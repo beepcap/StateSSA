@@ -31,8 +31,7 @@ StateSSA/
 │   └── driver.ssa      # CLI 引数解析・ファイル I/O を担うメインドライバ
 │
 ├── doc/                # 言語仕様書
-│   ├── SPECIFICATION.md# 基本言語仕様書
-│   └── SPEC_V0_12.md   # v0.12 静的型バリデータ & キャスト仕様書
+│   └── SPECIFICATION.md# 言語仕様書 (静的型バリデータ & キャスト仕様を含む)
 │
 └── samples/            # StateSSA サンプル集 (C言語ファイルなし)
     ├── 01_hello_world/ # 最小構成の Hello World
