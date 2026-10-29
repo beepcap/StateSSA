@@ -1,0 +1,130 @@
+// ============================================================================
+// StateSSA xz Clone: Pure StateSSA Roundtrip Verification Test Driver (main.ssa)
+// xz_compress で圧縮し、xz_decompress で解凍して原本と完全一致を検証する
+// ============================================================================
+
+extern "C" {
+    fn malloc(size: u32) -> *u8;
+    fn free(ptr: *u8) -> void;
+    fn puts(str: *u8) -> i32;
+}
+
+machine main() -> i32 {
+    flow {
+        reg res:         i32 = 0;
+        reg check_idx:   u32 = 0;
+        reg orig_ptr:    *u8 = null;
+        reg dict_ptr:    *u8 = null;
+        reg orig_size:   u32 = 92;
+
+        wire cur_orig_p = orig_ptr + check_idx;
+        wire cur_dict_p = dict_ptr + check_idx;
+        wire b_orig     = *cur_orig_p;
+        wire b_dict     = *cur_dict_p;
+
+        wire is_byte_eq  = b_orig == b_dict;
+        wire is_all_done = check_idx == orig_size;
+        wire next_idx    = check_idx + 1;
+    }
+
+    states {
+        Entry: {
+            let orig = "Hello StateSSA XZ Clone! Native Full Pipeline Compress & Decompress Roundtrip Verification.\n";
+            let orig_len = 92;
+
+            // 1. 各種バッファの確保
+            let m_probs     = call malloc(18052);
+            let probs_base  = cast(*u16) m_probs;
+
+            let m_hash      = call malloc(16384);
+            let hash_table  = cast(*u32) m_hash;
+
+            let m_crc       = call malloc(1024);
+            let crc_table   = cast(*u32) m_crc;
+
+            let m_rc        = call malloc(64);
+            let temp_rc     = cast(*RangeEncoder) m_rc;
+
+            let temp_comp   = call malloc(65536);
+            let xz_out      = call malloc(65536);
+
+            let m_dec       = call malloc(256);
+            let dec         = cast(*LzmaDecoder) m_dec;
+
+            let m_dec_probs = call malloc(18052);
+            let dec_probs   = cast(*u16) m_dec_probs;
+
+            let dict        = call malloc(1048576);
+
+            // 2. CRC32 テーブル初期化
+            call crc32_init_table(crc_table);
+
+            // 3. StateSSA xz_compress 実行
+            let xz_len = call xz_compress(
+                orig, orig_len,
+                xz_out,
+                probs_base, hash_table, crc_table,
+                temp_rc, temp_comp
+            );
+
+            let ok_comp = xz_len > 0;
+            ok_comp == 0 => Failure [ res <= 1 ];
+
+            // 4. デコーダの初期化
+            call lzma_init_probs(dec_probs, 9026);
+
+            dec.dict              <- dict;
+            dec.out_pos           <- 0;
+            dec.uncompressed_size <- orig_len;
+
+            dec.is_match      <- dec_probs + 0;
+            dec.is_rep        <- dec_probs + 192;
+            dec.is_rep0       <- dec_probs + 204;
+            dec.is_rep1       <- dec_probs + 216;
+            dec.is_rep2       <- dec_probs + 228;
+            dec.is_rep0_long  <- dec_probs + 240;
+            dec.pos_slot      <- dec_probs + 432;
+            dec.spec_pos      <- dec_probs + 688;
+            dec.align_probs   <- dec_probs + 802;
+            dec.len_probs     <- dec_probs + 818;
+            dec.rep_len_probs <- dec_probs + 1850;
+            dec.lit_probs     <- dec_probs + 2882;
+
+            // 5. StateSSA xz_decompress 実行
+            let dec_size = call xz_decompress(dec, xz_out, xz_len, crc_table);
+
+            let ok_size = dec_size == orig_len;
+            ok_size == 0 => Failure [ res <= 2 ];
+
+            _ => VerifyLoop [
+                orig_ptr <= orig,
+                dict_ptr <= dict,
+                check_idx <= 0
+            ];
+        }
+
+        VerifyLoop: {
+            is_all_done => Success;
+            is_byte_eq  => NextByte;
+            _           => Failure [ res <= 3 ];
+        }
+
+        NextByte: {
+            _ => VerifyLoop [ check_idx <= next_idx ];
+        }
+
+        Success: {
+            let _ = call puts("XZ Clone (Compress -> Decompress Roundtrip): 100% SUCCESS!");
+            _ => Exit [ res <= 0 ];
+        }
+
+        Failure: {
+            let _ = call puts("XZ Clone Roundtrip FAILED!");
+            _ => Exit;
+        }
+
+        Exit: {
+            _ => return res;
+        }
+    }
+}

@@ -1,0 +1,37 @@
+// ============================================================================
+// StateSSA Basics: 02. Simple Loop Test Driver (main.ssa)
+// simple_loop(10) を呼び出し、結果が 45 であることを検証する
+// ============================================================================
+
+extern "C" {
+    fn puts(str: *u8) -> i32;
+}
+
+machine main() -> i32 {
+    flow {
+        reg res: i32 = 0;
+    }
+
+    states {
+        Entry: {
+            // 0から9までの合計を計算: simple_loop(10)
+            let sum = call simple_loop(10);
+            sum == 45 => Success [ res <= 0 ];
+            _         => Failure [ res <= 1 ];
+        }
+
+        Success: {
+            let _ = call puts("simple_loop(10) = 45: SUCCESS!");
+            _ => Exit;
+        }
+
+        Failure: {
+            let _ = call puts("simple_loop(10) FAILED!");
+            _ => Exit;
+        }
+
+        Exit: {
+            _ => return res;
+        }
+    }
+}

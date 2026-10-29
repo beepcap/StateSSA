@@ -1,0 +1,351 @@
+// ============================================================================
+// StateSSA xz Container Encoder Implementation
+// .xz コンテナフォーマット生成エンジン (Header, Block, LZMA2, Check, Index, Footer)
+// ============================================================================
+
+include "lzma_encoder.ssa";
+include "crc32.ssa";
+
+// 32-bit リトルエンディアン書き込み
+machine write_u32_le(ptr: *u8, val: u32) -> void {
+    flow {
+        wire b0    = val & 255;
+        wire v_s8  = val >> 8;
+        wire b1    = v_s8 & 255;
+        wire v_s16 = val >> 16;
+        wire b2    = v_s16 & 255;
+        wire v_s24 = val >> 24;
+        wire b3    = v_s24 & 255;
+    }
+
+    states {
+        Entry: {
+            *ptr <- b0;
+            *(ptr + 1) <- b1;
+            *(ptr + 2) <- b2;
+            *(ptr + 3) <- b3;
+            _ => return;
+        }
+    }
+}
+
+// メモリゼロ埋め
+machine zero_fill(ptr: *u8, len: u32) -> void {
+    flow {
+        reg i: u32 = 0;
+        wire is_done = i == len;
+        wire cur_p   = ptr + i;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            *cur_p <- 0;
+            _ => Loop [ i <= i + 1 ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// メモリコピー
+machine copy_bytes(dst: *u8, src: *u8, len: u32) -> void {
+    flow {
+        reg i: u32 = 0;
+        wire is_done = i == len;
+        wire s_p = src + i;
+        wire d_p = dst + i;
+        wire b   = *s_p;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            *d_p <- b;
+            _ => Loop [ i <= i + 1 ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// VLI (Variable-Length Integer) 書き出しマシン
+machine xz_write_vli(out_ptr: *u8, value: u32) -> u32 {
+    flow {
+        reg val:   u32 = 0;
+        reg count: u32 = 0;
+
+        wire cur_ptr    = out_ptr + count;
+        wire data_bits  = val & 127;
+        wire rest_val   = val >> 7;
+        wire is_last    = rest_val == 0;
+        wire next_count = count + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop [ val <= value ];
+        }
+
+        Loop: {
+            is_last => Done;
+            _       => Step;
+        }
+
+        Step: {
+            *cur_ptr <- data_bits | 128;
+            _ => Loop [ val <= rest_val, count <= next_count ];
+        }
+
+        Done: {
+            *cur_ptr <- data_bits;
+            _ => return next_count;
+        }
+    }
+}
+
+// xz 完全圧縮メインマシン
+machine xz_compress(
+    in_buf: *u8, in_size: u32,
+    out_buf: *u8,
+    probs_base: *u16, hash_table: *u32, crc_table: *u32,
+    temp_rc: *RangeEncoder, temp_comp_buf: *u8
+) -> u32 {
+    flow {
+        reg lzma_len:      u32 = 0;
+        reg lzma2_len:     u32 = 0;
+        reg blk_hdr_len:   u32 = 0;
+        reg out_pos:       u32 = 0;
+        reg block_start:   u32 = 0;
+        reg comp_data_len: u32 = 0;
+        reg pad_len:       u32 = 0;
+        reg index_start:   u32 = 0;
+        reg index_len:     u32 = 0;
+    }
+
+    states {
+        Entry: {
+            _ => WriteStreamHeader;
+        }
+
+        // 1. Stream Header: 12 bytes
+        WriteStreamHeader: {
+            // Magic: \xFD, '7', 'z', 'X', 'Z', \x00
+            *out_buf       <- 0xFD;
+            *(out_buf + 1) <- 0x37;
+            *(out_buf + 2) <- 0x7A;
+            *(out_buf + 3) <- 0x58;
+            *(out_buf + 4) <- 0x5A;
+            *(out_buf + 5) <- 0x00;
+            // Stream Flags: 0x00, 0x01 (CRC32)
+            *(out_buf + 6) <- 0x00;
+            *(out_buf + 7) <- 0x01;
+            // Header CRC32 of Flags (2 bytes: out_buf + 6)
+            let hdr_crc = call crc32_calculate(crc_table, out_buf + 6, 2);
+            call write_u32_le(out_buf + 8, hdr_crc);
+
+            _ => RunLzmaEncode [ out_pos <= 12 ];
+        }
+
+        // 2. LZMA コアストリームエンコード実行 (temp_comp_buf へ一時出力)
+        RunLzmaEncode: {
+            call rc_enc_init(temp_rc, temp_comp_buf);
+            call lzma_enc_init_probs(probs_base, 9026);
+            call mf_init_hash(hash_table, 4096);
+
+            call lzma_encode_stream(temp_rc, in_buf, in_size, probs_base, hash_table);
+            let llen = temp_rc.out_pos;
+            _ => WriteBlockHeader [ lzma_len <= llen ];
+        }
+
+        // 3. Block Header 生成
+        WriteBlockHeader: {
+            let bh_ptr = out_buf + out_pos;
+            let b_start = out_pos;
+
+            // Header Size: 0x04 ((4 + 1) * 4 = 20 bytes)
+            *bh_ptr <- 4;
+            // Block Flags: 0xC0 (has comp_size & uncomp_size, 1 filter)
+            *(bh_ptr + 1) <- 0xC0;
+
+            // LZMA2 ストリーム長 = 6 (Chunk Header) + lzma_len + 1 (0x00 End Marker)
+            let l2_raw = 6 + lzma_len;
+            let l2_len = l2_raw + 1;
+
+            // Compressed Size VLI
+            let s1 = call xz_write_vli(bh_ptr + 2, l2_len);
+            let off1 = 2 + s1;
+
+            // Uncompressed Size VLI
+            let s2 = call xz_write_vli(bh_ptr + off1, in_size);
+            let off2 = off1 + s2;
+
+            // Filter Flags: Filter ID 0x21, Size 1, Dict 0x16 (8MB)
+            let off2_1 = off2 + 1;
+            let off2_2 = off2 + 2;
+            *(bh_ptr + off2)   <- 0x21;
+            *(bh_ptr + off2_1) <- 1;
+            *(bh_ptr + off2_2) <- 0x16;
+            let off3 = off2 + 3;
+
+            // Header Padding to 16 bytes (before CRC)
+            call zero_fill(bh_ptr + off3, 16 - off3);
+
+            // Block Header CRC32 (16 bytes)
+            let bh_crc = call crc32_calculate(crc_table, bh_ptr, 16);
+            call write_u32_le(bh_ptr + 16, bh_crc);
+
+            _ => WriteLZMA2Chunk [
+                out_pos <= out_pos + 20,
+                block_start <= b_start,
+                lzma2_len <= l2_len
+            ];
+        }
+
+        // 4. LZMA2 チャンク出力
+        WriteLZMA2Chunk: {
+            let l2_ptr = out_buf + out_pos;
+
+            // LZMA2 Chunk Header (6 bytes)
+            // Control Byte: 0xE0 | high 5 bits of uncomp_size - 1
+            let u_rem = in_size - 1;
+            let c_rem = lzma_len - 1;
+
+            let u_s16 = u_rem >> 16;
+            let u_top5 = u_s16 & 31;
+            let ctrl_b = 0xE0 | u_top5;
+            *l2_ptr <- ctrl_b;
+
+            let u_s8 = u_rem >> 8;
+            let u_b1 = u_s8 & 255;
+            *(l2_ptr + 1) <- u_b1;
+            *(l2_ptr + 2) <- u_rem & 255;
+
+            let c_s8 = c_rem >> 8;
+            let c_b3 = c_s8 & 255;
+            *(l2_ptr + 3) <- c_b3;
+            *(l2_ptr + 4) <- c_rem & 255;
+
+            // Properties byte: 0x5D (lc=3, lp=0, pb=2)
+            *(l2_ptr + 5) <- 0x5D;
+
+            // LZMA 圧縮データ本体をコピー
+            call copy_bytes(l2_ptr + 6, temp_comp_buf, lzma_len);
+
+            // LZMA2 チャンク終了マーカー
+            let end_off = 6 + lzma_len;
+            *(l2_ptr + end_off) <- 0x00;
+
+            let comp_raw = 6 + lzma_len;
+            let comp_len = comp_raw + 1;
+            let c_mod4   = comp_len & 3;
+            let pad_sub  = 4 - c_mod4;
+            let p_len    = pad_sub & 3;
+
+            _ => WriteBlockPadding [
+                out_pos <= out_pos + comp_len,
+                comp_data_len <= comp_len,
+                pad_len <= p_len
+            ];
+        }
+
+        // 5. Block Padding & Check (CRC32)
+        WriteBlockPadding: {
+            call zero_fill(out_buf + out_pos, pad_len);
+            let after_pad = out_pos + pad_len;
+
+            // 平文データの CRC32
+            let data_crc = call crc32_calculate(crc_table, in_buf, in_size);
+            call write_u32_le(out_buf + after_pad, data_crc);
+
+            _ => WriteIndex [ out_pos <= after_pad + 4 ];
+        }
+
+        // 6. Index (Indicator, Records, Padding, CRC32)
+        WriteIndex: {
+            let idx_ptr = out_buf + out_pos;
+            let idx_s = out_pos;
+
+            // Index Indicator: 0x00
+            *idx_ptr <- 0;
+            // Number of Records: 1
+            *(idx_ptr + 1) <- 1;
+
+            // Unpadded Size = Block Header (20) + comp_data_len + Check (4)
+            let unp_raw     = 20 + comp_data_len;
+            let unpadded_sz = unp_raw + 4;
+            let s1 = call xz_write_vli(idx_ptr + 2, unpadded_sz);
+            let off1 = 2 + s1;
+
+            // Uncompressed Size
+            let s2 = call xz_write_vli(idx_ptr + off1, in_size);
+            let off2 = off1 + s2;
+
+            // Index Padding (4-byte alignment before CRC)
+            let off2_mod4 = off2 & 3;
+            let pad_diff  = 4 - off2_mod4;
+            let idx_pad   = pad_diff & 3;
+            call zero_fill(idx_ptr + off2, idx_pad);
+            let off3 = off2 + idx_pad;
+
+            // Index CRC32
+            let idx_crc = call crc32_calculate(crc_table, idx_ptr, off3);
+            call write_u32_le(idx_ptr + off3, idx_crc);
+
+            let total_idx_len = off3 + 4;
+
+            _ => WriteStreamFooter [
+                out_pos <= out_pos + total_idx_len,
+                index_len <= total_idx_len
+            ];
+        }
+
+        // 7. Stream Footer: 12 bytes
+        WriteStreamFooter: {
+            let f_ptr = out_buf + out_pos;
+
+            // Backward Size: (index_len / 4) - 1
+            let idx_s2 = index_len >> 2;
+            let bw_sz  = idx_s2 - 1;
+            call write_u32_le(f_ptr + 4, bw_sz);
+
+            // Stream Flags: 0x00, 0x01
+            *(f_ptr + 8) <- 0x00;
+            *(f_ptr + 9) <- 0x01;
+
+            // Footer CRC32 of Backward Size & Stream Flags (6 bytes: f_ptr + 4)
+            let f_crc = call crc32_calculate(crc_table, f_ptr + 4, 6);
+            call write_u32_le(f_ptr, f_crc);
+
+            // Footer Magic: 'Y', 'Z' (0x59, 0x5A)
+            *(f_ptr + 10) <- 0x59;
+            *(f_ptr + 11) <- 0x5A;
+
+            _ => Done [ out_pos <= out_pos + 12 ];
+        }
+
+        Done: {
+            _ => return out_pos;
+        }
+    }
+}

@@ -1,0 +1,203 @@
+// ============================================================================
+// StateSSA LZMA2 Chunk Protocol Decoder Implementation
+// LZMA2 チャンクプロトコル FSM (圧縮・非圧縮・リセット制御)
+// ============================================================================
+
+include "lzma_decoder.ssa";
+
+// 非圧縮バイト列の転送マシン (src -> dst へ len バイトコピー)
+machine lzma2_copy_uncompressed(dst: *u8, src: *u8, len: u32) -> void {
+    flow {
+        reg step: u32 = 0;
+        wire is_done   = step == len;
+        wire src_ptr   = src + step;
+        wire dst_ptr   = dst + step;
+        wire byte_val  = *src_ptr;
+        wire next_step = step + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => CopyByte;
+        }
+
+        CopyByte: {
+            *dst_ptr <- byte_val;
+            _ => Loop [ step <= next_step ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// 確率テーブルの全リセット (1024 初期化)
+machine lzma2_reset_probs(dec: *LzmaDecoder) -> void {
+    flow {
+        wire p_match  = dec.is_match;
+        wire p_rep    = dec.is_rep;
+        wire p_rep0   = dec.is_rep0;
+        wire p_rep1   = dec.is_rep1;
+        wire p_rep2   = dec.is_rep2;
+        wire p_rep0l  = dec.is_rep0_long;
+        wire p_slot   = dec.pos_slot;
+        wire p_spec   = dec.spec_pos;
+        wire p_align  = dec.align_probs;
+        wire p_len    = dec.len_probs;
+        wire p_rlen   = dec.rep_len_probs;
+        wire p_lit    = dec.lit_probs;
+    }
+
+    states {
+        Entry: {
+            call lzma_init_probs(p_match, 192);
+            call lzma_init_probs(p_rep, 12);
+            call lzma_init_probs(p_rep0, 12);
+            call lzma_init_probs(p_rep1, 12);
+            call lzma_init_probs(p_rep2, 12);
+            call lzma_init_probs(p_rep0l, 192);
+            call lzma_init_probs(p_slot, 256);
+            call lzma_init_probs(p_spec, 114);
+            call lzma_init_probs(p_align, 16);
+            call lzma_init_probs(p_len, 514);
+            call lzma_init_probs(p_rlen, 514);
+            call lzma_init_probs(p_lit, 6144);
+            _ => Exit;
+        }
+
+        Exit: {
+            _ => return;
+        }
+    }
+}
+
+// LZMA2 ストリーム復号メインマシン
+machine lzma2_decode_stream(dec: *LzmaDecoder) -> u32 {
+    flow {
+        reg mode:    u32 = 0;
+        reg uncomp:  u32 = 0;
+        reg comp:    u32 = 0;
+        reg payload: *u8 = null;
+
+        // 入力ポインタと現在バイト
+        wire in_ptr   = dec.in_ptr;
+        wire cur_byte = *in_ptr;
+
+        // 制御バイト分岐判定
+        wire is_eos    = cur_byte == 0;
+        wire is_uncomp = cur_byte <= 2;
+        wire is_lzma   = cur_byte >= 128;
+
+        // 非圧縮チャンクのヘッダ解析
+        wire u_b1 = *(in_ptr + 1);
+        wire u_b2 = *(in_ptr + 2);
+        wire u_len = ((u_b1 << 8) | u_b2) + 1;
+        wire u_data_ptr = in_ptr + 3;
+
+        // LZMA 圧縮チャンクのヘッダ解析
+        wire lz_mode    = (cur_byte >> 5) & 3;
+        wire lz_u_high  = cur_byte & 31;
+        wire lz_u_mid   = *(in_ptr + 1);
+        wire lz_u_low   = *(in_ptr + 2);
+        wire lz_uncomp  = (((lz_u_high << 16) | (lz_u_mid << 8)) | lz_u_low) + 1;
+
+        wire lz_c_high  = *(in_ptr + 3);
+        wire lz_c_low   = *(in_ptr + 4);
+        wire lz_comp    = ((lz_c_high << 8) | lz_c_low) + 1;
+
+        wire is_prop        = lz_mode == 3;
+        wire lz_stream_prop = in_ptr + 6;
+        wire lz_stream_norm = in_ptr + 5;
+
+        // 出力位置
+        wire dict_base = dec.dict;
+        wire out_p     = dec.out_pos;
+        wire dict_cur  = dict_base + out_p;
+    }
+
+    states {
+        Entry: {
+            _ => ReadControl;
+        }
+
+        ReadControl: {
+            is_eos    => Finish;
+            is_uncomp => ParseUncomp;
+            is_lzma   => ParseLzma;
+            _         => Panic;
+        }
+
+        ParseUncomp: {
+            _ => ExecUncomp [ uncomp <= u_len, payload <= u_data_ptr ];
+        }
+
+        ExecUncomp: {
+            call lzma2_copy_uncompressed(dict_cur, payload, uncomp);
+            dec.out_pos <- dec.out_pos + uncomp;
+            dec.in_ptr  <- payload + uncomp;
+            _ => ReadControl;
+        }
+
+        ParseLzma: {
+            is_prop => ParseLzmaProp;
+            _       => ParseLzmaNormal;
+        }
+
+        ParseLzmaProp: {
+            _ => CheckLzmaReset [ mode <= lz_mode, uncomp <= lz_uncomp, comp <= lz_comp, payload <= lz_stream_prop ];
+        }
+
+        ParseLzmaNormal: {
+            _ => CheckLzmaReset [ mode <= lz_mode, uncomp <= lz_uncomp, comp <= lz_comp, payload <= lz_stream_norm ];
+        }
+
+        CheckLzmaReset: {
+            mode >= 2 => ResetProbsAndState;
+            mode >= 1 => ResetStateOnly;
+            _         => LaunchLzma;
+        }
+
+        ResetProbsAndState: {
+            call lzma2_reset_probs(dec);
+            dec.state <- 0;
+            dec.rep0  <- 0;
+            dec.rep1  <- 0;
+            dec.rep2  <- 0;
+            dec.rep3  <- 0;
+            call rc_init(dec, payload);
+            _ => LaunchLzma;
+        }
+
+        ResetStateOnly: {
+            dec.state <- 0;
+            dec.rep0  <- 0;
+            dec.rep1  <- 0;
+            dec.rep2  <- 0;
+            dec.rep3  <- 0;
+            call rc_init(dec, payload);
+            _ => LaunchLzma;
+        }
+
+        LaunchLzma: {
+            dec.uncompressed_size <- dec.out_pos + uncomp;
+            let _ = call lzma_decode_stream(dec);
+            dec.in_ptr <- payload + comp;
+            _ => ReadControl;
+        }
+
+        Finish: {
+            dec.in_ptr <- in_ptr + 1;
+            _ => return dec.out_pos;
+        }
+
+        Panic: {
+            _ => panic(0);
+        }
+    }
+}

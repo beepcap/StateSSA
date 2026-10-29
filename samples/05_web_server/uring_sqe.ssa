@@ -1,0 +1,90 @@
+// ============================================================================
+// StateSSA io_uring SQE Builder
+// Linux カーネル共有リングバッファ (64 bytes SQE) 直接構築マシン
+// ============================================================================
+
+include "uring_types.ssa";
+
+machine sqe_prep_accept(ctx: *UringContext, listen_fd: i32, tag: u64) -> void {
+    flow {
+        wire tail_ptr = ctx.sq_ktail;
+        wire tail     = *tail_ptr;
+        wire next_tail = tail + 1;
+        wire mask     = ctx.sq_mask;
+        wire slot_idx = tail & mask;
+        wire sqes_base = ctx.sqes;
+        wire sqe      = sqes_base + slot_idx;
+        wire sq_arr   = ctx.sq_array;
+    }
+
+    states {
+        Entry: {
+            let _ = call memset(sqe, 0, 64);
+            sqe.opcode    <- 13; // IORING_OP_ACCEPT
+            sqe.fd        <- listen_fd;
+            sqe.user_data <- tag;
+            let arr_ptr = sq_arr + slot_idx;
+            *arr_ptr <- slot_idx;
+            *tail_ptr <- next_tail;
+            _ => return;
+        }
+    }
+}
+
+machine sqe_prep_recv(ctx: *UringContext, client_fd: i32, buf: *u8, len: u32, tag: u64) -> void {
+    flow {
+        wire tail_ptr = ctx.sq_ktail;
+        wire tail     = *tail_ptr;
+        wire next_tail = tail + 1;
+        wire mask     = ctx.sq_mask;
+        wire slot_idx = tail & mask;
+        wire sqes_base = ctx.sqes;
+        wire sqe      = sqes_base + slot_idx;
+        wire sq_arr   = ctx.sq_array;
+    }
+
+    states {
+        Entry: {
+            let _ = call memset(sqe, 0, 64);
+            sqe.opcode    <- 27; // IORING_OP_RECV
+            sqe.fd        <- client_fd;
+            let buf_addr = cast(u64) buf;
+            sqe.addr      <- buf_addr;
+            sqe.len       <- len;
+            sqe.user_data <- tag;
+            let arr_ptr = sq_arr + slot_idx;
+            *arr_ptr <- slot_idx;
+            *tail_ptr <- next_tail;
+            _ => return;
+        }
+    }
+}
+
+machine sqe_prep_send(ctx: *UringContext, client_fd: i32, buf: *u8, len: u32, tag: u64) -> void {
+    flow {
+        wire tail_ptr = ctx.sq_ktail;
+        wire tail     = *tail_ptr;
+        wire next_tail = tail + 1;
+        wire mask     = ctx.sq_mask;
+        wire slot_idx = tail & mask;
+        wire sqes_base = ctx.sqes;
+        wire sqe      = sqes_base + slot_idx;
+        wire sq_arr   = ctx.sq_array;
+    }
+
+    states {
+        Entry: {
+            let _ = call memset(sqe, 0, 64);
+            sqe.opcode    <- 26; // IORING_OP_SEND
+            sqe.fd        <- client_fd;
+            let buf_addr = cast(u64) buf;
+            sqe.addr      <- buf_addr;
+            sqe.len       <- len;
+            sqe.user_data <- tag;
+            let arr_ptr = sq_arr + slot_idx;
+            *arr_ptr <- slot_idx;
+            *tail_ptr <- next_tail;
+            _ => return;
+        }
+    }
+}

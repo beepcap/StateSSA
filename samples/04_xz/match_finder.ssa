@@ -1,0 +1,136 @@
+// ============================================================================
+// StateSSA Match Finder Implementation
+// 2バイトハッシュテーブルによるスライド窓マッチ探索 FSM
+// ============================================================================
+
+// ハッシュテーブル初期化 (全エントリを 0 にクリア)
+machine mf_init_hash(hash_table: *u32, count: u32) -> void {
+    flow {
+        reg i: u32 = 0;
+        wire is_done  = i == count;
+        wire cur_ptr  = hash_table + i;
+        wire next_i   = i + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            *cur_ptr <- 0;
+            _ => Loop [ i <= next_i ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// マッチ探索マシン (戻り値: (len << 23) | dist)
+machine mf_find_match(
+    in_buf: *u8, in_size: u32, cur_pos: u32,
+    hash_table: *u32, dict_limit: u32
+) -> u32 {
+    flow {
+        reg prev_1:    u32 = 0;
+        reg max_len:   u32 = 0;
+        reg match_len: u32 = 0;
+
+        wire rem_bytes     = in_size - cur_pos;
+        wire next_cur_pos  = cur_pos + 1;
+        wire can_search    = next_cur_pos < in_size;
+
+        wire p0            = in_buf + cur_pos;
+        wire b0            = *p0;
+        wire p1            = in_buf + next_cur_pos;
+        wire b1            = *p1;
+        wire b0_s4         = b0 << 4;
+        wire h_raw         = b0_s4 ^ b1;
+        wire h             = h_raw & 4095;
+        wire h_ptr         = hash_table + h;
+
+        wire real_prev     = prev_1 - 1;
+        wire dist          = cur_pos - real_prev;
+        wire is_p1_nz      = prev_1 > 0;
+        wire is_dist_nz    = dist > 0;
+        wire is_dist_lim   = dist <= dict_limit;
+        wire is_prev_lt    = real_prev < cur_pos;
+        wire ok_p1_dist    = is_p1_nz && is_dist_nz;
+        wire ok_lim        = is_dist_lim && is_prev_lt;
+        wire is_valid_dist = ok_p1_dist && ok_lim;
+
+        wire cur_off       = cur_pos + match_len;
+        wire cur_p_ptr     = in_buf + cur_off;
+        wire cur_p_byte    = *cur_p_ptr;
+        wire prev_off      = real_prev + match_len;
+        wire prev_p_ptr    = in_buf + prev_off;
+        wire prev_p_byte   = *prev_p_ptr;
+        wire is_byte_eq    = cur_p_byte == prev_p_byte;
+        wire is_len_limit  = match_len == max_len;
+    }
+
+    states {
+        Entry: {
+            can_search => LookupHash;
+            _          => NoMatch;
+        }
+
+        LookupHash: {
+            let old_pos_1 = *h_ptr;
+            *h_ptr <- cur_pos + 1;
+            _ => CheckValidDist [ prev_1 <= old_pos_1 ];
+        }
+
+        CheckValidDist: {
+            is_valid_dist => CalcMaxLen;
+            _             => NoMatch;
+        }
+
+        CalcMaxLen: {
+            rem_bytes < 273 => SetMaxRem;
+            _               => SetMax273;
+        }
+
+        SetMaxRem: {
+            _ => MatchLoop [ max_len <= rem_bytes, match_len <= 0 ];
+        }
+
+        SetMax273: {
+            _ => MatchLoop [ max_len <= 273, match_len <= 0 ];
+        }
+
+        MatchLoop: {
+            is_len_limit => CheckLength;
+            is_byte_eq   => IncLen;
+            _            => CheckLength;
+        }
+
+        IncLen: {
+            _ => MatchLoop [ match_len <= match_len + 1 ];
+        }
+
+        CheckLength: {
+            match_len >= 2 => MatchFound;
+            _              => NoMatch;
+        }
+
+        MatchFound: {
+            let dist_val = dist - 1;
+            let len_s23 = match_len << 23;
+            let dist_masked = dist_val & 0x7FFFFF;
+            let packed = len_s23 | dist_masked;
+            _ => return packed;
+        }
+
+        NoMatch: {
+            _ => return 0;
+        }
+    }
+}

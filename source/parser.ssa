@@ -1,0 +1,2236 @@
+// ============================================================================
+// StateSSA Compiler v0.11.0 - Stream-Driven Parser & AST Engine (parser.ssa)
+// AST 構造体定義、バンプアロケータ、3番地フラット構文解析エンジンの一体化モジュール
+// ============================================================================
+
+include "common.ssa";
+include "lexer.ssa";
+
+// ----------------------------------------------------------------------------
+// 1. 式ノード (ExprNode)
+// kind:
+//   1: INT_LIT, 2: STR_LIT, 3: NULL_LIT, 4: VAR,
+//   5: BINOP, 6: UNOP, 7: FIELD, 8: CALL, 9: STRUCT_LIT, 10: CAST
+// ----------------------------------------------------------------------------
+type ExprNode = {
+    kind:      u32,
+    op:        u32,        // 演算子種別 (TOK_PLUS, TOK_MINUS, etc.)
+    int_val:   i64,        // INT_LIT 数値 (64-bit 整数)
+    str_ptr:   *u8,        // 文字列スライス (ゼロコピー)
+    str_len:   u32,
+    left:      *ExprNode,  // BINOP left / UNOP operand / FIELD target
+    right:     *ExprNode,  // BINOP right
+    args:      *ExprNode,  // CALL 第1引数ポインタ
+    next_arg:  *ExprNode,  // CALL 次引数へのリンクポインタ
+    arg_count: u32
+};
+
+// ----------------------------------------------------------------------------
+// 3. レジスタ & ワイヤー定義
+// ----------------------------------------------------------------------------
+type RegDef = {
+    name_ptr:  *u8,
+    name_len:  u32,
+    type_ptr:  *u8,        // 型文字列ポインタ (例: "i32", "*u8")
+    type_len:  u32,
+    init_expr: *ExprNode   // 初期値式 (null 可)
+};
+
+type WireDef = {
+    name_ptr:  *u8,
+    name_len:  u32,
+    expr:      *ExprNode
+};
+
+// ----------------------------------------------------------------------------
+// 4. アクション (ActionStmt)
+// kind: 1: LET, 2: CALL, 3: STORE
+// ----------------------------------------------------------------------------
+type ActionStmt = {
+    kind:        u32,
+    target_ptr:  *u8,        // let 変数名 (null なら _)
+    target_len:  u32,
+    target_expr: *ExprNode,  // store 左辺ポインタ式
+    expr:        *ExprNode,  // 右辺式
+    next:        *ActionStmt
+};
+
+// ----------------------------------------------------------------------------
+// 5. ラッチ代入 & 遷移ルール (TransitionRule)
+// ----------------------------------------------------------------------------
+type LatchAssign = {
+    reg_ptr:  *u8,
+    reg_len:  u32,
+    expr:     *ExprNode,
+    next:     *LatchAssign
+};
+
+type TransitionRule = {
+    guard:        *ExprNode,    // ガード式 (null なら無条件 _)
+    target_ptr:   *u8,          // 遷移先ステート名 (null なら return/panic)
+    target_len:   u32,
+    latches:      *LatchAssign, // ラッチ代入配列
+    latch_count:  u32,
+    is_return:    u32,          // 1: return, 0: 通常
+    is_panic:     u32,          // 1: panic, 0: 通常
+    ret_expr:     *ExprNode,    // return / panic 式
+    next:         *TransitionRule
+};
+
+// ----------------------------------------------------------------------------
+// 6. ステート定義 (StateDef)
+// ----------------------------------------------------------------------------
+type StateDef = {
+    name_ptr:     *u8,
+    name_len:     u32,
+    actions:      *ActionStmt,
+    action_count: u32,
+    rules:        *TransitionRule,
+    rule_count:   u32,
+    next:         *StateDef
+};
+
+// ----------------------------------------------------------------------------
+// 7. マシン引数 & マシン定義 (MachineDef)
+// ----------------------------------------------------------------------------
+type MachineParam = {
+    name_ptr: *u8,
+    name_len: u32,
+    type_ptr: *u8,
+    type_len: u32
+};
+
+type MachineDef = {
+    name_ptr:     *u8,
+    name_len:     u32,
+    params:       *MachineParam,
+    param_count:  u32,
+    ret_type_ptr: *u8,
+    ret_type_len: u32,
+    regs:         *RegDef,
+    reg_count:    u32,
+    wires:        *WireDef,
+    wire_count:   u32,
+    state_defs:   *StateDef,
+    state_count:  u32
+};
+
+// ----------------------------------------------------------------------------
+// 8. 型定義 (TypeDef)
+// ----------------------------------------------------------------------------
+type TypeField = {
+    name_ptr: *u8,
+    name_len: u32,
+    type_ptr: *u8,
+    type_len: u32
+};
+
+type TypeDef = {
+    name_ptr:    *u8,
+    name_len:    u32,
+    fields:      *TypeField,
+    field_count: u32
+};
+
+// ----------------------------------------------------------------------------
+// 9. 外部関数定義 (ExternFn)
+// ----------------------------------------------------------------------------
+type ExternFn = {
+    name_ptr:     *u8,
+    name_len:     u32,
+    params:       *MachineParam,
+    param_count:  u32,
+    ret_type_ptr: *u8,
+    ret_type_len: u32
+};
+
+// ----------------------------------------------------------------------------
+// 10. プログラム全体 (ProgramDef)
+// ----------------------------------------------------------------------------
+type ProgramDef = {
+    types:         *TypeDef,
+    type_count:    u32,
+    externs:       *ExternFn,
+    extern_count:  u32,
+    machines:      *MachineDef,
+    machine_count: u32
+};
+
+// ----------------------------------------------------------------------------
+// 型名スライス構造体
+// ----------------------------------------------------------------------------
+type TypeSlice = {
+    ptr: *u8,
+    len: u32
+};
+
+// ----------------------------------------------------------------------------
+// 11. パーサコンテキスト構造体
+// ----------------------------------------------------------------------------
+type ParseContext = {
+    tokens:      *Token,
+    pos:         u32,
+    tok_cnt:     u32,
+    alloc:       *BumpAlloc,
+    error_code:  i32
+};
+
+// ============================================================================
+// パーサコンテキスト走査ヘルパーマシン群
+// ============================================================================
+
+machine ctx_peek_kind(ctx: *ParseContext) -> u32 {
+    flow {
+        wire pos = ctx.pos;
+        wire cnt = ctx.tok_cnt;
+        wire is_eof = pos >= cnt;
+        wire toks = ctx.tokens;
+        wire curr_tok = toks + pos;
+        wire kind = curr_tok.kind;
+    }
+    states {
+        Entry: {
+            is_eof != 0 => ReturnEof;
+            _           => ReturnKind;
+        }
+        ReturnEof: {
+            _ => return 99; // TokenType.EOF
+        }
+        ReturnKind: {
+            _ => return kind;
+        }
+    }
+}
+
+machine ctx_peek_tok(ctx: *ParseContext) -> *Token {
+    flow {
+        wire pos = ctx.pos;
+        wire toks = ctx.tokens;
+        wire curr_tok = toks + pos;
+    }
+    states {
+        Entry: {
+            _ => return curr_tok;
+        }
+    }
+}
+
+machine ctx_consume(ctx: *ParseContext) -> *Token {
+    flow {
+        wire pos = ctx.pos;
+        wire toks = ctx.tokens;
+        wire curr_tok = toks + pos;
+        wire next_pos = pos + 1;
+    }
+    states {
+        Entry: {
+            let ret_tok = curr_tok;
+            ctx.pos <- next_pos;
+            _ => return ret_tok;
+        }
+    }
+}
+
+machine ctx_match(ctx: *ParseContext, expected: u32) -> u32 {
+    flow {
+        wire pos = ctx.pos;
+        wire cnt = ctx.tok_cnt;
+        wire is_eof = pos >= cnt;
+        wire toks = ctx.tokens;
+        wire curr_tok = toks + pos;
+        wire kind = curr_tok.kind;
+        wire is_match = kind == expected;
+        wire next_pos = pos + 1;
+    }
+    states {
+        Entry: {
+            is_eof != 0   => NoMatch;
+            is_match != 0 => Match;
+            _             => NoMatch;
+        }
+        Match: {
+            ctx.pos <- next_pos;
+            _ => return 1;
+        }
+        NoMatch: {
+            _ => return 0;
+        }
+    }
+}
+
+// ============================================================================
+// 数値変換マシン (10進数 & 0x16進数)
+// ============================================================================
+
+machine parse_int_val(ptr: *u8, len: u32) -> i64 {
+    flow {
+        reg pos: u32 = 0;
+        reg val: i64 = 0;
+
+        wire is_end    = pos >= len;
+        wire cur_ptr   = ptr + pos;
+        wire c         = *cur_ptr;
+
+        wire p0        = ptr + 0;
+        wire c0        = *p0;
+        wire p1        = ptr + 1;
+        wire c1        = *p1;
+
+        wire digit_dec = c - 48;
+        wire digit_i64 = cast(i64) digit_dec;
+        wire val_mul10 = val * 10;
+        wire next_dec  = val_mul10 + digit_i64;
+        wire next_pos  = pos + 1;
+    }
+    states {
+        Entry: {
+            len < 2  => LoopDec;
+            c0 == 48 => CheckHexPrefix;
+            _        => LoopDec;
+        }
+
+        CheckHexPrefix: {
+            c1 == 120 => StartHex; // 'x'
+            c1 == 88  => StartHex; // 'X'
+            _         => LoopDec;
+        }
+
+        LoopDec: {
+            is_end != 0 => Finish;
+            _           => NextDec [ val <= next_dec, pos <= next_pos ];
+        }
+
+        NextDec: {
+            _ => LoopDec;
+        }
+
+        StartHex: {
+            _ => LoopHex [ pos <= 2, val <= 0 ];
+        }
+
+        LoopHex: {
+            is_end != 0 => Finish;
+            c < 48      => Finish;
+            c <= 57     => AddHexNum;
+            c < 65      => Finish;
+            c <= 70     => AddHexUpper;
+            c < 97      => Finish;
+            c <= 102    => AddHexLower;
+            _           => Finish;
+        }
+
+        AddHexNum: {
+            let d = c - 48;
+            let d_i64 = cast(i64) d;
+            let v16 = val * 16;
+            let next_v = v16 + d_i64;
+            let np = pos + 1;
+            _ => LoopHex [ val <= next_v, pos <= np ];
+        }
+
+        AddHexLower: {
+            let d = c - 87;
+            let d_i64 = cast(i64) d;
+            let v16 = val * 16;
+            let next_v = v16 + d_i64;
+            let np = pos + 1;
+            _ => LoopHex [ val <= next_v, pos <= np ];
+        }
+
+        AddHexUpper: {
+            let d = c - 55;
+            let d_i64 = cast(i64) d;
+            let v16 = val * 16;
+            let next_v = v16 + d_i64;
+            let np = pos + 1;
+            _ => LoopHex [ val <= next_v, pos <= np ];
+        }
+
+        Finish: {
+            _ => return val;
+        }
+    }
+}
+
+// ============================================================================
+// AST ノード生成ファクトリマシン群
+// ============================================================================
+
+machine alloc_expr_raw(alloc: *BumpAlloc) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let mem = call bump_alloc(alloc, 80, 8);
+            _ => return mem;
+        }
+    }
+}
+
+machine make_expr_node(alloc: *BumpAlloc, kind: u32) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call alloc_expr_raw(alloc);
+            n.kind      <- kind;
+            n.op        <- 0;
+            n.int_val   <- 0;
+            n.str_ptr   <- null;
+            n.str_len   <- 0;
+            n.left      <- null;
+            n.right     <- null;
+            n.args      <- null;
+            n.next_arg  <- null;
+            n.arg_count <- 0;
+            _ => return n;
+        }
+    }
+}
+
+machine make_int_node(alloc: *BumpAlloc, val: i64) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call make_expr_node(alloc, 1); // 1: INT_LIT
+            n.int_val <- val;
+            _ => return n;
+        }
+    }
+}
+
+machine make_str_node(alloc: *BumpAlloc, ptr: *u8, len: u32) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call make_expr_node(alloc, 2); // 2: STR_LIT
+            n.str_ptr <- ptr;
+            n.str_len <- len;
+            _ => return n;
+        }
+    }
+}
+
+machine make_null_node(alloc: *BumpAlloc) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call make_expr_node(alloc, 3); // 3: NULL_LIT
+            _ => return n;
+        }
+    }
+}
+
+machine make_var_node(alloc: *BumpAlloc, ptr: *u8, len: u32) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call make_expr_node(alloc, 4); // 4: VAR
+            n.str_ptr <- ptr;
+            n.str_len <- len;
+            _ => return n;
+        }
+    }
+}
+
+machine make_cast_node(alloc: *BumpAlloc, type_p: *u8, type_l: u32, operand: *ExprNode) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call make_expr_node(alloc, 10); // 10: CAST
+            n.str_ptr <- type_p;
+            n.str_len <- type_l;
+            n.left    <- operand;
+            _ => return n;
+        }
+    }
+}
+
+machine make_binop_node(alloc: *BumpAlloc, op: u32, left: *ExprNode, right: *ExprNode) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call make_expr_node(alloc, 5); // 5: BINOP
+            n.op    <- op;
+            n.left  <- left;
+            n.right <- right;
+            _ => return n;
+        }
+    }
+}
+
+machine make_unop_node(alloc: *BumpAlloc, op: u32, operand: *ExprNode) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call make_expr_node(alloc, 6); // 6: UNOP
+            n.op   <- op;
+            n.left <- operand;
+            _ => return n;
+        }
+    }
+}
+
+machine make_field_node(alloc: *BumpAlloc, target: *ExprNode, f_ptr: *u8, f_len: u32) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call make_expr_node(alloc, 7); // 7: FIELD
+            n.left    <- target;
+            n.str_ptr <- f_ptr;
+            n.str_len <- f_len;
+            _ => return n;
+        }
+    }
+}
+
+machine make_call_node(alloc: *BumpAlloc, fn_ptr: *u8, fn_len: u32, args: *ExprNode, cnt: u32) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call make_expr_node(alloc, 8); // 8: CALL
+            n.str_ptr   <- fn_ptr;
+            n.str_len   <- fn_len;
+            n.args      <- args;
+            n.arg_count <- cnt;
+            _ => return n;
+        }
+    }
+}
+
+// ============================================================================
+// 純粋 3 番地フラット式構文解析マシン (parse_atom & parse_expr)
+// ============================================================================
+
+machine parse_call_expr(ctx: *ParseContext) -> *ExprNode {
+    flow {
+        reg fn_ptr: *u8 = null;
+        reg fn_len: u32 = 0;
+        reg head:   *ExprNode = null;
+        reg tail:   *ExprNode = null;
+        reg cnt:    u32 = 0;
+
+        wire alloc = ctx.alloc;
+        wire kind = call ctx_peek_kind(ctx);
+        wire is_rparen = kind == 75; // ')'
+        wire is_comma = kind == 67;  // ','
+    }
+    states {
+        Entry: {
+            let _ = call ctx_consume(ctx); // consume 'call' (16)
+            let fn_tok = call ctx_consume(ctx); // consume IDENT (30)
+            let _ = call ctx_match(ctx, 74); // consume '(' (74)
+            _ => CheckEmpty [ fn_ptr <= fn_tok.val_ptr, fn_len <= fn_tok.val_len ];
+        }
+
+        CheckEmpty: {
+            is_rparen != 0 => FinishCall;
+            _              => ParseFirst;
+        }
+
+        ParseFirst: {
+            let arg0 = call parse_expr(ctx);
+            _ => ArgLoop [ head <= arg0, tail <= arg0, cnt <= 1 ];
+        }
+
+        ArgLoop: {
+            is_comma != 0  => NextArg;
+            is_rparen != 0 => FinishCall;
+            _              => FinishCall;
+        }
+
+        NextArg: {
+            let _ = call ctx_consume(ctx); // consume ','
+            let next_node = call parse_expr(ctx);
+            tail.next_arg <- next_node;
+            _ => ArgLoop [ tail <= next_node, cnt <= cnt + 1 ];
+        }
+
+        FinishCall: {
+            let _ = call ctx_match(ctx, 75); // consume ')'
+            let node = call make_call_node(alloc, fn_ptr, fn_len, head, cnt);
+            _ => return node;
+        }
+    }
+}
+
+machine parse_struct_lit(ctx: *ParseContext, type_ptr: *u8, type_len: u32) -> *ExprNode {
+    flow {
+        reg type_p:    *u8 = null;
+        reg type_l:    u32 = 0;
+        reg head:      *ExprNode = null;
+        reg tail:      *ExprNode = null;
+        reg cnt:       u32 = 0;
+        reg cur_fn_p:  *u8 = null;
+        reg cur_fn_l:  u32 = 0;
+
+        wire alloc = ctx.alloc;
+        wire kind = call ctx_peek_kind(ctx);
+        wire is_rbrace = kind == 77; // '}'
+        wire is_comma = kind == 67;  // ','
+    }
+    states {
+        Entry: {
+            let _ = call ctx_consume(ctx); // consume '{' (76)
+            _ => CheckEmpty [ type_p <= type_ptr, type_l <= type_len ];
+        }
+
+        CheckEmpty: {
+            is_rbrace != 0 => FinishStruct;
+            _              => ParseFirstField;
+        }
+
+        ParseFirstField: {
+            let fname_tok = call ctx_consume(ctx); // IDENT
+            let _ = call ctx_match(ctx, 65); // ':'
+            _ => ParseFirstVal [ cur_fn_p <= fname_tok.val_ptr, cur_fn_l <= fname_tok.val_len ];
+        }
+
+        ParseFirstVal: {
+            let val0 = call parse_expr(ctx);
+            let f0 = call alloc_expr_raw(alloc);
+            f0.kind <- 4; // IDENT
+            f0.str_ptr <- cur_fn_p;
+            f0.str_len <- cur_fn_l;
+            f0.left <- val0;
+            f0.next_arg <- null;
+            _ => FieldLoop [ head <= f0, tail <= f0, cnt <= 1 ];
+        }
+
+        FieldLoop: {
+            is_comma != 0  => NextField;
+            is_rbrace != 0 => FinishStruct;
+            _              => FinishStruct;
+        }
+
+        NextField: {
+            let _ = call ctx_consume(ctx); // consume ','
+            is_rbrace != 0 => FinishStruct; // trailing comma support
+            let fname_tok = call ctx_consume(ctx); // IDENT
+            let _ = call ctx_match(ctx, 65); // ':'
+            _ => ParseNextVal [ cur_fn_p <= fname_tok.val_ptr, cur_fn_l <= fname_tok.val_len ];
+        }
+
+        ParseNextVal: {
+            let next_val = call parse_expr(ctx);
+            let next_f = call alloc_expr_raw(alloc);
+            next_f.kind <- 4; // IDENT
+            next_f.str_ptr <- cur_fn_p;
+            next_f.str_len <- cur_fn_l;
+            next_f.left <- next_val;
+            next_f.next_arg <- null;
+            tail.next_arg <- next_f;
+            _ => FieldLoop [ tail <= next_f, cnt <= cnt + 1 ];
+        }
+
+        FinishStruct: {
+            let _ = call ctx_match(ctx, 77); // consume '}'
+            let root = call alloc_expr_raw(alloc);
+            root.kind <- 9; // STRUCT_LIT
+            root.str_ptr <- type_p;
+            root.str_len <- type_l;
+            root.args <- head;
+            root.next_arg <- null;
+            root.arg_count <- cnt;
+            _ => return root;
+        }
+    }
+}
+
+// 基本要素アトム走査 (リテラル、変数、単項演算、丸括弧、call)
+machine parse_atom(ctx: *ParseContext) -> *ExprNode {
+    flow {
+        reg id_ptr:    *u8 = null;
+        reg id_len:    u32 = 0;
+        reg left_node: *ExprNode = null;
+
+        wire kind = call ctx_peek_kind(ctx);
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            kind == 22 => HandleCast;   // 'cast' (TOK_CAST = 22)
+            kind == 31 => HandleInt;    // INT_LIT
+            kind == 32 => HandleStr;    // STRING_LIT
+            kind == 30 => HandleIdent;  // IDENT
+            kind == 16 => HandleCall;   // CALL
+            kind == 70 => HandleDeref;  // '*'
+            kind == 62 => HandleAddr;   // '&'
+            kind == 72 => HandleNeg;    // '-'
+            kind == 74 => HandleParen;  // '('
+            _          => HandleError;
+        }
+
+        HandleCast: {
+            let _ = call ctx_consume(ctx); // consume 'cast'
+            let _ = call ctx_match(ctx, 74); // match '('
+            let ts = call parse_type_slice(ctx); // parse target type e.g. "i64", "*u8"
+            let _ = call ctx_match(ctx, 75); // match ')'
+            let operand = call parse_atom(ctx);
+            let node = call make_cast_node(alloc, ts.ptr, ts.len, operand);
+            _ => return node;
+        }
+
+        HandleInt: {
+            let t = call ctx_consume(ctx);
+            let t_ptr = t.val_ptr;
+            let t_len = t.val_len;
+            let val = call parse_int_val(t_ptr, t_len);
+            let node = call make_int_node(alloc, val);
+            _ => return node;
+        }
+
+        HandleStr: {
+            let t = call ctx_consume(ctx);
+            let t_ptr = t.val_ptr;
+            let t_len = t.val_len;
+            let node = call make_str_node(alloc, t_ptr, t_len);
+            _ => return node;
+        }
+
+        HandleIdent: {
+            let t = call ctx_consume(ctx);
+            let t_ptr = t.val_ptr;
+            let t_len = t.val_len;
+            t_len == 4 => CheckNull [ id_ptr <= t_ptr, id_len <= t_len ];
+            _          => CheckStruct [ id_ptr <= t_ptr, id_len <= t_len ];
+        }
+
+        CheckNull: {
+            let c0 = *id_ptr;
+            c0 != 110 => CheckStruct; // 'n'
+            let p1 = id_ptr + 1;
+            let c1 = *p1;
+            c1 != 117 => CheckStruct; // 'u'
+            let p2 = id_ptr + 2;
+            let c2 = *p2;
+            c2 != 108 => CheckStruct; // 'l'
+            let p3 = id_ptr + 3;
+            let c3 = *p3;
+            c3 == 108 => MakeNull;    // 'l'
+            _         => CheckStruct;
+        }
+
+        CheckStruct: {
+            let next_k = call ctx_peek_kind(ctx);
+            next_k == 76 => ParseStruct; // '{' -> StructLit
+            _            => MakeVar;
+        }
+
+        ParseStruct: {
+            let s_node = call parse_struct_lit(ctx, id_ptr, id_len);
+            _ => return s_node;
+        }
+
+        MakeNull: {
+            let node = call make_null_node(alloc);
+            _ => return node;
+        }
+
+        MakeVar: {
+            let node = call make_var_node(alloc, id_ptr, id_len);
+            _ => return node;
+        }
+
+        HandleCall: {
+            let node = call parse_call_expr(ctx);
+            _ => return node;
+        }
+
+        HandleDeref: {
+            let _ = call ctx_consume(ctx);
+            let operand = call parse_atom(ctx);
+            let node = call make_unop_node(alloc, 70, operand);
+            _ => return node;
+        }
+
+        HandleAddr: {
+            let _ = call ctx_consume(ctx);
+            let operand = call parse_atom(ctx);
+            _ => CheckAddrDot [ left_node <= operand ];
+        }
+
+        CheckAddrDot: {
+            let next_k = call ctx_peek_kind(ctx);
+            next_k == 68 => ConsumeAddrDot; // '.'
+            _            => FinishAddr;
+        }
+
+        ConsumeAddrDot: {
+            let _ = call ctx_consume(ctx); // consume '.'
+            let f_tok = call ctx_consume(ctx); // consume field
+            let f_node = call make_field_node(alloc, left_node, f_tok.val_ptr, f_tok.val_len);
+            _ => CheckAddrDot [ left_node <= f_node ];
+        }
+
+        FinishAddr: {
+            let node = call make_unop_node(alloc, 62, left_node);
+            _ => return node;
+        }
+
+        HandleNeg: {
+            let _ = call ctx_consume(ctx);
+            let operand = call parse_atom(ctx);
+            let zero = call make_int_node(alloc, 0);
+            let node = call make_binop_node(alloc, 72, zero, operand);
+            _ => return node;
+        }
+
+        HandleParen: {
+            let _ = call ctx_consume(ctx); // consume '('
+            let expr = call parse_expr(ctx);
+            let _ = call ctx_match(ctx, 75); // consume ')'
+            _ => return expr;
+        }
+
+        HandleError: {
+            ctx.error_code <- -10;
+            _ => return null;
+        }
+    }
+}
+
+machine is_binop_token(k: u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            k < 40  => No;
+            k == 42 => No;  // '->'
+            k == 43 => No;  // '=>'
+            k == 45 => No;  // '<-'
+            k <= 50 => Yes; // '<<', '>>', '<=', '==', '!=', '>=', '||', '&&'
+            k < 60  => No;
+            k <= 64 => Yes; // '<', '>', '&', '|', '^'
+            k < 70  => No;
+            k <= 73 => Yes; // '*', '+', '-', '/'
+            _       => No;
+        }
+        Yes: { _ => return 1; }
+        No:  { _ => return 0; }
+    }
+}
+
+// フラット式パーサ (Atom [Op RightAtom | .Field])
+machine parse_expr(ctx: *ParseContext) -> *ExprNode {
+    flow {
+        reg left:   *ExprNode = null;
+        reg op:     u32 = 0;
+
+        wire alloc = ctx.alloc;
+        wire next_kind = call ctx_peek_kind(ctx);
+        wire is_dot = next_kind == 68; // '.'
+    }
+    states {
+        Entry: {
+            let first = call parse_atom(ctx);
+            _ => CheckNext [ left <= first ];
+        }
+
+        CheckNext: {
+            is_dot != 0 => HandleDot;
+            let is_bin = call is_binop_token(next_kind);
+            is_bin != 0 => ParseRight [ op <= next_kind ];
+            _           => Finish;
+        }
+
+        HandleDot: {
+            let _ = call ctx_consume(ctx); // consume '.'
+            let f_tok = call ctx_consume(ctx); // consume field IDENT
+            let node = call make_field_node(alloc, left, f_tok.val_ptr, f_tok.val_len);
+            // 連続するドットアクセス (a.b.c) のため再帰的にチェック
+            _ => CheckNext [ left <= node ];
+        }
+
+        ParseRight: {
+            let _ = call ctx_consume(ctx); // consume operator
+            let right = call parse_atom(ctx);
+            let node = call make_binop_node(alloc, op, left, right);
+
+            let after_k = call ctx_peek_kind(ctx);
+            let is_complex = call is_binop_token(after_k);
+            is_complex != 0 => ErrorComplexExpr;
+            _               => return node;
+        }
+
+        ErrorComplexExpr: {
+            ctx.error_code <- -29; // COMPLEX_EXPR_DISALLOWED
+            _ => return null;
+        }
+
+        Finish: {
+            _ => return left;
+        }
+    }
+}
+
+// ============================================================================
+// 構文述語ヘルパーマシン群
+// ============================================================================
+
+// Entry 名検証 ("Entry": len == 5, 'E'=69, 'n'=110, 't'=116, 'r'=114, 'y'=121)
+machine is_entry_name(p: *u8, len: u32) -> u32 {
+    flow {
+        wire p0 = p + 0;
+        wire c0 = *p0;
+        wire p1 = p + 1;
+        wire c1 = *p1;
+        wire p2 = p + 2;
+        wire c2 = *p2;
+        wire p3 = p + 3;
+        wire c3 = *p3;
+        wire p4 = p + 4;
+        wire c4 = *p4;
+    }
+    states {
+        Entry: {
+            len != 5  => NoMatch;
+            c0 != 69  => NoMatch; // 'E'
+            c1 != 110 => NoMatch; // 'n'
+            c2 != 116 => NoMatch; // 't'
+            c3 != 114 => NoMatch; // 'r'
+            c4 == 121 => Match;   // 'y'
+            _         => NoMatch;
+        }
+        Match: { _ => return 1; }
+        NoMatch: { _ => return 0; }
+    }
+}
+
+machine alloc_type_slice(alloc: *BumpAlloc) -> *TypeSlice {
+    flow {}
+    states {
+        Entry: {
+            let mem = call bump_alloc(alloc, 16, 8);
+            _ => return mem;
+        }
+    }
+}
+
+// 型スライスパースマシン ("*u8", "i32" 等)
+machine parse_type_slice(ctx: *ParseContext) -> *TypeSlice {
+    flow {
+        reg start_p:  *u8 = null;
+        reg star_cnt: u32 = 0;
+        wire kind = call ctx_peek_kind(ctx);
+        wire is_star = kind == 70; // '*'
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            let first_tok = call ctx_peek_tok(ctx);
+            _ => StarLoop [ start_p <= first_tok.val_ptr, star_cnt <= 0 ];
+        }
+        StarLoop: {
+            is_star != 0 => ConsumeStar;
+            _            => ConsumeBase;
+        }
+        ConsumeStar: {
+            let _ = call ctx_consume(ctx);
+            _ => StarLoop [ star_cnt <= star_cnt + 1 ];
+        }
+        ConsumeBase: {
+            let base_tok = call ctx_consume(ctx); // base IDENT
+            let b_len = base_tok.val_len;
+            let total_len = star_cnt + b_len;
+            let slice_mem = call alloc_type_slice(alloc);
+            slice_mem.ptr <- start_p;
+            slice_mem.len <- total_len;
+            _ => return slice_mem;
+        }
+    }
+}
+
+// ルール開始判定 (先読み 10 トークンで '=>' があるか、または先頭が '_')
+machine is_rule_start(ctx: *ParseContext) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire cpos = ctx.pos;
+        wire ctoks = ctx.tokens;
+        wire max_t = ctx.tok_cnt;
+        wire p = cpos + i;
+        wire tok = ctoks + p;
+        wire k = tok.kind;
+    }
+    states {
+        Entry: {
+            let curr_k = call ctx_peek_kind(ctx);
+            curr_k == 80 => MatchRule; // '_'
+            _            => LookaheadLoop [ i <= 0 ];
+        }
+        LookaheadLoop: {
+            i >= 10     => NoRule;
+            p >= max_t  => NoRule;
+            k == 43     => MatchRule; // '=>' (FAT_ARROW)
+            k == 66     => NoRule;    // ';'
+            k == 45     => NoRule;    // '<-' (STORE)
+            _           => NextTok [ i <= i + 1 ];
+        }
+        NextTok: {
+            _ => LookaheadLoop;
+        }
+        MatchRule: { _ => return 1; }
+        NoRule:    { _ => return 0; }
+    }
+}
+
+// ============================================================================
+// Flow ブロック構文解析マシン (parse_flow)
+// ============================================================================
+
+machine parse_flow(ctx: *ParseContext, m: *MachineDef) -> i32 {
+    flow {
+        reg reg_cnt:    u32 = 0;
+        reg wire_cnt:   u32 = 0;
+        reg cur_name_p: *u8 = null;
+        reg cur_name_l: u32 = 0;
+        reg cur_type_p: *u8 = null;
+        reg cur_type_l: u32 = 0;
+
+        wire alloc = ctx.alloc;
+        wire kind = call ctx_peek_kind(ctx);
+        wire is_rbrace = kind == 77; // '}'
+        wire is_reg = kind == 13;    // REG
+        wire is_wire = kind == 14;   // WIRE
+    }
+    states {
+        Entry: {
+            let _ = call ctx_consume(ctx); // consume 'flow' (11)
+            let ok_lbrace = call ctx_match(ctx, 76); // '{'
+            ok_lbrace == 0 => ErrorFlow;
+
+            let regs_mem = call bump_alloc(alloc, 1024, 8);
+            let wires_mem = call bump_alloc(alloc, 1024, 8);
+            m.regs <- regs_mem;
+            m.wires <- wires_mem;
+
+            _ => Loop [ reg_cnt <= 0, wire_cnt <= 0 ];
+        }
+
+        Loop: {
+            is_rbrace != 0 => Finish;
+            is_reg != 0    => ParseReg;
+            is_wire != 0   => ParseWire;
+            _              => ErrorFlow;
+        }
+
+        ParseReg: {
+            let _ = call ctx_consume(ctx); // consume 'reg'
+            let name_tok = call ctx_consume(ctx); // IDENT
+            let ok_colon = call ctx_match(ctx, 65); // ':'
+            ok_colon == 0 => ErrorFlow;
+
+            let ts = call parse_type_slice(ctx);
+            let name_p = name_tok.val_ptr;
+            let name_l = name_tok.val_len;
+            let ts_p = ts.ptr;
+            let ts_l = ts.len;
+
+            let has_eq = call ctx_match(ctx, 69); // '='
+            has_eq != 0 => RegWithInit [ cur_name_p <= name_p, cur_name_l <= name_l, cur_type_p <= ts_p, cur_type_l <= ts_l ];
+            _           => RegNoInit   [ cur_name_p <= name_p, cur_name_l <= name_l, cur_type_p <= ts_p, cur_type_l <= ts_l ];
+        }
+
+        RegWithInit: {
+            let init_e = call parse_expr(ctx);
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorFlow;
+
+            let m_regs = m.regs;
+            let reg_slot = m_regs + reg_cnt;
+            reg_slot.name_ptr  <- cur_name_p;
+            reg_slot.name_len  <- cur_name_l;
+            reg_slot.type_ptr  <- cur_type_p;
+            reg_slot.type_len  <- cur_type_l;
+            reg_slot.init_expr <- init_e;
+
+            let next_rc = reg_cnt + 1;
+            _ => Loop [ reg_cnt <= next_rc ];
+        }
+
+        RegNoInit: {
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorFlow;
+
+            let m_regs = m.regs;
+            let reg_slot = m_regs + reg_cnt;
+            reg_slot.name_ptr  <- cur_name_p;
+            reg_slot.name_len  <- cur_name_l;
+            reg_slot.type_ptr  <- cur_type_p;
+            reg_slot.type_len  <- cur_type_l;
+            reg_slot.init_expr <- null;
+
+            let next_rc = reg_cnt + 1;
+            _ => Loop [ reg_cnt <= next_rc ];
+        }
+
+        ParseWire: {
+            let _ = call ctx_consume(ctx); // consume 'wire'
+            let name_tok = call ctx_consume(ctx); // IDENT
+            let ok_eq = call ctx_match(ctx, 69); // '='
+            ok_eq == 0 => ErrorFlow;
+
+            let w_expr = call parse_expr(ctx);
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorFlow;
+
+            let m_wires = m.wires;
+            let wire_slot = m_wires + wire_cnt;
+            let name_p = name_tok.val_ptr;
+            let name_l = name_tok.val_len;
+            wire_slot.name_ptr <- name_p;
+            wire_slot.name_len <- name_l;
+            wire_slot.expr     <- w_expr;
+
+            let next_wc = wire_cnt + 1;
+            _ => Loop [ wire_cnt <= next_wc ];
+        }
+
+        Finish: {
+            let _ = call ctx_consume(ctx); // consume '}'
+            m.reg_count  <- reg_cnt;
+            m.wire_count <- wire_cnt;
+            _ => return 0;
+        }
+
+        ErrorFlow: {
+            ctx.error_code <- -20; // FLOW_SYNTAX_ERROR
+            _ => return -20;
+        }
+    }
+}
+
+// ============================================================================
+// ActionStmt & TransitionRule パースマシン群
+// ============================================================================
+
+machine parse_action(ctx: *ParseContext, out_act: *ActionStmt) -> i32 {
+    flow {
+        wire kind = call ctx_peek_kind(ctx);
+    }
+    states {
+        Entry: {
+            kind == 15 => ParseLet;  // 'let'
+            kind == 16 => ParseCall; // 'call'
+            _          => ParseStore; // Store
+        }
+
+        ParseLet: {
+            let _ = call ctx_consume(ctx); // consume 'let'
+            let is_under = call ctx_match(ctx, 80); // '_'
+            is_under != 0 => LetUnder;
+            _             => LetNamed;
+        }
+
+        LetUnder: {
+            let ok_eq = call ctx_match(ctx, 69); // '='
+            ok_eq == 0 => ErrorAction;
+            let expr = call parse_expr(ctx);
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorAction;
+
+            out_act.kind        <- 1; // LET
+            out_act.target_ptr  <- null;
+            out_act.target_len  <- 0;
+            out_act.target_expr <- null;
+            out_act.expr        <- expr;
+            _ => return 0;
+        }
+
+        LetNamed: {
+            let t_tok = call ctx_consume(ctx); // IDENT
+            let ok_eq = call ctx_match(ctx, 69); // '='
+            ok_eq == 0 => ErrorAction;
+            let expr = call parse_expr(ctx);
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorAction;
+
+            out_act.kind        <- 1; // LET
+            out_act.target_ptr  <- t_tok.val_ptr;
+            out_act.target_len  <- t_tok.val_len;
+            out_act.target_expr <- null;
+            out_act.expr        <- expr;
+            _ => return 0;
+        }
+
+        ParseCall: {
+            let expr = call parse_call_expr(ctx);
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorAction;
+
+            out_act.kind        <- 2; // CALL
+            out_act.target_ptr  <- null;
+            out_act.target_len  <- 0;
+            out_act.target_expr <- null;
+            out_act.expr        <- expr;
+            _ => return 0;
+        }
+
+        ParseStore: {
+            let target = call parse_expr(ctx);
+            let ok_store = call ctx_match(ctx, 45); // '<-'
+            ok_store == 0 => ErrorAction;
+            let val = call parse_expr(ctx);
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorAction;
+
+            out_act.kind        <- 3; // STORE
+            out_act.target_ptr  <- null;
+            out_act.target_len  <- 0;
+            out_act.target_expr <- target;
+            out_act.expr        <- val;
+            _ => return 0;
+        }
+
+        ErrorAction: {
+            ctx.error_code <- -23;
+            _ => return -23;
+        }
+    }
+}
+
+machine alloc_latch_node(alloc: *BumpAlloc) -> *LatchAssign {
+    flow {}
+    states {
+        Entry: {
+            let p = call bump_alloc(alloc, 32, 8);
+            _ => return p;
+        }
+    }
+}
+
+machine alloc_rule_node(alloc: *BumpAlloc) -> *TransitionRule {
+    flow {}
+    states {
+        Entry: {
+            let p = call bump_alloc(alloc, 64, 8);
+            _ => return p;
+        }
+    }
+}
+
+machine alloc_action_node(alloc: *BumpAlloc) -> *ActionStmt {
+    flow {}
+    states {
+        Entry: {
+            let p = call bump_alloc(alloc, 48, 8);
+            _ => return p;
+        }
+    }
+}
+
+machine alloc_state_node(alloc: *BumpAlloc) -> *StateDef {
+    flow {}
+    states {
+        Entry: {
+            let p = call bump_alloc(alloc, 56, 8);
+            _ => return p;
+        }
+    }
+}
+
+machine parse_rule(ctx: *ParseContext, out_rule: *TransitionRule) -> i32 {
+    flow {
+        reg guard_e:    *ExprNode = null;
+        reg target_p:   *u8 = null;
+        reg target_l:   u32 = 0;
+        reg latch_cnt:  u32 = 0;
+        reg head_latch: *LatchAssign = null;
+        reg tail_latch: *LatchAssign = null;
+        reg cur_latch:  *LatchAssign = null;
+
+        wire alloc = ctx.alloc;
+        wire kind = call ctx_peek_kind(ctx);
+        wire is_under = kind == 80; // '_'
+    }
+    states {
+        Entry: {
+            is_under != 0 => GuardUnder;
+            _             => GuardExpr;
+        }
+
+        GuardUnder: {
+            let _ = call ctx_consume(ctx); // consume '_'
+            _ => AfterGuard [ guard_e <= null ];
+        }
+
+        GuardExpr: {
+            let g = call parse_expr(ctx);
+            let has_err = ctx.error_code;
+            has_err != 0 => ForwardExprError;
+            _            => AfterGuard [ guard_e <= g ];
+        }
+
+        ForwardExprError: {
+            _ => return ctx.error_code;
+        }
+
+        AfterGuard: {
+            let ok_farr = call ctx_match(ctx, 43); // '=>'
+            ok_farr == 0 => ErrorRule;
+
+            let next_k = call ctx_peek_kind(ctx);
+            next_k == 19 => HandleReturn; // 'return'
+            next_k == 20 => HandlePanic;  // 'panic'
+            _            => HandleTarget; // IDENT
+        }
+
+        HandleReturn: {
+            let _ = call ctx_consume(ctx); // consume 'return'
+            let is_semi = call ctx_match(ctx, 66); // ';'
+            is_semi != 0 => RetVoid;
+            _            => RetVal;
+        }
+
+        RetVoid: {
+            out_rule.guard       <- guard_e;
+            out_rule.target_ptr  <- null;
+            out_rule.target_len  <- 0;
+            out_rule.latches     <- null;
+            out_rule.latch_count <- 0;
+            out_rule.is_return   <- 1;
+            out_rule.is_panic    <- 0;
+            out_rule.ret_expr    <- null;
+            out_rule.next        <- null;
+            _ => return 0;
+        }
+
+        RetVal: {
+            let r_expr = call parse_expr(ctx);
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorRule;
+
+            out_rule.guard       <- guard_e;
+            out_rule.target_ptr  <- null;
+            out_rule.target_len  <- 0;
+            out_rule.latches     <- null;
+            out_rule.latch_count <- 0;
+            out_rule.is_return   <- 1;
+            out_rule.is_panic    <- 0;
+            out_rule.ret_expr    <- r_expr;
+            out_rule.next        <- null;
+            _ => return 0;
+        }
+
+        HandlePanic: {
+            let _ = call ctx_consume(ctx); // consume 'panic'
+            let ok_lp = call ctx_match(ctx, 74); // '('
+            ok_lp == 0 => ErrorRule;
+            let p_expr = call parse_expr(ctx);
+            let ok_rp = call ctx_match(ctx, 75); // ')'
+            ok_rp == 0 => ErrorRule;
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorRule;
+
+            out_rule.guard       <- guard_e;
+            out_rule.target_ptr  <- null;
+            out_rule.target_len  <- 0;
+            out_rule.latches     <- null;
+            out_rule.latch_count <- 0;
+            out_rule.is_return   <- 0;
+            out_rule.is_panic    <- 1;
+            out_rule.ret_expr    <- p_expr;
+            out_rule.next        <- null;
+            _ => return 0;
+        }
+
+        HandleTarget: {
+            let t_tok = call ctx_consume(ctx); // target IDENT
+            // Entry 逆戻り遷移禁止ガード (error -22)
+            let is_to_entry = call is_entry_name(t_tok.val_ptr, t_tok.val_len);
+            is_to_entry != 0 => ErrorToEntry;
+
+            let has_bracket = call ctx_match(ctx, 78); // '['
+            has_bracket != 0 => ParseLatches [ target_p <= t_tok.val_ptr, target_l <= t_tok.val_len ];
+            _                => TargetNoLatch [ target_p <= t_tok.val_ptr, target_l <= t_tok.val_len ];
+        }
+
+        ErrorToEntry: {
+            ctx.error_code <- -22; // ILLEGAL_TRANSITION_TO_ENTRY
+            _ => return -22;
+        }
+
+        TargetNoLatch: {
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorRule;
+
+            out_rule.guard       <- guard_e;
+            out_rule.target_ptr  <- target_p;
+            out_rule.target_len  <- target_l;
+            out_rule.latches     <- null;
+            out_rule.latch_count <- 0;
+            out_rule.is_return   <- 0;
+            out_rule.is_panic    <- 0;
+            out_rule.ret_expr    <- null;
+            out_rule.next        <- null;
+            _ => return 0;
+        }
+
+        ParseLatches: {
+            _ => LatchLoop [ guard_e <= guard_e, target_p <= target_p, target_l <= target_l, latch_cnt <= 0, head_latch <= null, tail_latch <= null ];
+        }
+
+        LatchLoop: {
+            let r_tok = call ctx_consume(ctx); // reg IDENT
+            let ok_leq = call ctx_match(ctx, 44); // '<='
+            ok_leq == 0 => ErrorRule;
+            let l_expr = call parse_expr(ctx);
+
+            let latch_node = call alloc_latch_node(alloc);
+            latch_node.reg_ptr <- r_tok.val_ptr;
+            latch_node.reg_len <- r_tok.val_len;
+            latch_node.expr    <- l_expr;
+            latch_node.next    <- null;
+
+            head_latch == null => InitLatchList [ head_latch <= latch_node, tail_latch <= latch_node, cur_latch <= latch_node ];
+            _                  => LinkLatchNode [ cur_latch <= latch_node ];
+        }
+
+        InitLatchList: {
+            _ => CheckLatchComma;
+        }
+
+        LinkLatchNode: {
+            tail_latch.next <- cur_latch;
+            _ => CheckLatchComma [ tail_latch <= cur_latch ];
+        }
+
+        CheckLatchComma: {
+            let has_comma = call ctx_match(ctx, 67); // ','
+            has_comma != 0 => NextLatch [ latch_cnt <= latch_cnt + 1 ];
+            _              => EndLatches [ latch_cnt <= latch_cnt + 1 ];
+        }
+
+        NextLatch: {
+            _ => LatchLoop;
+        }
+
+        EndLatches: {
+            let ok_rb = call ctx_match(ctx, 79); // ']'
+            ok_rb == 0 => ErrorRule;
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorRule;
+
+            out_rule.guard       <- guard_e;
+            out_rule.target_ptr  <- target_p;
+            out_rule.target_len  <- target_l;
+            out_rule.latches     <- head_latch;
+            out_rule.latch_count <- latch_cnt;
+            out_rule.is_return   <- 0;
+            out_rule.is_panic    <- 0;
+            out_rule.ret_expr    <- null;
+            out_rule.next        <- null;
+            _ => return 0;
+        }
+
+        ErrorRule: {
+            ctx.error_code <- -24;
+            _ => return -24;
+        }
+    }
+}
+
+// ============================================================================
+// States ブロック構文解析マシン (parse_states)
+// ============================================================================
+
+machine parse_states(ctx: *ParseContext, m: *MachineDef) -> i32 {
+    flow {
+        reg state_cnt:  u32 = 0;
+        reg head_state: *StateDef = null;
+        reg tail_state: *StateDef = null;
+        reg curr_s:     *StateDef = null;
+
+        // アクション用
+        reg head_act:   *ActionStmt = null;
+        reg tail_act:   *ActionStmt = null;
+        reg cur_act:    *ActionStmt = null;
+
+        // ルール用
+        reg head_rule:  *TransitionRule = null;
+        reg tail_rule:  *TransitionRule = null;
+        reg cur_rule:   *TransitionRule = null;
+
+        reg s_name_p:   *u8 = null;
+        reg s_name_l:   u32 = 0;
+
+        wire alloc = ctx.alloc;
+        wire kind = call ctx_peek_kind(ctx);
+        wire is_rbrace = kind == 77; // '}'
+    }
+    states {
+        Entry: {
+            let _ = call ctx_consume(ctx); // consume 'states' (12)
+            let ok_lb = call ctx_match(ctx, 76); // '{'
+            ok_lb == 0 => ErrorStates;
+
+            _ => StateLoop [ state_cnt <= 0, head_state <= null, tail_state <= null ];
+        }
+
+        StateLoop: {
+            is_rbrace != 0 => FinishStates;
+            _              => ParseSingleState;
+        }
+
+        ParseSingleState: {
+            let s_tok = call ctx_consume(ctx); // StateName IDENT
+
+            // 第1ステート Entry 検証ガード (error -21)
+            state_cnt == 0 => CheckFirstState [ s_name_p <= s_tok.val_ptr, s_name_l <= s_tok.val_len ];
+            _              => StateHeaderOk    [ s_name_p <= s_tok.val_ptr, s_name_l <= s_tok.val_len ];
+        }
+
+        CheckFirstState: {
+            let is_ent = call is_entry_name(s_name_p, s_name_l);
+            is_ent == 0 => ErrorNotEntry;
+            _           => StateHeaderOk;
+        }
+
+        StateHeaderOk: {
+            let ok_colon = call ctx_match(ctx, 65); // ':'
+            ok_colon == 0 => ErrorStates;
+            let ok_lb = call ctx_match(ctx, 76); // '{'
+            ok_lb == 0 => ErrorStates;
+
+            let new_s = call alloc_state_node(alloc);
+            new_s.name_ptr     <- s_name_p;
+            new_s.name_len     <- s_name_l;
+            new_s.actions      <- null;
+            new_s.action_count <- 0;
+            new_s.rules        <- null;
+            new_s.rule_count   <- 0;
+            new_s.next         <- null;
+
+            head_state == null => InitStateList [ head_state <= new_s, tail_state <= new_s, curr_s <= new_s, head_act <= null, tail_act <= null, head_rule <= null, tail_rule <= null ];
+            _                  => LinkStateNode [ curr_s <= new_s, head_act <= null, tail_act <= null, head_rule <= null, tail_rule <= null ];
+        }
+
+        InitStateList: {
+            _ => InStateLoop;
+        }
+
+        LinkStateNode: {
+            tail_state.next <- curr_s;
+            _ => InStateLoop [ tail_state <= curr_s ];
+        }
+
+        ErrorNotEntry: {
+            ctx.error_code <- -21; // FIRST_STATE_MUST_BE_ENTRY
+            _ => return -21;
+        }
+
+        InStateLoop: {
+            let curr_k = call ctx_peek_kind(ctx);
+            curr_k == 77 => EndSingleState; // '}'
+
+            let is_rule = call is_rule_start(ctx);
+            is_rule != 0 => ParseInStateRule;
+            _            => ParseInStateAction;
+        }
+
+        ParseInStateAction: {
+            let act_node = call alloc_action_node(alloc);
+            act_node.next <- null;
+            let ret = call parse_action(ctx, act_node);
+            ret != 0 => ForwardStatesError;
+
+            head_act == null => InitActList [ head_act <= act_node, tail_act <= act_node, cur_act <= act_node ];
+            _                => LinkActNode [ cur_act <= act_node ];
+        }
+
+        InitActList: {
+            curr_s.action_count <- curr_s.action_count + 1;
+            _ => InStateLoop;
+        }
+
+        LinkActNode: {
+            tail_act.next <- cur_act;
+            curr_s.action_count <- curr_s.action_count + 1;
+            _ => InStateLoop [ tail_act <= cur_act ];
+        }
+
+        ParseInStateRule: {
+            let rule_node = call alloc_rule_node(alloc);
+            rule_node.latches <- null;
+            rule_node.next    <- null;
+            let ret = call parse_rule(ctx, rule_node);
+            ret != 0 => ForwardStatesError;
+
+            head_rule == null => InitRuleList [ head_rule <= rule_node, tail_rule <= rule_node, cur_rule <= rule_node ];
+            _                 => LinkRuleNode [ cur_rule <= rule_node ];
+        }
+
+        InitRuleList: {
+            curr_s.rule_count <- curr_s.rule_count + 1;
+            _ => InStateLoop;
+        }
+
+        LinkRuleNode: {
+            tail_rule.next <- cur_rule;
+            curr_s.rule_count <- curr_s.rule_count + 1;
+            _ => InStateLoop [ tail_rule <= cur_rule ];
+        }
+
+        EndSingleState: {
+            let _ = call ctx_consume(ctx); // consume '}'
+            curr_s.actions <- head_act;
+            curr_s.rules   <- head_rule;
+            _ => StateLoop [ state_cnt <= state_cnt + 1 ];
+        }
+
+        FinishStates: {
+            let _ = call ctx_consume(ctx); // consume '}'
+            m.state_defs  <- head_state;
+            m.state_count <- state_cnt;
+            _ => return 0;
+        }
+
+        ForwardStatesError: {
+            _ => return ctx.error_code;
+        }
+
+        ErrorStates: {
+            ctx.error_code <- -25;
+            _ => return -25;
+        }
+    }
+}
+
+// ============================================================================
+// Type 定義パースマシン (parse_type)
+// ============================================================================
+
+machine parse_type(ctx: *ParseContext, out_t: *TypeDef) -> i32 {
+    flow {
+        reg field_cnt:  u32 = 0;
+        reg cur_name_p: *u8 = null;
+        reg cur_name_l: u32 = 0;
+
+        wire alloc = ctx.alloc;
+        wire kind = call ctx_peek_kind(ctx);
+        wire is_rbrace = kind == 77; // '}'
+        wire is_star = kind == 70;   // '*'
+    }
+    states {
+        Entry: {
+            let _ = call ctx_consume(ctx); // consume 'type' (18)
+            let name_tok = call ctx_consume(ctx); // IDENT
+            out_t.name_ptr <- name_tok.val_ptr;
+            out_t.name_len <- name_tok.val_len;
+
+            let ok_eq = call ctx_match(ctx, 69); // '='
+            ok_eq == 0 => ErrorType;
+
+            let fields_mem = call bump_alloc(alloc, 1024, 8);
+            out_t.fields <- fields_mem;
+
+            // Check if alias pointer type: type Name = *Target;
+            is_star != 0 => ParsePointerAlias;
+            _            => StartStruct;
+        }
+
+        ParsePointerAlias: {
+            let star_tok = call ctx_consume(ctx); // consume '*'
+            let target_tok = call ctx_consume(ctx); // Target IDENT
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorType;
+
+            let f0 = out_t.fields;
+            let target_p = target_tok.val_ptr;
+            let star_p = star_tok.val_ptr;
+            let target_l = target_tok.val_len;
+            let full_len = target_l + 1;
+            f0.name_ptr <- target_p;
+            f0.name_len <- 0;
+            f0.type_ptr <- star_p; // '*' から開始
+            f0.type_len <- full_len;
+            out_t.field_count <- 1;
+            _ => return 0;
+        }
+
+        StartStruct: {
+            let ok_lbrace = call ctx_match(ctx, 76); // '{'
+            ok_lbrace == 0 => ErrorType;
+            _ => FieldLoop [ field_cnt <= 0 ];
+        }
+
+        FieldLoop: {
+            is_rbrace != 0 => FinishFields;
+            _              => ParseField;
+        }
+
+        ParseField: {
+            let fname_tok = call ctx_consume(ctx); // fname IDENT
+            let ok_colon = call ctx_match(ctx, 65); // ':'
+            ok_colon == 0 => ErrorType;
+
+            let fn_p = fname_tok.val_ptr;
+            let fn_l = fname_tok.val_len;
+            _ => ParseFieldType [
+                cur_name_p <= fn_p,
+                cur_name_l <= fn_l
+            ];
+        }
+
+        ParseFieldType: {
+            let ts = call parse_type_slice(ctx);
+            let _ = call ctx_match(ctx, 67); // optional ','
+
+            let t_fields = out_t.fields;
+            let cur_f = t_fields + field_cnt;
+            let ts_p = ts.ptr;
+            let ts_l = ts.len;
+            cur_f.name_ptr <- cur_name_p;
+            cur_f.name_len <- cur_name_l;
+            cur_f.type_ptr <- ts_p;
+            cur_f.type_len <- ts_l;
+
+            let next_fc = field_cnt + 1;
+            _ => FieldLoop [ field_cnt <= next_fc ];
+        }
+
+        FinishFields: {
+            let _ = call ctx_consume(ctx); // consume '}'
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorType;
+            out_t.field_count <- field_cnt;
+            _ => return 0;
+        }
+
+        ErrorType: {
+            ctx.error_code <- -26;
+            _ => return -26;
+        }
+    }
+}
+
+// ============================================================================
+// Extern "C" ブロックパースマシン (parse_extern)
+// 戻り値: パースした ExternFn の個数 (>= 0), または負のエラーコード
+// ============================================================================
+
+machine parse_extern(ctx: *ParseContext, out_externs: *ExternFn, base_idx: u32) -> i32 {
+    flow {
+        reg fn_cnt:      u32 = 0;
+        reg param_cnt:   u32 = 0;
+        reg cur_fn_p:    *u8 = null;
+        reg cur_fn_l:    u32 = 0;
+        reg cur_pname_p: *u8 = null;
+        reg cur_pname_l: u32 = 0;
+
+        wire alloc = ctx.alloc;
+        wire kind = call ctx_peek_kind(ctx);
+        wire is_rbrace = kind == 77; // '}'
+        wire is_rparen = kind == 75; // ')'
+        wire is_str = kind == 32;    // STRING_LIT
+    }
+    states {
+        Entry: {
+            let _ = call ctx_consume(ctx); // consume 'extern' (17)
+            is_str != 0 => SkipStr;
+            _           => CheckLBrace;
+        }
+
+        SkipStr: {
+            let _ = call ctx_consume(ctx); // consume "C"
+            _ => CheckLBrace;
+        }
+
+        CheckLBrace: {
+            let ok_lbrace = call ctx_match(ctx, 76); // '{'
+            ok_lbrace == 0 => ErrorExtern;
+            _ => FnLoop [ fn_cnt <= 0 ];
+        }
+
+        FnLoop: {
+            is_rbrace != 0 => FinishExtern;
+            _              => ParseFnHeader;
+        }
+
+        ParseFnHeader: {
+            let _ = call ctx_consume(ctx); // 'fn' IDENT
+            let fname_tok = call ctx_consume(ctx); // fname IDENT
+            let ok_lparen = call ctx_match(ctx, 74); // '('
+            ok_lparen == 0 => ErrorExtern;
+
+            let params_mem = call bump_alloc(alloc, 512, 8);
+            let fn_idx = base_idx + fn_cnt;
+            let cur_fn = out_externs + fn_idx;
+            cur_fn.params <- params_mem;
+
+            let fname_p = fname_tok.val_ptr;
+            let fname_l = fname_tok.val_len;
+            _ => ParamLoop [
+                cur_fn_p <= fname_p,
+                cur_fn_l <= fname_l,
+                param_cnt <= 0
+            ];
+        }
+
+        ParamLoop: {
+            is_rparen != 0 => FinishParams;
+            _              => ParseParam;
+        }
+
+        ParseParam: {
+            let pname_tok = call ctx_consume(ctx); // pname IDENT
+            let ok_colon = call ctx_match(ctx, 65); // ':'
+            ok_colon == 0 => ErrorExtern;
+
+            let pname_p = pname_tok.val_ptr;
+            let pname_l = pname_tok.val_len;
+            _ => ParseParamType [
+                cur_pname_p <= pname_p,
+                cur_pname_l <= pname_l
+            ];
+        }
+
+        ParseParamType: {
+            let ts = call parse_type_slice(ctx);
+            let _ = call ctx_match(ctx, 67); // optional ','
+
+            let fn_idx = base_idx + fn_cnt;
+            let cur_fn = out_externs + fn_idx;
+            let fn_params = cur_fn.params;
+            let p_slot = fn_params + param_cnt;
+            let ts_p = ts.ptr;
+            let ts_l = ts.len;
+            p_slot.name_ptr <- cur_pname_p;
+            p_slot.name_len <- cur_pname_l;
+            p_slot.type_ptr <- ts_p;
+            p_slot.type_len <- ts_l;
+
+            let next_pc = param_cnt + 1;
+            _ => ParamLoop [ param_cnt <= next_pc ];
+        }
+
+        FinishParams: {
+            let _ = call ctx_consume(ctx); // consume ')'
+            let ok_arrow = call ctx_match(ctx, 42); // '->'
+            ok_arrow == 0 => ErrorExtern;
+
+            let ts_ret = call parse_type_slice(ctx);
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorExtern;
+
+            let fn_idx = base_idx + fn_cnt;
+            let cur_fn = out_externs + fn_idx;
+            let ts_ret_p = ts_ret.ptr;
+            let ts_ret_l = ts_ret.len;
+            cur_fn.name_ptr     <- cur_fn_p;
+            cur_fn.name_len     <- cur_fn_l;
+            cur_fn.param_count  <- param_cnt;
+            cur_fn.ret_type_ptr <- ts_ret_p;
+            cur_fn.ret_type_len <- ts_ret_l;
+
+            let next_fc = fn_cnt + 1;
+            _ => FnLoop [ fn_cnt <= next_fc ];
+        }
+
+        FinishExtern: {
+            let _ = call ctx_consume(ctx); // consume '}'
+            _ => return fn_cnt;
+        }
+
+        ErrorExtern: {
+            ctx.error_code <- -27;
+            _ => return -27;
+        }
+    }
+}
+
+// ============================================================================
+// Machine 定義パースマシン (parse_machine)
+// ============================================================================
+
+machine parse_machine(ctx: *ParseContext, out_m: *MachineDef) -> i32 {
+    flow {
+        reg param_cnt:   u32 = 0;
+        reg cur_pname_p: *u8 = null;
+        reg cur_pname_l: u32 = 0;
+
+        wire alloc = ctx.alloc;
+        wire kind = call ctx_peek_kind(ctx);
+        wire is_rparen = kind == 75; // ')'
+    }
+    states {
+        Entry: {
+            let _ = call ctx_consume(ctx); // consume 'machine' (10)
+            let name_tok = call ctx_consume(ctx); // IDENT
+            out_m.name_ptr <- name_tok.val_ptr;
+            out_m.name_len <- name_tok.val_len;
+
+            let ok_lparen = call ctx_match(ctx, 74); // '('
+            ok_lparen == 0 => ErrorMachine;
+
+            let params_mem = call bump_alloc(alloc, 512, 8);
+            out_m.params <- params_mem;
+
+            _ => ParamLoop [ param_cnt <= 0 ];
+        }
+
+        ParamLoop: {
+            is_rparen != 0 => FinishParams;
+            _              => ParseParam;
+        }
+
+        ParseParam: {
+            let pname_tok = call ctx_consume(ctx); // pname IDENT
+            let ok_colon = call ctx_match(ctx, 65); // ':'
+            ok_colon == 0 => ErrorMachine;
+
+            let pname_p = pname_tok.val_ptr;
+            let pname_l = pname_tok.val_len;
+            _ => ParseParamType [
+                cur_pname_p <= pname_p,
+                cur_pname_l <= pname_l
+            ];
+        }
+
+        ParseParamType: {
+            let ts = call parse_type_slice(ctx);
+            let _ = call ctx_match(ctx, 67); // optional ','
+
+            let m_params = out_m.params;
+            let p_slot = m_params + param_cnt;
+            let ts_p = ts.ptr;
+            let ts_l = ts.len;
+            p_slot.name_ptr <- cur_pname_p;
+            p_slot.name_len <- cur_pname_l;
+            p_slot.type_ptr <- ts_p;
+            p_slot.type_len <- ts_l;
+
+            let next_pc = param_cnt + 1;
+            _ => ParamLoop [ param_cnt <= next_pc ];
+        }
+
+        FinishParams: {
+            let _ = call ctx_consume(ctx); // consume ')'
+            out_m.param_count <- param_cnt;
+
+            let ok_arrow = call ctx_match(ctx, 42); // '->'
+            ok_arrow == 0 => ErrorMachine;
+
+            let ts_ret = call parse_type_slice(ctx);
+            let ts_ret_p = ts_ret.ptr;
+            let ts_ret_l = ts_ret.len;
+            out_m.ret_type_ptr <- ts_ret_p;
+            out_m.ret_type_len <- ts_ret_l;
+
+            let ok_lbrace = call ctx_match(ctx, 76); // '{'
+            ok_lbrace == 0 => ErrorMachine;
+
+            _ => ExecFlow;
+        }
+
+        ExecFlow: {
+            let ret_flow = call parse_flow(ctx, out_m);
+            ret_flow != 0 => ForwardError;
+            _ => ExecStates;
+        }
+
+        ExecStates: {
+            let ret_states = call parse_states(ctx, out_m);
+            ret_states != 0 => ForwardError;
+            _ => FinishMachine;
+        }
+
+        FinishMachine: {
+            let ok_rbrace = call ctx_match(ctx, 77); // '}'
+            ok_rbrace == 0 => ErrorMachine;
+            _ => return 0;
+        }
+
+        ForwardError: {
+            _ => return ctx.error_code;
+        }
+
+        ErrorMachine: {
+            ctx.error_code <- -28;
+            _ => return -28;
+        }
+    }
+}
+
+// ============================================================================
+// Program パースマシン (parse_program) & ssac_parse エントリポイント
+// ============================================================================
+
+// ============================================================================
+// プログラムエンティティ動的事前計測マシン (count_program_entities)
+// トークン列を 1 パス走査し、type / extern / machine の正確な個数を動的に計測する
+// ============================================================================
+
+machine is_fn_token(tok: *Token) -> u32 {
+    flow {
+        wire k   = tok.kind;
+        wire len = tok.val_len;
+        wire p   = tok.val_ptr;
+    }
+    states {
+        Entry: {
+            k != 30  => NoMatch; // IDENT
+            len != 2 => NoMatch;
+            _        => CheckChars;
+        }
+        CheckChars: {
+            let c0 = *p;
+            let p1 = p + 1;
+            let c1 = *p1;
+            c0 != 102 => NoMatch; // 'f'
+            c1 == 110 => Match;   // 'n'
+            _         => NoMatch;
+        }
+        Match:   { _ => return 1; }
+        NoMatch: { _ => return 0; }
+    }
+}
+
+machine count_program_entities(tokens: *Token, tok_cnt: u32, out_types: *u32, out_externs: *u32, out_machines: *u32) -> u32 {
+    flow {
+        reg i:         u32 = 0;
+        reg typ_cnt:   u32 = 0;
+        reg ext_cnt:   u32 = 0;
+        reg mac_cnt:   u32 = 0;
+        reg in_extern: u32 = 0;
+
+        wire has_more   = i < tok_cnt;
+        wire tok_ptr    = tokens + i;
+        wire kind       = tok_ptr.kind;
+
+        wire is_typ     = kind == 18; // TokenType.TYPE
+        wire is_ext     = kind == 17; // TokenType.EXTERN
+        wire is_mac     = kind == 10; // TokenType.MACHINE
+        wire is_rbrace  = kind == 77; // '}'
+
+        wire next_i   = i + 1;
+        wire next_typ = typ_cnt + 1;
+        wire next_ext = ext_cnt + 1;
+        wire next_mac = mac_cnt + 1;
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0, typ_cnt <= 0, ext_cnt <= 0, mac_cnt <= 0, in_extern <= 0 ];
+        }
+        Loop: {
+            has_more == 0  => Finish;
+            is_ext != 0    => StartExtern;
+            is_typ != 0    => IncType;
+            is_mac != 0    => IncMac;
+            in_extern != 0 => CheckInExtern;
+            _              => Next;
+        }
+        CheckInExtern: {
+            is_rbrace != 0 => EndExtern;
+            let is_fn = call is_fn_token(tok_ptr);
+            is_fn != 0     => IncExt;
+            _              => Next;
+        }
+        StartExtern: {
+            _ => Loop [ in_extern <= 1, i <= next_i ];
+        }
+        EndExtern: {
+            _ => Loop [ in_extern <= 0, i <= next_i ];
+        }
+        IncType: {
+            _ => Loop [ typ_cnt <= next_typ, i <= next_i ];
+        }
+        IncExt: {
+            _ => Loop [ ext_cnt <= next_ext, i <= next_i ];
+        }
+        IncMac: {
+            _ => Loop [ mac_cnt <= next_mac, i <= next_i ];
+        }
+        Next: {
+            _ => Loop [ i <= next_i ];
+        }
+        Finish: {
+            *out_types    <- typ_cnt;
+            *out_externs  <- ext_cnt;
+            *out_machines <- mac_cnt;
+            _ => return 0;
+        }
+    }
+}
+
+machine parse_program(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
+    flow {
+        reg typ_cnt: u32 = 0;
+        reg ext_cnt: u32 = 0;
+        reg mac_cnt: u32 = 0;
+
+        wire alloc = ctx.alloc;
+        wire kind = call ctx_peek_kind(ctx);
+        wire is_eof = kind == 99; // EOF
+        wire is_inc = kind == 21; // INCLUDE
+        wire is_typ = kind == 18; // TYPE
+        wire is_ext = kind == 17; // EXTERN
+        wire is_mac = kind == 10; // MACHINE
+    }
+    states {
+        Entry: {
+            let toks = ctx.tokens;
+            let cnt = ctx.tok_cnt;
+
+            // 一時作業領域として 3 ワード分を alloc から切り出し
+            let counts_buf = call bump_alloc(alloc, 16, 8);
+            let ptr_t = counts_buf + 0;
+            let ptr_e = counts_buf + 4;
+            let ptr_m = counts_buf + 8;
+            let _ = call count_program_entities(toks, cnt, ptr_t, ptr_e, ptr_m);
+
+            let num_t = *ptr_t;
+            let num_e = *ptr_e;
+            let num_m = *ptr_m;
+
+            // +1 マージンを確保
+            let cap_t = num_t + 1;
+            let cap_e = num_e + 1;
+            let cap_m = num_m + 1;
+
+            let bytes_t = cap_t * 32;
+            let bytes_e = cap_e * 48;
+            let bytes_m = cap_m * 96;
+
+            let types_mem    = call bump_alloc(alloc, bytes_t, 8);
+            let externs_mem  = call bump_alloc(alloc, bytes_e, 8);
+            let machines_mem = call bump_alloc(alloc, bytes_m, 8);
+            out_prog.types    <- types_mem;
+            out_prog.externs  <- externs_mem;
+            out_prog.machines <- machines_mem;
+            out_prog.type_count <- 0;
+            out_prog.extern_count <- 0;
+            out_prog.machine_count <- 0;
+
+            _ => TopLoop [ typ_cnt <= 0, ext_cnt <= 0, mac_cnt <= 0 ];
+        }
+
+        TopLoop: {
+            is_eof != 0 => FinishProgram;
+            is_inc != 0 => HandleInclude;
+            is_typ != 0 => HandleType;
+            is_ext != 0 => HandleExtern;
+            is_mac != 0 => HandleMachine;
+            _           => ErrorTopLevel;
+        }
+
+        HandleInclude: {
+            let _ = call ctx_consume(ctx); // consume 'include' (21)
+            let _ = call ctx_consume(ctx); // consume STRING_LIT
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorTopLevel;
+            _ => TopLoop;
+        }
+
+        HandleType: {
+            let p_types = out_prog.types;
+            let cur_t = p_types + typ_cnt;
+            let ret_t = call parse_type(ctx, cur_t);
+            ret_t != 0 => ForwardError;
+            let next_tc = typ_cnt + 1;
+            _ => TopLoop [ typ_cnt <= next_tc ];
+        }
+
+        HandleExtern: {
+            let p_exts = out_prog.externs;
+            let num_ext = call parse_extern(ctx, p_exts, ext_cnt);
+            num_ext < 0 => ForwardError;
+            let next_ec = ext_cnt + num_ext;
+            _ => TopLoop [ ext_cnt <= next_ec ];
+        }
+
+        HandleMachine: {
+            let p_macs = out_prog.machines;
+            let cur_m = p_macs + mac_cnt;
+            let ret_m = call parse_machine(ctx, cur_m);
+            ret_m != 0 => ForwardError;
+            let next_mc = mac_cnt + 1;
+            _ => TopLoop [ mac_cnt <= next_mc ];
+        }
+
+        FinishProgram: {
+            out_prog.type_count <- typ_cnt;
+            out_prog.extern_count <- ext_cnt;
+            out_prog.machine_count <- mac_cnt;
+            _ => return 0;
+        }
+
+        ForwardError: {
+            let ec = ctx.error_code;
+            _ => return ec;
+        }
+
+        ErrorTopLevel: {
+            ctx.error_code <- -30;
+            _ => return -30;
+        }
+    }
+}
+
+machine alloc_parse_context(alloc: *BumpAlloc) -> *ParseContext {
+    flow {}
+    states {
+        Entry: {
+            let mem = call bump_alloc(alloc, 64, 8);
+            _ => return mem;
+        }
+    }
+}
+
+machine init_parse_context(ctx: *ParseContext, tokens: *Token, tok_cnt: u32, alloc: *BumpAlloc) -> *ParseContext {
+    flow {}
+    states {
+        Entry: {
+            ctx.tokens <- tokens;
+            ctx.pos <- 0;
+            ctx.tok_cnt <- tok_cnt;
+            ctx.alloc <- alloc;
+            ctx.error_code <- 0;
+            _ => return ctx;
+        }
+    }
+}
+
+// ssac_parse: トークン配列から ProgramDef を構築する最上位公開エントリポイント
+machine ssac_parse(tokens: *Token, tok_cnt: u32, alloc: *BumpAlloc, out_prog: *ProgramDef) -> i32 {
+    flow {}
+    states {
+        Entry: {
+            let ctx_mem = call alloc_parse_context(alloc);
+            let ctx = call init_parse_context(ctx_mem, tokens, tok_cnt, alloc);
+            let ret = call parse_program(ctx, out_prog);
+            _ => return ret;
+        }
+    }
+}
+
+// ssac_get_program_info: C-ABI 境界テスト用アクセサ (ctypes 構造体定義を完全に不要化する)
+machine ssac_get_program_info(prog: *ProgramDef, out_types: *u32, out_externs: *u32, out_machines: *u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            let tc = prog.type_count;
+            let ec = prog.extern_count;
+            let mc = prog.machine_count;
+            *out_types <- tc;
+            *out_externs <- ec;
+            *out_machines <- mc;
+            _ => return 0;
+        }
+    }
+}
+
+// ssac_get_machine_info: マシン内部の構成検証アクセサ
+machine ssac_get_machine_info(prog: *ProgramDef, mac_idx: u32, out_regs: *u32, out_wires: *u32, out_states: *u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            let p_macs = prog.machines;
+            let m = p_macs + mac_idx;
+            let rc = m.reg_count;
+            let wc = m.wire_count;
+            let sc = m.state_count;
+            *out_regs <- rc;
+            *out_wires <- wc;
+            *out_states <- sc;
+            _ => return 0;
+        }
+    }
+}

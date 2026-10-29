@@ -1,0 +1,31 @@
+// ============================================================================
+// StateSSA io_uring Web Server: Pure StateSSA Main Entry Point (main.ssa)
+// SIGPIPE を無視し、ポート 18080 で io_uring 非同期サーバーを起動する
+// ============================================================================
+
+include "uring_server.ssa";
+
+extern "C" {
+    fn puts(str: *u8) -> i32;
+    fn signal(sig: i32, handler: *void) -> *void;
+}
+
+machine main() -> i32 {
+    flow {
+        reg res: i32 = 0;
+    }
+
+    states {
+        Entry: {
+            // SIGPIPE (13) を SIG_IGN (1) に設定して切断耐性を確保
+            let _ = call signal(13, cast(*void) 1);
+            let _ = call puts("StateSSA io_uring Web Server listening on 0.0.0.0:18080...");
+            let ret = call uring_server_run(18080);
+            _ => Exit [ res <= ret ];
+        }
+
+        Exit: {
+            _ => return res;
+        }
+    }
+}

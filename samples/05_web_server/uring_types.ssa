@@ -1,0 +1,124 @@
+// ============================================================================
+// StateSSA io_uring Core Types & POSIX ABI Declarations
+// Linux カーネル / POSIX libc ABI 直結型定義
+// ============================================================================
+
+include "http_types.ssa";
+
+// Linux カーネル io_uring SQE (Submission Queue Entry: 64 bytes)
+type IoUringSqe = {
+    opcode:      u8,
+    flags:       u8,
+    ioprio:      u16,
+    fd:          i32,
+    off:         u64,
+    addr:        u64,
+    len:         u32,
+    rw_flags:    u32,
+    user_data:   u64,
+    buf_index:   u16,
+    personality: u16,
+    file_index:  u32,
+    addr3:       u64,
+    pad:         u64
+};
+
+// Linux カーネル io_uring CQE (Completion Queue Entry: 16 bytes)
+type IoUringCqe = {
+    user_data:   u64,
+    res:         i32,
+    flags:       u32
+};
+
+// Linux カーネル io_uring オフセット & パラメータ定義 (120 bytes)
+type IoSqringOffsets = {
+    head:         u32,
+    tail:         u32,
+    ring_mask:    u32,
+    ring_entries: u32,
+    flags:        u32,
+    dropped:      u32,
+    array:        u32,
+    resv1:        u32,
+    user_addr:    u64
+};
+
+type IoCqringOffsets = {
+    head:         u32,
+    tail:         u32,
+    ring_mask:    u32,
+    ring_entries: u32,
+    overflow:     u32,
+    cqes:         u32,
+    flags:        u32,
+    resv1:        u32,
+    user_addr:    u64
+};
+
+type IoUringParams = {
+    sq_entries:     u32,
+    cq_entries:     u32,
+    flags:          u32,
+    sq_thread_cpu:  u32,
+    sq_thread_idle: u32,
+    features:       u32,
+    wq_fd:          u32,
+    resv0:          u32,
+    resv1:          u32,
+    resv2:          u32,
+    sq_off:         IoSqringOffsets,
+    cq_off:         IoCqringOffsets
+};
+
+// 32-bit メモリアクセスヘルパーマシン
+machine load_u32(p: *u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            _ => return *p;
+        }
+    }
+}
+
+type UringContext = {
+    ring_fd:     i32,
+
+    sq_khead:    *u32,
+    sq_ktail:    *u32,
+    sq_kflags:   *u32,
+    sq_array:    *u32,
+    sqes:        *IoUringSqe, // struct io_uring_sqe 配列 (64 bytes / entry)
+    sq_mask:     u32,
+    sq_entries:  u32,
+
+    cq_khead:    *u32,
+    cq_ktail:    *u32,
+    cqes:        *IoUringCqe, // struct io_uring_cqe 配列 (16 bytes / entry)
+    cq_mask:     u32,
+    cq_entries:  u32
+};
+
+// クライアント接続コンテキスト
+type HttpConn = {
+    fd:          i32,         // ソケット記述子 (-1: 未使用)
+    state:       u32,         // 0: FREE, 1: ACCEPT, 2: RECV, 3: SEND
+    req:         HttpRequest, // パース済みリクエスト情報
+    rx_buf:      *u8,         // 受信バッファ (4KB)
+    tx_buf:      *u8,         // 送信バッファ (4KB)
+    tx_len:      u32,         // 送信データ長
+    rx_len:      u32          // 直前受信バイト数
+};
+
+// Linux システムコール & POSIX libc extern 宣言
+extern "C" {
+    fn syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64;
+    fn mmap(addr: *void, len: u64, prot: i32, flags: i32, fd: i32, offset: i64) -> *u8;
+    fn munmap(addr: *void, len: u64) -> i32;
+    fn socket(domain: i32, type_: i32, protocol: i32) -> i32;
+    fn setsockopt(fd: i32, level: i32, optname: i32, optval: *void, optlen: u32) -> i32;
+    fn bind(fd: i32, addr: *void, addrlen: u32) -> i32;
+    fn listen(fd: i32, backlog: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn memset(dst: *void, val: i32, len: u32) -> *void;
+    fn printf(fmt: *u8, a1: i64, a2: i64) -> i32;
+}

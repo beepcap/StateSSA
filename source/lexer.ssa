@@ -1,0 +1,575 @@
+// ============================================================================
+// StateSSA Compiler v0.11.0 - Pure StateSSA Zero-Copy Lexer FSM (lexer.ssa)
+// Token 定義、高速キーワード照合、Gate 1 決定性字句解析エンジンの一体化モジュール
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. トークンデータ構造定義
+// ----------------------------------------------------------------------------
+type Token = {
+    kind:     u32,  // トークン種別 (10..99)
+    val_ptr:  *u8,  // ソースバッファ上の文字列開始ポインタ (ゼロコピー)
+    val_len:  u32,  // バイト長
+    line:     u32,  // ソースコード行番号 (1-based)
+    col:      u32   // ソースコード列番号 (1-based)
+};
+
+// トークン定数一覧:
+// Keywords: 10..29
+//   10: MACHINE, 11: FLOW, 12: STATES, 13: REG, 14: WIRE, 15: LET, 16: CALL
+//   17: EXTERN, 18: TYPE, 19: RETURN, 20: PANIC, 21: INCLUDE, 22: CAST
+// Literals & Identifiers: 30..39
+//   30: IDENT, 31: INT_LIT, 32: STRING_LIT
+// 2-character Symbols: 40..59
+//   40: SHL (<<), 41: SHR (>>), 42: ARROW (->), 43: FAT_ARROW (=>)
+//   44: LEQ (<=), 45: STORE (<-), 46: EQ (==), 47: NEQ (!=)
+//   48: GEQ (>=), 49: OR (||), 50: AND (&&)
+// 1-character Symbols: 60..89
+//   60: LT (<), 61: GT (>), 62: BIT_AND (&), 63: BIT_OR (|), 64: BIT_XOR (^)
+//   65: COLON (:), 66: SEMICOLON (;), 67: COMMA (,), 68: DOT (.)
+//   69: EQUALS (=), 70: STAR (*), 71: PLUS (+), 72: MINUS (-)
+//   73: SLASH (/), 74: LPAREN ((), 75: RPAREN ()), 76: LBRACE ({)
+//   77: RBRACE (}), 78: LBRACKET ([), 79: RBRACKET (]), 80: UNDERSCORE (_)
+// End of File:
+//   99: EOF
+
+// ----------------------------------------------------------------------------
+// 2. 高速キーワード判定マシン (バイト配列直接判定)
+// ----------------------------------------------------------------------------
+machine match_keyword(p: *u8, len: u32) -> u32 {
+    flow {
+        wire c0 = *(p + 0);
+        wire c1 = *(p + 1);
+        wire c2 = *(p + 2);
+        wire c3 = *(p + 3);
+        wire c4 = *(p + 4);
+        wire c5 = *(p + 5);
+        wire c6 = *(p + 6);
+    }
+
+    states {
+        Entry: {
+            len == 3 => CheckLen3;
+            len == 4 => CheckLen4;
+            len == 5 => CheckLen5;
+            len == 6 => CheckLen6;
+            len == 7 => CheckLen7;
+            _        => NotKeyword;
+        }
+
+        // len == 3: reg, let
+        CheckLen3: {
+            c0 == 114 => CheckReg; // 'r'
+            c0 == 108 => CheckLet; // 'l'
+            _         => NotKeyword;
+        }
+
+        CheckReg: {
+            c1 != 101 => NotKeyword; // 'e'
+            c2 == 103 => MatchReg;   // 'g'
+            _         => NotKeyword;
+        }
+
+        MatchReg: { _ => return 13; } // TokenType.REG
+
+        CheckLet: {
+            c1 != 101 => NotKeyword; // 'e'
+            c2 == 116 => MatchLet;   // 't'
+            _         => NotKeyword;
+        }
+
+        MatchLet: { _ => return 15; } // TokenType.LET
+
+        // len == 4: flow, wire, call, type, cast
+        CheckLen4: {
+            c0 == 102 => CheckFlow; // 'f'
+            c0 == 119 => CheckWire; // 'w'
+            c0 == 99  => CheckC4;   // 'c'
+            c0 == 116 => CheckType; // 't'
+            _         => NotKeyword;
+        }
+
+        CheckFlow: {
+            c1 != 108 => NotKeyword; // 'l'
+            c2 != 111 => NotKeyword; // 'o'
+            c3 == 119 => MatchFlow;  // 'w'
+            _         => NotKeyword;
+        }
+
+        MatchFlow: { _ => return 11; } // TokenType.FLOW
+
+        CheckWire: {
+            c1 != 105 => NotKeyword; // 'i'
+            c2 != 114 => NotKeyword; // 'r'
+            c3 == 101 => MatchWire;  // 'e'
+            _         => NotKeyword;
+        }
+
+        MatchWire: { _ => return 14; } // TokenType.WIRE
+
+        CheckC4: {
+            c1 != 97  => NotKeyword; // 'a'
+            c2 == 108 => CheckCall;  // 'l'
+            c2 == 115 => CheckCast;  // 's'
+            _         => NotKeyword;
+        }
+
+        CheckCall: {
+            c3 == 108 => MatchCall;  // 'l'
+            _         => NotKeyword;
+        }
+
+        MatchCall: { _ => return 16; } // TokenType.CALL
+
+        CheckCast: {
+            c3 == 116 => MatchCast;  // 't'
+            _         => NotKeyword;
+        }
+
+        MatchCast: { _ => return 22; } // TokenType.CAST
+
+        CheckType: {
+            c1 != 121 => NotKeyword; // 'y'
+            c2 != 112 => NotKeyword; // 'p'
+            c3 == 101 => MatchType;  // 'e'
+            _         => NotKeyword;
+        }
+
+        MatchType: { _ => return 18; } // TokenType.TYPE
+
+        // len == 5: panic
+        CheckLen5: {
+            c0 != 112 => NotKeyword; // 'p'
+            c1 != 97  => NotKeyword; // 'a'
+            c2 != 110 => NotKeyword; // 'n'
+            c3 != 105 => NotKeyword; // 'i'
+            c4 == 99  => MatchPanic; // 'c'
+            _         => NotKeyword;
+        }
+
+        MatchPanic: { _ => return 20; } // TokenType.PANIC
+
+        // len == 6: states, extern, return
+        CheckLen6: {
+            c0 == 115 => CheckStates; // 's'
+            c0 == 101 => CheckExtern; // 'e'
+            c0 == 114 => CheckReturn; // 'r'
+            _         => NotKeyword;
+        }
+
+        CheckStates: {
+            c1 != 116 => NotKeyword; // 't'
+            c2 != 97  => NotKeyword; // 'a'
+            c3 != 116 => NotKeyword; // 't'
+            c4 != 101 => NotKeyword; // 'e'
+            c5 == 115 => MatchStates; // 's'
+            _         => NotKeyword;
+        }
+
+        MatchStates: { _ => return 12; } // TokenType.STATES
+
+        CheckExtern: {
+            c1 != 120 => NotKeyword; // 'x'
+            c2 != 116 => NotKeyword; // 't'
+            c3 != 101 => NotKeyword; // 'e'
+            c4 != 114 => NotKeyword; // 'r'
+            c5 == 110 => MatchExtern; // 'n'
+            _         => NotKeyword;
+        }
+
+        MatchExtern: { _ => return 17; } // TokenType.EXTERN
+
+        CheckReturn: {
+            c1 != 101 => NotKeyword; // 'e'
+            c2 != 116 => NotKeyword; // 't'
+            c3 != 117 => NotKeyword; // 'u'
+            c4 != 114 => NotKeyword; // 'r'
+            c5 == 110 => MatchReturn; // 'n'
+            _         => NotKeyword;
+        }
+
+        MatchReturn: { _ => return 19; } // TokenType.RETURN
+
+        // len == 7: machine, include
+        CheckLen7: {
+            c0 == 109 => CheckMachine; // 'm'
+            c0 == 105 => CheckInclude; // 'i'
+            _         => NotKeyword;
+        }
+
+        CheckMachine: {
+            c1 != 97  => NotKeyword; // 'a'
+            c2 != 99  => NotKeyword; // 'c'
+            c3 != 104 => NotKeyword; // 'h'
+            c4 != 105 => NotKeyword; // 'i'
+            c5 != 110 => NotKeyword; // 'n'
+            c6 == 101 => MatchMachine; // 'e'
+            _         => NotKeyword;
+        }
+
+        MatchMachine: { _ => return 10; } // TokenType.MACHINE
+
+        CheckInclude: {
+            c1 != 110 => NotKeyword; // 'n'
+            c2 != 99  => NotKeyword; // 'c'
+            c3 != 108 => NotKeyword; // 'l'
+            c4 != 117 => NotKeyword; // 'u'
+            c5 != 100 => NotKeyword; // 'd'
+            c6 == 101 => MatchInclude; // 'e'
+            _         => NotKeyword;
+        }
+
+        MatchInclude: { _ => return 21; } // TokenType.INCLUDE
+
+        NotKeyword: {
+            _ => return 30; // TokenType.IDENT
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 3. トークン発行ヘルパー
+// ----------------------------------------------------------------------------
+machine emit_token(tokens: *Token, idx: u32, kind: u32, ptr: *u8, len: u32, line: u32, col: u32) -> void {
+    flow {
+        wire tok = tokens + idx;
+    }
+    states {
+        Entry: {
+            tok.kind    <- kind;
+            tok.val_ptr <- ptr;
+            tok.val_len <- len;
+            tok.line    <- line;
+            tok.col     <- col;
+            _           => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 4. 字句解析メインマシン (ssac_tokenize)
+// ----------------------------------------------------------------------------
+machine ssac_tokenize(src: *u8, src_len: u32, tokens: *Token, max_tokens: u32) -> i32 {
+    flow {
+        reg pos:       u32 = 0;
+        reg line:      u32 = 1;
+        reg col:       u32 = 1;
+        reg tok_cnt:   u32 = 0;
+        reg cur_start: u32 = 0;
+        reg cur_col:   u32 = 0;
+
+        wire is_eof   = pos >= src_len;
+        wire c0       = *(src + pos);
+        wire c1       = *(src + (pos + 1));
+        wire has_next = (pos + 1) < src_len;
+        wire is_full  = tok_cnt >= max_tokens;
+    }
+
+    states {
+        Entry: {
+            _ => MainLoop;
+        }
+
+        MainLoop: {
+            is_full != 0 => TrapBufferOverflow;
+            is_eof  != 0 => EmitEof;
+
+            // 空白スキップ
+            c0 == 32 => SkipSpace;
+            c0 == 9  => SkipSpace;
+            c0 == 13 => SkipSpace;
+            c0 == 10 => SkipNewline;
+
+            // コメント判定
+            c0 == 47 => CheckComment;
+
+            // 文字列リテラル: '"' = 34
+            c0 == 34 => StartString [ cur_start <= pos + 1, cur_col <= col, pos <= pos + 1, col <= col + 1 ];
+
+            // アンダースコア
+            c0 == 95 => StartWord   [ cur_start <= pos, cur_col <= col ];
+
+            // 英数字・記号
+            _ => CheckAlphaNum;
+        }
+
+        CheckComment: {
+            has_next == 0 => CheckSymbols;
+            c1 == 47      => SkipComment [ pos <= pos + 2, col <= col + 2 ];
+            _             => CheckSymbols;
+        }
+
+        CheckAlphaNum: {
+            c0 < 48   => CheckSymbols;
+            c0 <= 57  => StartNumber [ cur_start <= pos, cur_col <= col ];
+            c0 < 65   => CheckSymbols;
+            c0 <= 90  => StartWord   [ cur_start <= pos, cur_col <= col ];
+            c0 < 97   => CheckSymbols;
+            c0 <= 122 => StartWord   [ cur_start <= pos, cur_col <= col ];
+            _         => CheckSymbols;
+        }
+
+        SkipSpace: {
+            _ => MainLoop [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        SkipNewline: {
+            _ => MainLoop [ pos <= pos + 1, line <= line + 1, col <= 1 ];
+        }
+
+        // 行コメントスキップ (改行まで読み飛ばす)
+        SkipComment: {
+            is_eof != 0 => EmitEof;
+            c0 == 10    => SkipNewline;
+            _           => SkipComment [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        // --------------------------------------------------------------------
+        // 4.1 識別子 & キーワード走査
+        // --------------------------------------------------------------------
+        StartWord: {
+            _ => ScanWord [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        ScanWord: {
+            is_eof != 0 => FinishWord;
+            c0 == 95    => AdvanceWord;
+            c0 < 48     => FinishWord;
+            c0 <= 57    => AdvanceWord;
+            c0 < 65     => FinishWord;
+            c0 <= 90    => AdvanceWord;
+            c0 < 97     => FinishWord;
+            c0 <= 122   => AdvanceWord;
+            _           => FinishWord;
+        }
+
+        AdvanceWord: {
+            _ => ScanWord [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        FinishWord: {
+            let w_len = pos - cur_start;
+            w_len == 1 => CheckUnder;
+            _          => EmitNormalWord;
+        }
+
+        CheckUnder: {
+            let w_ptr = src + cur_start;
+            let ch = *w_ptr;
+            ch == 95 => EmitUnderscore;
+            _        => EmitNormalWord;
+        }
+
+        EmitUnderscore: {
+            let _ = call emit_token(tokens, tok_cnt, 80, src + cur_start, 1, line, cur_col);
+            _ => MainLoop [ tok_cnt <= tok_cnt + 1 ];
+        }
+
+        EmitNormalWord: {
+            let w_len = pos - cur_start;
+            let w_ptr = src + cur_start;
+            let kind = call match_keyword(w_ptr, w_len);
+            let _ = call emit_token(tokens, tok_cnt, kind, w_ptr, w_len, line, cur_col);
+            _ => MainLoop [ tok_cnt <= tok_cnt + 1 ];
+        }
+
+        // --------------------------------------------------------------------
+        // 4.2 数値リテラル走査 (10進数 & 0x16進数)
+        // --------------------------------------------------------------------
+        StartNumber: {
+            c0 == 48 => CheckHexPrefix;
+            _        => ScanDec [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        CheckHexPrefix: {
+            has_next == 0 => ScanDec [ pos <= pos + 1, col <= col + 1 ];
+            c1 == 120     => StartHex; // 'x'
+            c1 == 88      => StartHex; // 'X'
+            _             => ScanDec [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        StartHex: {
+            // "0x" の 2 バイト進める
+            _ => ScanHex [ pos <= pos + 2, col <= col + 2 ];
+        }
+
+        ScanHex: {
+            is_eof != 0 => FinishNumber;
+            c0 < 48     => FinishNumber;
+            c0 <= 57    => AdvanceHex;
+            c0 < 65     => FinishNumber;
+            c0 <= 70    => AdvanceHex; // 'A'-'F'
+            c0 < 97     => FinishNumber;
+            c0 <= 102   => AdvanceHex; // 'a'-'f'
+            _           => FinishNumber;
+        }
+
+        AdvanceHex: {
+            _ => ScanHex [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        ScanDec: {
+            is_eof != 0 => FinishNumber;
+            c0 < 48     => FinishNumber;
+            c0 <= 57    => AdvanceDec;
+            _           => FinishNumber;
+        }
+
+        AdvanceDec: {
+            _ => ScanDec [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        FinishNumber: {
+            let num_len = pos - cur_start;
+            let num_ptr = src + cur_start;
+            let _ = call emit_token(tokens, tok_cnt, 31, num_ptr, num_len, line, cur_col); // INT_LIT = 31
+            _ => MainLoop [ tok_cnt <= tok_cnt + 1 ];
+        }
+
+        // --------------------------------------------------------------------
+        // 4.3 文字列リテラル走査
+        // --------------------------------------------------------------------
+        StartString: {
+            _ => ScanString;
+        }
+
+        ScanString: {
+            is_eof != 0 => TrapUnterminatedString;
+            c0 == 10    => TrapUnterminatedString; // 改行は未終端エラー (Gate 1 違反)
+            c0 == 92    => SkipEscape [ pos <= pos + 2, col <= col + 2 ]; // '\' エスケープスキップ
+            c0 == 34    => FinishString;         // 終端 '"'
+            _           => ScanString [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        SkipEscape: {
+            is_eof != 0 => TrapUnterminatedString;
+            c0 == 10    => TrapUnterminatedString;
+            _           => ScanString;
+        }
+
+        FinishString: {
+            let str_len = pos - cur_start;
+            let str_ptr = src + cur_start;
+            // 終端 '"' の分を pos と col に加算
+            let _ = call emit_token(tokens, tok_cnt, 32, str_ptr, str_len, line, cur_col); // STRING_LIT = 32
+            _ => MainLoop [ pos <= pos + 1, col <= col + 1, tok_cnt <= tok_cnt + 1 ];
+        }
+
+        // --------------------------------------------------------------------
+        // 4.4 記号走査 (2文字記号優先判定)
+        // --------------------------------------------------------------------
+        CheckSymbols: {
+            has_next != 0 => Check2CharSymbols;
+            _             => Check1CharSymbols;
+        }
+
+        Check2CharSymbols: {
+            c0 == 60  => Check2CharLt;    // '<'
+            c0 == 62  => Check2CharGt;    // '>'
+            c0 == 61  => Check2CharEq;    // '='
+            c0 == 45  => Check2CharMinus; // '-'
+            c0 == 33  => Check2CharBang;  // '!'
+            c0 == 124 => Check2CharPipe;  // '|'
+            c0 == 38  => Check2CharAmp;   // '&'
+            _         => Check1CharSymbols;
+        }
+
+        Check2CharLt: {
+            c1 == 60 => Emit2Char [ cur_start <= 40 ]; // "<<"
+            c1 == 61 => Emit2Char [ cur_start <= 44 ]; // "<="
+            c1 == 45 => Emit2Char [ cur_start <= 45 ]; // "<-"
+            _        => Check1CharSymbols;
+        }
+
+        Check2CharGt: {
+            c1 == 62 => Emit2Char [ cur_start <= 41 ]; // ">>"
+            c1 == 61 => Emit2Char [ cur_start <= 48 ]; // ">="
+            _        => Check1CharSymbols;
+        }
+
+        Check2CharEq: {
+            c1 == 62 => Emit2Char [ cur_start <= 43 ]; // "=>"
+            c1 == 61 => Emit2Char [ cur_start <= 46 ]; // "=="
+            _        => Check1CharSymbols;
+        }
+
+        Check2CharMinus: {
+            c1 == 62 => Emit2Char [ cur_start <= 42 ]; // "->"
+            _        => Check1CharSymbols;
+        }
+
+        Check2CharBang: {
+            c1 == 61 => Emit2Char [ cur_start <= 47 ]; // "!="
+            _        => Check1CharSymbols;
+        }
+
+        Check2CharPipe: {
+            c1 == 124 => Emit2Char [ cur_start <= 49 ]; // "||"
+            _         => Check1CharSymbols;
+        }
+
+        Check2CharAmp: {
+            c1 == 38 => Emit2Char [ cur_start <= 50 ]; // "&&"
+            _        => Check1CharSymbols;
+        }
+
+        Emit2Char: {
+            let kind = cur_start;
+            let _ = call emit_token(tokens, tok_cnt, kind, src + pos, 2, line, col);
+            _ => MainLoop [ pos <= pos + 2, col <= col + 2, tok_cnt <= tok_cnt + 1 ];
+        }
+
+        Check1CharSymbols: {
+            // '<' (60), '>' (61), '&' (62), '|' (63), '^' (64), ':' (65), ';' (66), ',' (67), '.' (68)
+            // '=' (69), '*' (70), '+' (71), '-' (72), '/' (73), '(' (74), ')' (75), '{' (76), '}' (77), '[' (78), ']' (79)
+            c0 == 60  => Emit1Char [ cur_start <= 60 ]; // '<'
+            c0 == 62  => Emit1Char [ cur_start <= 61 ]; // '>'
+            c0 == 38  => Emit1Char [ cur_start <= 62 ]; // '&'
+            c0 == 124 => Emit1Char [ cur_start <= 63 ]; // '|'
+            c0 == 94  => Emit1Char [ cur_start <= 64 ]; // '^'
+            c0 == 58  => Emit1Char [ cur_start <= 65 ]; // ':'
+            c0 == 59  => Emit1Char [ cur_start <= 66 ]; // ';'
+            c0 == 44  => Emit1Char [ cur_start <= 67 ]; // ','
+            c0 == 46  => Emit1Char [ cur_start <= 68 ]; // '.'
+            c0 == 61  => Emit1Char [ cur_start <= 69 ]; // '='
+            c0 == 42  => Emit1Char [ cur_start <= 70 ]; // '*'
+            c0 == 43  => Emit1Char [ cur_start <= 71 ]; // '+'
+            c0 == 45  => Emit1Char [ cur_start <= 72 ]; // '-'
+            c0 == 47  => Emit1Char [ cur_start <= 73 ]; // '/'
+            c0 == 40  => Emit1Char [ cur_start <= 74 ]; // '('
+            c0 == 41  => Emit1Char [ cur_start <= 75 ]; // ')'
+            c0 == 123 => Emit1Char [ cur_start <= 76 ]; // '{'
+            c0 == 125 => Emit1Char [ cur_start <= 77 ]; // '}'
+            c0 == 91  => Emit1Char [ cur_start <= 78 ]; // '['
+            c0 == 93  => Emit1Char [ cur_start <= 79 ]; // ']'
+
+            _ => TrapUnexpectedChar;
+        }
+
+        Emit1Char: {
+            let kind = cur_start;
+            let _ = call emit_token(tokens, tok_cnt, kind, src + pos, 1, line, col);
+            _ => MainLoop [ pos <= pos + 1, col <= col + 1, tok_cnt <= tok_cnt + 1 ];
+        }
+
+        // --------------------------------------------------------------------
+        // 4.5 終端 & エラートラップ (Gate 1)
+        // --------------------------------------------------------------------
+        EmitEof: {
+            let _ = call emit_token(tokens, tok_cnt, 99, src + pos, 0, line, col); // EOF = 99
+            _ => return tok_cnt + 1;
+        }
+
+        TrapUnterminatedString: {
+            _ => return -1; // Gate 1 違反 (文字列未終端)
+        }
+
+        TrapUnexpectedChar: {
+            _ => return -2; // Gate 1 違反 (不正文字)
+        }
+
+        TrapBufferOverflow: {
+            _ => return -3; // バッファオーバーフロー (max_tokens 超過)
+        }
+    }
+}

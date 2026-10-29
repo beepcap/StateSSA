@@ -1,0 +1,76 @@
+// ============================================================================
+// StateSSA Connection Pool Manager
+// 固定メモリプールにおける HttpConn スロット管理マシン
+// ============================================================================
+
+include "uring_types.ssa";
+
+// 接続プール初期化マシン (conns 配列のスロットに rx_buf / tx_buf を mmap で割り当て)
+machine init_connection_pool(conns: *HttpConn, max_conns: u32) -> i32 {
+    flow {
+        reg i: u32 = 0;
+        wire is_done = i == max_conns;
+        wire conn    = conns + i;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => InitSlot;
+        }
+
+        InitSlot: {
+            // 各接続に 4KB の rx_buf と 4KB の tx_buf を確保 (計 8192 bytes)
+            let mem = call mmap(null, 8192, 3, 34, -1, 0);
+            conn.fd              <- -1;
+            conn.state           <- 0; // FREE
+            conn.rx_buf          <- mem;
+            conn.tx_buf          <- mem + 4096;
+            conn.tx_len          <- 0;
+            conn.rx_len          <- 0;
+            _ => Loop [ i <= i + 1 ];
+        }
+
+        Done: {
+            _ => return 0;
+        }
+    }
+}
+
+// 空き接続スロット探索マシン (見つからなければ -1 を返す)
+machine find_free_slot(conns: *HttpConn, max_conns: u32) -> i32 {
+    flow {
+        reg i: u32 = 0;
+        wire is_end  = i == max_conns;
+        wire conn    = conns + i;
+        wire is_free = conn.state == 0;
+    }
+
+    states {
+        Entry: {
+            _ => Check;
+        }
+
+        Check: {
+            is_end  => NotFound;
+            is_free => Found;
+            _       => Next;
+        }
+
+        Found: {
+            _ => return i;
+        }
+
+        Next: {
+            _ => Check [ i <= i + 1 ];
+        }
+
+        NotFound: {
+            _ => return -1;
+        }
+    }
+}

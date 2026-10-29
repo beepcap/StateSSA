@@ -1,0 +1,362 @@
+// ============================================================================
+// StateSSA Range Encoder Implementation
+// レンジエンコーダ (能動確率区間更新 & キャリー伝播 FSM)
+// ============================================================================
+
+type RangeEncoder = {
+    low:        u32,      // 下位 32 ビット
+    low_high:   u32,      // キャリーフラグ (0 または 1)
+    range:      u32,      // レンジ幅 (初期値: 0xFFFFFFFF)
+    cache:      u32,      // キャッシュバイト
+    cache_size: u32,      // キャッシュカウント (初期値: 1)
+    out_ptr:    *u8,      // 出力バッファ
+    out_pos:    u32       // 出力位置
+};
+
+// レンジエンコーダ初期化
+machine rc_enc_init(rc: *RangeEncoder, out_ptr: *u8) -> void {
+    flow {}
+
+    states {
+        Entry: {
+            rc.low        <- 0;
+            rc.low_high   <- 0;
+            rc.range      <- 0xFFFFFFFF;
+            rc.cache      <- 0;
+            rc.cache_size <- 1;
+            rc.out_ptr    <- out_ptr;
+            rc.out_pos    <- 0;
+            _ => return;
+        }
+    }
+}
+
+// キャリー伝播およびバイト出力
+machine rc_shift_low(rc: *RangeEncoder) -> void {
+    flow {
+        reg rem_cache: u32 = 0;
+        reg fill_byte: u32 = 0;
+
+        wire low_high   = rc.low_high;
+        wire low        = rc.low;
+        wire low_s24    = low >> 24;
+        wire low_mid    = low_s24 & 255;
+        wire cache      = rc.cache;
+        wire cache_sz   = rc.cache_size;
+        wire out_pos    = rc.out_pos;
+        wire out_ptr    = rc.out_ptr + out_pos;
+
+        wire is_carry     = low_high != 0;
+        wire is_low_bound = low < 0xFF000000;
+        wire is_flush     = is_carry || is_low_bound;
+        wire is_loop_done = rem_cache <= 1;
+    }
+
+    states {
+        Entry: {
+            is_flush => EmitFirstByte;
+            _        => IncCache;
+        }
+
+        IncCache: {
+            rc.cache_size <- cache_sz + 1;
+            _ => ShiftLow;
+        }
+
+        EmitFirstByte: {
+            let first_b = cache + low_high;
+            *out_ptr <- first_b;
+            rc.out_pos <- out_pos + 1;
+            low_high != 0 => SetFill00;
+            _             => SetFillFF;
+        }
+
+        SetFill00: {
+            _ => CheckRemLoop [ rem_cache <= cache_sz, fill_byte <= 0 ];
+        }
+
+        SetFillFF: {
+            _ => CheckRemLoop [ rem_cache <= cache_sz, fill_byte <= 255 ];
+        }
+
+        CheckRemLoop: {
+            is_loop_done => ResetCache;
+            _            => EmitFillByte;
+        }
+
+        EmitFillByte: {
+            let p_base = rc.out_ptr;
+            let p_off = rc.out_pos;
+            let cur_p = p_base + p_off;
+            *cur_p <- fill_byte;
+            rc.out_pos <- rc.out_pos + 1;
+            _ => CheckRemLoop [ rem_cache <= rem_cache - 1 ];
+        }
+
+        ResetCache: {
+            rc.cache <- low_mid;
+            rc.cache_size <- 1;
+            rc.low_high <- 0;
+            _ => ShiftLow;
+        }
+
+        ShiftLow: {
+            let r_low = rc.low;
+            let masked_low = r_low & 0x00FFFFFF;
+            let next_low = masked_low << 8;
+            rc.low <- next_low;
+            _ => return;
+        }
+    }
+}
+
+// 正規化ループ
+machine rc_enc_normalize(rc: *RangeEncoder) -> void {
+    flow {
+        wire range = rc.range;
+        wire is_norm_done = range >= 0x01000000;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_norm_done => Done;
+            _            => Step;
+        }
+
+        Step: {
+            call rc_shift_low(rc);
+            let next_range = rc.range << 8;
+            rc.range <- next_range;
+            _ => Loop;
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// 単一ビットのエンコード
+machine rc_encode_bit(rc: *RangeEncoder, prob_ptr: *u16, bit: u32) -> void {
+    flow {
+        reg reg_low: u32 = 0;
+
+        wire range = rc.range;
+        wire prob  = *prob_ptr;
+        wire range_s11 = range >> 11;
+        wire bound = range_s11 * prob;
+    }
+
+    states {
+        Entry: {
+            bit == 0 => EncodeZero;
+            _        => EncodeOne;
+        }
+
+        EncodeZero: {
+            rc.range <- bound;
+            let prob_diff = 2048 - prob;
+            let prob_delta = prob_diff >> 5;
+            let next_prob = prob + prob_delta;
+            *prob_ptr <- next_prob;
+            _ => Norm;
+        }
+
+        EncodeOne: {
+            let r_low = rc.low;
+            let new_low = r_low + bound;
+            rc.range <- range - bound;
+            let prob_delta = prob >> 5;
+            let next_prob = prob - prob_delta;
+            *prob_ptr <- next_prob;
+            let is_carry = new_low < r_low;
+            is_carry => AddCarry [ reg_low <= new_low ];
+            _        => NoCarry  [ reg_low <= new_low ];
+        }
+
+        AddCarry: {
+            rc.low <- reg_low;
+            rc.low_high <- rc.low_high + 1;
+            _ => Norm;
+        }
+
+        NoCarry: {
+            rc.low <- reg_low;
+            _ => Norm;
+        }
+
+        Norm: {
+            call rc_enc_normalize(rc);
+            _ => return;
+        }
+    }
+}
+
+// ビットツリーエンコード
+machine rc_encode_bit_tree(rc: *RangeEncoder, probs: *u16, num_bits: u32, symbol: u32) -> void {
+    flow {
+        reg m: u32 = 1;
+        reg bit_idx: u32 = 0;
+
+        wire is_done = bit_idx == num_bits;
+        wire nb_minus_1 = num_bits - 1;
+        wire shift_amt = nb_minus_1 - bit_idx;
+        wire sym_s = symbol >> shift_amt;
+        wire bit = sym_s & 1;
+        wire prob_ptr = probs + m;
+        wire m_s1 = m << 1;
+        wire next_m = m_s1 | bit;
+        wire next_idx = bit_idx + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            call rc_encode_bit(rc, prob_ptr, bit);
+            _ => Loop [ m <= next_m, bit_idx <= next_idx ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// リバースビットツリーエンコード
+machine rc_encode_reverse_bit_tree(rc: *RangeEncoder, probs: *u16, num_bits: u32, symbol: u32) -> void {
+    flow {
+        reg m: u32 = 1;
+        reg bit_idx: u32 = 0;
+        reg sym: u32 = 0;
+
+        wire is_done = bit_idx == num_bits;
+        wire bit = sym & 1;
+        wire prob_ptr = probs + m;
+        wire m_s1 = m << 1;
+        wire next_m = m_s1 | bit;
+        wire next_idx = bit_idx + 1;
+        wire next_sym = sym >> 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop [ sym <= symbol ];
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            call rc_encode_bit(rc, prob_ptr, bit);
+            _ => Loop [ m <= next_m, bit_idx <= next_idx, sym <= next_sym ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// 固定確率 (0.5) 直接ビットエンコード
+machine rc_encode_direct_bits(rc: *RangeEncoder, value: u32, num_bits: u32) -> void {
+    flow {
+        reg bit_idx: u32 = 0;
+        reg reg_low: u32 = 0;
+
+        wire is_done = bit_idx == num_bits;
+        wire nb_minus_1 = num_bits - 1;
+        wire shift_amt = nb_minus_1 - bit_idx;
+        wire val_s = value >> shift_amt;
+        wire bit = val_s & 1;
+        wire next_idx = bit_idx + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            let next_range = rc.range >> 1;
+            rc.range <- next_range;
+            bit != 0 => AddLow;
+            _        => Norm;
+        }
+
+        AddLow: {
+            let r_low = rc.low;
+            let r_range = rc.range;
+            let new_low = r_low + r_range;
+            let is_carry = new_low < r_low;
+            is_carry => AddCarry [ reg_low <= new_low ];
+            _        => NoCarry  [ reg_low <= new_low ];
+        }
+
+        AddCarry: {
+            rc.low <- reg_low;
+            rc.low_high <- rc.low_high + 1;
+            _ => Norm;
+        }
+
+        NoCarry: {
+            rc.low <- reg_low;
+            _ => Norm;
+        }
+
+        Norm: {
+            call rc_enc_normalize(rc);
+            _ => Loop [ bit_idx <= next_idx ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// レンジエンコーダフラッシュ (末尾 5 バイトの出力)
+machine rc_enc_flush(rc: *RangeEncoder) -> void {
+    flow {
+        reg step: u32 = 0;
+        wire is_done = step == 5;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            call rc_shift_low(rc);
+            _ => Loop [ step <= step + 1 ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}

@@ -1,0 +1,168 @@
+// ============================================================================
+// StateSSA io_uring Initializer & Socket Setup
+// Linux システムコール直接呼び出しによるゼロ C 言語・純粋 StateSSA 起動エンジン
+// ============================================================================
+
+include "uring_types.ssa";
+
+// ノンブロッキング TCP リスニングソケット作成マシン
+// ポート番号 (例: 8080) を受け取り、listen 済みの fd を返す (失敗時は負数)
+machine uring_create_listen_socket(port: u32) -> i32 {
+    flow {
+        reg sock_fd: i32 = -1;
+    }
+
+    states {
+        Entry: {
+            // AF_INET=2, SOCK_STREAM|SOCK_NONBLOCK=2049, protocol=0
+            let fd = call socket(2, 2049, 0);
+            fd < 0 => Error;
+            _      => ConfigSocket [ sock_fd <= fd ];
+        }
+
+        ConfigSocket: {
+            // mmap で一時設定バッファ (64 bytes) を確保
+            let buf = call mmap(null, 64, 3, 34, -1, 0); // PROT_READ|WRITE=3, MAP_PRIVATE|ANON=34
+            let _ = call memset(buf, 0, 64);
+
+            // SO_REUSEADDR=2, SO_REUSEPORT=15, SOL_SOCKET=1
+            *(buf + 0) <- 1; // opt = 1
+            let _ = call setsockopt(sock_fd, 1, 2, buf, 4);
+            let _ = call setsockopt(sock_fd, 1, 15, buf, 4);
+
+            // sockaddr_in 構築 (offset 16)
+            // sin_family = AF_INET (2: u16)
+            *(buf + 16) <- 2;
+            *(buf + 17) <- 0;
+            // sin_port (network byte order: big-endian)
+            *(buf + 18) <- (port >> 8) & 255;
+            *(buf + 19) <- port & 255;
+
+            let b_res = call bind(sock_fd, buf + 16, 16);
+            let _ = call munmap(buf, 64);
+            b_res < 0 => CloseAndFail;
+            _         => DoListen;
+        }
+
+        DoListen: {
+            let l_res = call listen(sock_fd, 4096);
+            l_res < 0 => CloseAndFail;
+            _         => Success;
+        }
+
+        Success: {
+            _ => return sock_fd;
+        }
+
+        CloseAndFail: {
+            let _ = call close(sock_fd);
+            _ => return -1;
+        }
+
+        Error: {
+            _ => return -1;
+        }
+    }
+}
+
+// io_uring セットアップマシン (リングバッファ mmap 取得・初期化)
+machine uring_setup_ring(ctx: *UringContext, entries: u32) -> i32 {
+    flow {
+        reg ring_fd:  i32 = -1;
+        reg params_p: *IoUringParams = null;
+        reg init_i:   u32 = 0;
+    }
+
+    states {
+        Entry: {
+            // io_uring_params 用一時バッファ (128 bytes) を mmap で確保
+            let params = call mmap(null, 128, 3, 34, -1, 0);
+            let _ = call memset(params, 0, 128);
+
+            // syscall(__NR_io_uring_setup=425, entries, params, 0, 0, 0, 0)
+            let params_u64 = cast(u64) params;
+            let rfd_raw = call syscall(425, entries, params_u64, 0, 0, 0, 0);
+            let rfd = cast(i32) rfd_raw;
+            rfd < 0 => FailSetup [ params_p <= params ];
+            _       => MapRings  [ ring_fd <= rfd, params_p <= params ];
+        }
+
+        MapRings: {
+            ctx.ring_fd <- ring_fd;
+
+            // params からオフセット読み取り (型安全な構造体アクセス)
+            let sq_entries  = params_p.sq_entries;
+            let cq_entries  = params_p.cq_entries;
+            let sq_off_head = params_p.sq_off.head;
+            let sq_off_tail = params_p.sq_off.tail;
+            let sq_off_mask = params_p.sq_off.ring_mask;
+            let sq_off_arr  = params_p.sq_off.array;
+
+            let cq_off_head = params_p.cq_off.head;
+            let cq_off_tail = params_p.cq_off.tail;
+            let cq_off_mask = params_p.cq_off.ring_mask;
+            let cq_off_cqes = params_p.cq_off.cqes;
+
+            // 1. SQ / CQ ring mmap
+            let sq_ring_sz = sq_off_arr + (sq_entries * 4);
+            let cq_ring_sz = cq_off_cqes + (cq_entries * 16);
+            let ring_sz = sq_ring_sz + cq_ring_sz;
+
+            // IORING_OFF_SQ_RING = 0, PROT_READ|WRITE=3, MAP_SHARED|POPULATE=32769
+            let sq_ring_ptr = call mmap(null, ring_sz, 3, 32769, ring_fd, 0);
+
+            ctx.sq_khead   <- sq_ring_ptr + sq_off_head;
+            ctx.sq_ktail   <- sq_ring_ptr + sq_off_tail;
+            ctx.sq_array   <- sq_ring_ptr + sq_off_arr;
+            ctx.sq_mask    <- call load_u32(sq_ring_ptr + sq_off_mask);
+            ctx.sq_entries <- sq_entries;
+
+            ctx.cq_khead   <- sq_ring_ptr + cq_off_head;
+            ctx.cq_ktail   <- sq_ring_ptr + cq_off_tail;
+            ctx.cqes       <- sq_ring_ptr + cq_off_cqes;
+            ctx.cq_mask    <- call load_u32(sq_ring_ptr + cq_off_mask);
+            ctx.cq_entries <- cq_entries;
+
+            // 2. SQEs mmap (IORING_OFF_SQES = 0x10000000 = 268435456)
+            let sqes_sz = sq_entries * 64;
+            let sqes_ptr = call mmap(null, sqes_sz, 3, 32769, ring_fd, 268435456);
+            ctx.sqes <- sqes_ptr;
+
+            _ => InitSqArray [ init_i <= 0 ];
+        }
+
+        // SQ array (インデックス直結) 初期化ループ: array[i] = i
+        InitSqArray: {
+            let n = ctx.sq_entries;
+            init_i == n => FinishSetup;
+            let arr = ctx.sq_array;
+            *(arr + init_i) <- init_i;
+            _ => InitSqArray [ init_i <= init_i + 1 ];
+        }
+
+        FinishSetup: {
+            let _ = call munmap(params_p, 128);
+            _ => return 0;
+        }
+
+        FailSetup: {
+            let _ = call munmap(params_p, 128);
+            _ => return -1;
+        }
+    }
+}
+
+// io_uring_enter システムコールマシン
+machine uring_enter(ctx: *UringContext, to_submit: u32, min_complete: u32, flags: u32) -> i32 {
+    flow {
+        wire ring_fd = ctx.ring_fd;
+    }
+
+    states {
+        Entry: {
+            // syscall(__NR_io_uring_enter=426, fd, to_submit, min_complete, flags, 0, 0)
+            let ret = call syscall(426, ring_fd, to_submit, min_complete, flags, 0, 0);
+            _ => return cast(i32) ret;
+        }
+    }
+}

@@ -1,0 +1,142 @@
+// ============================================================================
+// StateSSA Concurrency: 03. Parallel Sum Orchestration
+// 2つの並列ワーカータスクを起動(rt_spawn)し、結果を同期(rt_sync)して合算する
+// ============================================================================
+
+// 1. 外部 POSIX pthread ABI 宣言
+extern "C" {
+    fn pthread_create(thread: *u64, attr: *void, start_routine: *void, arg: *void) -> i32;
+    fn pthread_join(thread: u64, retval: *void) -> i32;
+    fn malloc(size: u32) -> *u8;
+    fn free(ptr: *u8) -> void;
+}
+
+// 2. 型定義 (Type Definitions)
+type WorkerEnv = {
+    arr:   *i32,
+    start: i32,
+    end:   i32
+};
+
+type AsyncTask = {
+    th:     u64,
+    arr:    *i32,
+    start:  i32,
+    end:    i32,
+    result: i32
+};
+
+// 3. 逐次計算ワーカーマシン (Sequential Worker Machine)
+machine worker_task(arr: *i32, start: i32, end: i32) -> i32 {
+    flow {
+        reg i:   i32 = start;
+        reg acc: i32 = 0;
+
+        wire is_finished = (i >= end);
+        wire next_i      = i + 1;
+        wire elem_ptr    = arr + i;
+        wire elem        = *elem_ptr;
+        wire next_acc    = acc + elem;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_finished != 0 => Exit;
+            _                => Loop [ i <= next_i, acc <= next_acc ];
+        }
+
+        Exit: {
+            _ => return acc;
+        }
+    }
+}
+
+// 4. pthread スレッドトランポリンマシン
+machine thread_trampoline(task: *AsyncTask) -> *void {
+    flow {}
+    states {
+        Entry: {
+            let a = task.arr;
+            let s = task.start;
+            let e = task.end;
+            let r = call worker_task(a, s, e);
+            task.result <- r;
+            _ => return null;
+        }
+    }
+}
+
+// 5. タスク起動マシン (rt_spawn)
+machine rt_spawn(task_fn: *void, env_ptr: *WorkerEnv) -> *void {
+    flow {}
+    states {
+        Entry: {
+            let mem = call malloc(40);
+            let task = cast(*AsyncTask) mem;
+            task.arr   <- env_ptr.arr;
+            task.start <- env_ptr.start;
+            task.end   <- env_ptr.end;
+
+            let p_th = cast(*u64) task;
+            let _ = call pthread_create(p_th, null, &thread_trampoline, cast(*void) task);
+            _ => return cast(*void) task;
+        }
+    }
+}
+
+// 6. タスク同期マシン (rt_sync)
+machine rt_sync(task_ptr: *void) -> i32 {
+    flow {}
+    states {
+        Entry: {
+            let task = cast(*AsyncTask) task_ptr;
+            let th = task.th;
+            let _ = call pthread_join(th, null);
+            let res = task.result;
+            let _ = call free(cast(*u8) task);
+            _ => return res;
+        }
+    }
+}
+
+// 7. 並列オーケストレーションマシン (Parallel Sum Orchestration)
+machine ParallelSum(arr: *i32, len: i32) -> i32 {
+    flow {
+        wire mid = len / 2;
+
+        wire env_l = WorkerEnv { arr: arr, start: 0,   end: mid };
+        wire env_r = WorkerEnv { arr: arr, start: mid, end: len };
+
+        reg task_l: *void = null;
+        reg task_r: *void = null;
+
+        reg res_l: i32 = 0;
+        reg res_r: i32 = 0;
+
+        wire total_sum = res_l + res_r;
+    }
+
+    states {
+        Entry: {
+            let tl = call rt_spawn(&worker_task, &env_l);
+            let tr = call rt_spawn(&worker_task, &env_r);
+
+            _ => Awaiting [ task_l <= tl, task_r <= tr ];
+        }
+
+        Awaiting: {
+            let r1 = call rt_sync(task_l);
+            let r2 = call rt_sync(task_r);
+
+            _ => Exit [ res_l <= r1, res_r <= r2 ];
+        }
+
+        Exit: {
+            _ => return total_sum;
+        }
+    }
+}

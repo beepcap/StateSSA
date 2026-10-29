@@ -1,0 +1,412 @@
+// ============================================================================
+// StateSSA LZMA Core Encoder Implementation
+// LZMA 圧縮ストリームエンコードエンジン (12状態マシン & 能動 FSM)
+// ============================================================================
+
+include "range_encoder.ssa";
+include "match_finder.ssa";
+
+// 一致長エンコード (LenEncoder)
+machine lzma_encode_len(rc: *RangeEncoder, len_probs: *u16, pos_state: u32, len_val: u32) -> void {
+    flow {
+        wire choice1_ptr = len_probs + 0;
+        wire choice2_ptr = len_probs + 1;
+        wire pos_s3      = pos_state << 3;
+        wire lp2         = len_probs + 2;
+        wire low_base    = lp2 + pos_s3;
+        wire lp130       = len_probs + 130;
+        wire mid_base    = lp130 + pos_s3;
+        wire high_base   = len_probs + 258;
+
+        wire is_low  = len_val < 8;
+        wire is_mid  = len_val < 16;
+    }
+
+    states {
+        Entry: {
+            is_low => EncodeLow;
+            _      => CheckMid;
+        }
+
+        EncodeLow: {
+            call rc_encode_bit(rc, choice1_ptr, 0);
+            call rc_encode_bit_tree(rc, low_base, 3, len_val);
+            _ => return;
+        }
+
+        CheckMid: {
+            call rc_encode_bit(rc, choice1_ptr, 1);
+            is_mid => EncodeMid;
+            _      => EncodeHigh;
+        }
+
+        EncodeMid: {
+            call rc_encode_bit(rc, choice2_ptr, 0);
+            call rc_encode_bit_tree(rc, mid_base, 3, len_val - 8);
+            _ => return;
+        }
+
+        EncodeHigh: {
+            call rc_encode_bit(rc, choice2_ptr, 1);
+            call rc_encode_bit_tree(rc, high_base, 8, len_val - 16);
+            _ => return;
+        }
+    }
+}
+
+// 距離スロット計算 (FSM search)
+machine lzma_calc_pos_slot(dist: u32) -> u32 {
+    flow {
+        reg slot: u32 = 0;
+
+        wire is_max_dist = dist == 0xFFFFFFFF;
+        wire is_simple   = dist < 4;
+        wire is_max_slot = slot >= 63;
+
+        wire next_slot = slot + 1;
+        wire ns_s1 = next_slot >> 1;
+        wire num_direct_bits = ns_s1 - 1;
+        wire ns_and1 = next_slot & 1;
+        wire base_prefix = 2 | ns_and1;
+        wire next_base = base_prefix << num_direct_bits;
+        wire is_lt_base = dist < next_base;
+        wire is_matched = is_lt_base || is_max_slot;
+    }
+
+    states {
+        Entry: {
+            is_max_dist => Return63;
+            is_simple   => ReturnDist;
+            _           => SearchLoop [ slot <= 4 ];
+        }
+
+        Return63: {
+            _ => return 63;
+        }
+
+        ReturnDist: {
+            _ => return dist;
+        }
+
+        SearchLoop: {
+            is_matched => Done;
+            _          => Step;
+        }
+
+        Step: {
+            _ => SearchLoop [ slot <= next_slot ];
+        }
+
+        Done: {
+            _ => return slot;
+        }
+    }
+}
+
+// 距離エンコード (Distance Encoding)
+machine lzma_encode_dist(
+    rc: *RangeEncoder,
+    pos_slot_probs: *u16, spec_pos_probs: *u16, align_probs: *u16,
+    len_state: u32, dist: u32
+) -> void {
+    flow {
+        reg slot: u32 = 0;
+
+        wire ls_s6           = len_state << 6;
+        wire slot_base       = pos_slot_probs + ls_s6;
+        wire is_simple       = slot < 4;
+        wire is_spec         = slot < 14;
+
+        wire slot_s1         = slot >> 1;
+        wire num_direct_bits = slot_s1 - 1;
+        wire slot_and1       = slot & 1;
+        wire base_prefix     = 2 | slot_and1;
+        wire base_dist       = base_prefix << num_direct_bits;
+        wire dist_sub        = dist - base_dist;
+        wire bd_minus_slot   = base_dist - slot;
+        wire spec_off        = bd_minus_slot - 1;
+        wire spec_base       = spec_pos_probs + spec_off;
+    }
+
+    states {
+        Entry: {
+            let s = call lzma_calc_pos_slot(dist);
+            _ => EncodeSlot [ slot <= s ];
+        }
+
+        EncodeSlot: {
+            call rc_encode_bit_tree(rc, slot_base, 6, slot);
+            is_simple => Done;
+            is_spec   => EncodeSpec;
+            _         => EncodeAlign;
+        }
+
+        EncodeSpec: {
+            call rc_encode_reverse_bit_tree(rc, spec_base, num_direct_bits, dist_sub);
+            _ => Done;
+        }
+
+        EncodeAlign: {
+            let direct_part = dist_sub >> 4;
+            let align_part  = dist_sub & 15;
+            call rc_encode_direct_bits(rc, direct_part, num_direct_bits - 4);
+            call rc_encode_reverse_bit_tree(rc, align_probs, 4, align_part);
+            _ => Done;
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// リテラルエンコード (8 ビットツリー走査)
+machine lzma_encode_literal(
+    rc: *RangeEncoder, lit_base: *u16,
+    is_matched: u32, match_byte: u32, symbol_byte: u32
+) -> void {
+    flow {
+        reg symbol:     u32 = 1;
+        reg step:       u32 = 0;
+        reg match_mode: u32 = 0;
+
+        wire is_done    = step == 8;
+        wire shift_amt  = 7 - step;
+        wire sb_s       = symbol_byte >> shift_amt;
+        wire bit        = sb_s & 1;
+        wire mb_s       = match_byte >> shift_amt;
+        wire match_bit  = mb_s & 1;
+
+        wire norm_prob_ptr  = lit_base + symbol;
+        wire mb_s8          = match_bit << 8;
+        wire lb_256         = lit_base + 256;
+        wire mb_ptr         = lb_256 + mb_s8;
+        wire match_prob_ptr = mb_ptr + symbol;
+
+        wire sym_s1      = symbol << 1;
+        wire next_symbol = sym_s1 | bit;
+        wire next_step   = step + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop [ match_mode <= is_matched ];
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => CheckMode;
+        }
+
+        CheckMode: {
+            match_mode != 0 => EncodeMatchedBit;
+            _               => EncodeNormalBit;
+        }
+
+        EncodeNormalBit: {
+            call rc_encode_bit(rc, norm_prob_ptr, bit);
+            _ => Loop [ symbol <= next_symbol, step <= next_step, match_mode <= 0 ];
+        }
+
+        EncodeMatchedBit: {
+            call rc_encode_bit(rc, match_prob_ptr, bit);
+            match_bit == bit => KeepMatch;
+            _                => BreakMatch;
+        }
+
+        KeepMatch: {
+            _ => Loop [ symbol <= next_symbol, step <= next_step, match_mode <= 1 ];
+        }
+
+        BreakMatch: {
+            _ => Loop [ symbol <= next_symbol, step <= next_step, match_mode <= 0 ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// 確率テーブルの初期化 (1024)
+machine lzma_enc_init_probs(probs: *u16, count: u32) -> void {
+    flow {
+        reg idx: u32 = 0;
+        wire is_done  = idx == count;
+        wire cur_ptr  = probs + idx;
+        wire next_idx = idx + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            *cur_ptr <- 1024;
+            _ => Loop [ idx <= next_idx ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// LZMA エンコードメインマシン
+machine lzma_encode_stream(
+    rc: *RangeEncoder,
+    in_buf: *u8, in_size: u32,
+    probs_base: *u16, hash_table: *u32
+) -> void {
+    flow {
+        reg cur_pos:        u32 = 0;
+        reg state:          u32 = 0;
+        reg rep0:           u32 = 0;
+        reg reg_len:        u32 = 0;
+        reg reg_dist:       u32 = 0;
+        reg reg_lit_base:   *u16 = null;
+        reg reg_match_mode: u32 = 0;
+        reg reg_match_byte: u32 = 0;
+
+        wire is_finished = cur_pos >= in_size;
+        wire pos_state   = cur_pos & 3;
+
+        // Prob pointers
+        wire p_match     = probs_base + 0;
+        wire p_rep       = probs_base + 192;
+        wire p_pos_slot  = probs_base + 432;
+        wire p_spec_pos  = probs_base + 688;
+        wire p_align     = probs_base + 802;
+        wire p_len       = probs_base + 818;
+        wire p_lit_probs = probs_base + 2882;
+
+        wire st_s4          = state << 4;
+        wire st_match_base  = p_match + st_s4;
+        wire match_prob_ptr = st_match_base + pos_state;
+        wire rep_prob_ptr   = p_rep + state;
+
+        wire prev_pos        = cur_pos - 1;
+        wire prev_byte_ptr   = in_buf + prev_pos;
+        wire cur_minus_rep0  = cur_pos - rep0;
+        wire match_off       = cur_minus_rep0 - 1;
+        wire match_byte_ptr  = in_buf + match_off;
+        wire cur_byte_ptr    = in_buf + cur_pos;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_finished => Done;
+            _           => FindMatch;
+        }
+
+        FindMatch: {
+            let packed = call mf_find_match(in_buf, in_size, cur_pos, hash_table, 8388608);
+            let m_len  = packed >> 23;
+            let m_dist = packed & 0x7FFFFF;
+            m_len >= 2 => EncodeMatch [ reg_len <= m_len, reg_dist <= m_dist ];
+            _          => PrepLit;
+        }
+
+        // --- リテラルエンコード経路 ---
+        PrepLit: {
+            call rc_encode_bit(rc, match_prob_ptr, 0);
+            cur_pos == 0 => LitFirst;
+            state >= 7   => LitMatched;
+            _            => LitNormal;
+        }
+
+        LitFirst: {
+            let lb = p_lit_probs;
+            _ => DoEncodeLit [ reg_lit_base <= lb, reg_match_mode <= 0, reg_match_byte <= 0 ];
+        }
+
+        LitMatched: {
+            let prev_byte = *prev_byte_ptr;
+            let lit_state = prev_byte >> 5;
+            let lit_off   = lit_state * 768;
+            let lb        = p_lit_probs + lit_off;
+            let mb        = cast(i32) *match_byte_ptr;
+            _ => DoEncodeLit [ reg_lit_base <= lb, reg_match_mode <= 1, reg_match_byte <= mb ];
+        }
+
+        LitNormal: {
+            let prev_byte = *prev_byte_ptr;
+            let lit_state = prev_byte >> 5;
+            let lit_off   = lit_state * 768;
+            let lb        = p_lit_probs + lit_off;
+            _ => DoEncodeLit [ reg_lit_base <= lb, reg_match_mode <= 0, reg_match_byte <= 0 ];
+        }
+
+        DoEncodeLit: {
+            let cur_b = *cur_byte_ptr;
+            call lzma_encode_literal(rc, reg_lit_base, reg_match_mode, reg_match_byte, cur_b);
+            state < 4  => LitUpdate0;
+            state < 10 => LitUpdateSub3;
+            _          => LitUpdateSub6;
+        }
+
+        LitUpdate0: {
+            _ => Loop [ state <= 0, cur_pos <= cur_pos + 1 ];
+        }
+
+        LitUpdateSub3: {
+            _ => Loop [ state <= state - 3, cur_pos <= cur_pos + 1 ];
+        }
+
+        LitUpdateSub6: {
+            _ => Loop [ state <= state - 6, cur_pos <= cur_pos + 1 ];
+        }
+
+        // --- マッチエンコード経路 ---
+        EncodeMatch: {
+            call rc_encode_bit(rc, match_prob_ptr, 1);
+            call rc_encode_bit(rc, rep_prob_ptr, 0); // 新規マッチ
+
+            let raw_len = reg_len - 2;
+            call lzma_encode_len(rc, p_len, pos_state, raw_len);
+
+            reg_len < 6 => DistLenShort;
+            _           => DistLenLong;
+        }
+
+        DistLenShort: {
+            let len_state = reg_len - 2;
+            call lzma_encode_dist(rc, p_pos_slot, p_spec_pos, p_align, len_state, reg_dist);
+            _ => ApplyMatch;
+        }
+
+        DistLenLong: {
+            let len_state = 3;
+            call lzma_encode_dist(rc, p_pos_slot, p_spec_pos, p_align, len_state, reg_dist);
+            _ => ApplyMatch;
+        }
+
+        ApplyMatch: {
+            state < 7 => MatchSet7;
+            _         => MatchSet10;
+        }
+
+        MatchSet7: {
+            _ => Loop [ state <= 7, rep0 <= reg_dist, cur_pos <= cur_pos + reg_len ];
+        }
+
+        MatchSet10: {
+            _ => Loop [ state <= 10, rep0 <= reg_dist, cur_pos <= cur_pos + reg_len ];
+        }
+
+        Done: {
+            call rc_enc_flush(rc);
+            _ => return;
+        }
+    }
+}

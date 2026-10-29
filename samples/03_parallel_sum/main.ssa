@@ -1,0 +1,52 @@
+// ============================================================================
+// StateSSA Concurrency: 03. Parallel Sum Test Driver (main.ssa)
+// 8要素の配列を確保・初期化し、ParallelSum で並列合算して 36 を検証する
+// ============================================================================
+
+extern "C" {
+    fn puts(str: *u8) -> i32;
+}
+
+machine main() -> i32 {
+    flow {
+        reg res: i32 = 0;
+    }
+
+    states {
+        Entry: {
+            // 8要素の配列を確保: 8 * 4 = 32 bytes
+            let mem = call malloc(32);
+            let p = cast(*i32) mem;
+
+            // 配列初期化: [1, 2, 3, 4, 5, 6, 7, 8]
+            *(p + 0) <- 1;
+            *(p + 1) <- 2;
+            *(p + 2) <- 3;
+            *(p + 3) <- 4;
+            *(p + 4) <- 5;
+            *(p + 5) <- 6;
+            *(p + 6) <- 7;
+            *(p + 7) <- 8;
+
+            let sum = call ParallelSum(p, 8);
+            let _ = call free(mem);
+
+            sum == 36 => Success [ res <= 0 ];
+            _         => Failure [ res <= 1 ];
+        }
+
+        Success: {
+            let _ = call puts("ParallelSum([1..8]) = 36: SUCCESS!");
+            _ => Exit;
+        }
+
+        Failure: {
+            let _ = call puts("ParallelSum FAILED!");
+            _ => Exit;
+        }
+
+        Exit: {
+            _ => return res;
+        }
+    }
+}

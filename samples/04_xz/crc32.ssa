@@ -1,0 +1,106 @@
+// ============================================================================
+// StateSSA CRC32: IEEE 802.3 CRC32 Implementation
+// 純粋 FSM による CRC32 テーブル生成およびストリームチェックサム計算エンジン
+// ============================================================================
+
+// CRC32 テーブル初期化 (256 entries)
+machine crc32_init_table(table: *u32) -> void {
+    flow {
+        reg i: u32 = 0;
+        reg j: u32 = 0;
+        reg c: u32 = 0;
+
+        wire is_outer_done = i == 256;
+        wire is_inner_done = j == 8;
+
+        wire cur_ptr       = table + i;
+        wire lsb           = c & 1;
+        wire c_shifted     = c >> 1;
+        wire c_xor         = c_shifted ^ 0xEDB88320;
+    }
+
+    states {
+        Entry: {
+            _ => OuterLoop;
+        }
+
+        OuterLoop: {
+            is_outer_done => Done;
+            _             => StartInner [ c <= i, j <= 0 ];
+        }
+
+        StartInner: {
+            _ => InnerLoop;
+        }
+
+        InnerLoop: {
+            is_inner_done => SaveTable;
+            lsb != 0      => ShiftXor;
+            _             => ShiftOnly;
+        }
+
+        ShiftXor: {
+            _ => InnerLoop [ c <= c_xor, j <= j + 1 ];
+        }
+
+        ShiftOnly: {
+            _ => InnerLoop [ c <= c_shifted, j <= j + 1 ];
+        }
+
+        SaveTable: {
+            *cur_ptr <- c;
+            _ => OuterLoop [ i <= i + 1 ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// CRC32 更新マシン (バッファを舐めて中間 CRC を更新)
+machine crc32_update(table: *u32, current_crc: u32, buf: *u8, len: u32) -> u32 {
+    flow {
+        reg crc: u32 = 0;
+        reg idx: u32 = 0;
+
+        wire is_done    = idx == len;
+        wire cur_byte   = *(buf + idx);
+        wire table_idx  = (crc ^ cur_byte) & 255;
+        wire table_ptr  = table + table_idx;
+        wire table_val  = *table_ptr;
+        wire next_crc   = (crc >> 8) ^ table_val;
+        wire next_idx   = idx + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop [ crc <= current_crc ];
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            _ => Loop [ crc <= next_crc, idx <= next_idx ];
+        }
+
+        Done: {
+            _ => return crc;
+        }
+    }
+}
+
+// 単一バッファの完全 CRC32 計算 (初期値 ~0, 最終反転 ~0)
+machine crc32_calculate(table: *u32, buf: *u8, len: u32) -> u32 {
+    flow {}
+
+    states {
+        Entry: {
+            let mid_crc = call crc32_update(table, 0xFFFFFFFF, buf, len);
+            _ => return mid_crc ^ 0xFFFFFFFF;
+        }
+    }
+}

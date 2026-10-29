@@ -1,0 +1,429 @@
+// ============================================================================
+// StateSSA HTTP Response Generator & Router Implementation
+// HttpArena 準拠レスポンス生成エンジン (200 OK, /baseline11, /echo, 404)
+// ============================================================================
+
+include "uring_types.ssa";
+
+// メモリコピーマシン (dst に src から len バイトコピーし、コピーしたバイト数を返す)
+machine resp_copy_bytes(dst: *u8, src: *u8, len: u32) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire is_done = i == len;
+        wire s_p = src + i;
+        wire d_p = dst + i;
+        wire b = *s_p;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            *d_p <- b;
+            _ => Loop [ i <= i + 1 ];
+        }
+
+        Done: {
+            _ => return len;
+        }
+    }
+}
+
+// 符号なし 32 ビット整数の 10 進 ASCII 文字列化マシン
+machine resp_write_u32_ascii(dst: *u8, value: u32) -> u32 {
+    flow {
+        reg val:   u32 = 0;
+        reg count: u32 = 0;
+        reg idx:   u32 = 0;
+
+        wire is_zero = value == 0;
+        wire is_div_done = val == 0;
+        wire is_rev_done = idx == count;
+
+        wire next_val = val / 10;
+        wire rem = val - (next_val * 10);
+    }
+
+    states {
+        Entry: {
+            is_zero => WriteZero;
+            _       => CalcDigits [ val <= value, count <= 0 ];
+        }
+
+        WriteZero: {
+            *dst <- 48; // '0'
+            _ => return 1;
+        }
+
+        // 下位桁から一時的に格納 (スタック領域 dst + 16 から手前に向かって埋める)
+        CalcDigits: {
+            is_div_done => CopyToDst [ idx <= 0 ];
+            _           => PushDigit;
+        }
+
+        PushDigit: {
+            let digit_char = 48 + rem;
+            let t_off = 32 + count;
+            let temp_p = dst + t_off; // 一時退避
+            *temp_p <- digit_char;
+            _ => CalcDigits [ val <= next_val, count <= count + 1 ];
+        }
+
+        CopyToDst: {
+            is_rev_done => Done;
+            _           => ReverseCopy;
+        }
+
+        ReverseCopy: {
+            // temp から逆順に dst へ
+            let c_sub = count - 1;
+            let src_idx = c_sub - idx;
+            let s_off = 32 + src_idx;
+            let src_p = dst + s_off;
+            let b = *src_p;
+            let target_p = dst + idx;
+            *target_p <- b;
+            _ => CopyToDst [ idx <= idx + 1 ];
+        }
+
+        Done: {
+            _ => return count;
+        }
+    }
+}
+
+// baseline11 クエリパラメータ数値パース (a と b を足す)
+// 例: /baseline11?a=10&b=20 -> 30
+machine parse_baseline_query(uri_ptr: *u8, uri_len: u32) -> u32 {
+    flow {
+        reg pos: u32 = 0;
+        reg sum: u32 = 0;
+        reg cur_num: u32 = 0;
+        reg in_num: u32 = 0;
+        reg in_query: u32 = 0;
+
+        wire is_eof = pos == uri_len;
+        wire cur_p = uri_ptr + pos;
+        wire b = *cur_p;
+        wire is_qmark = b == 63; // '?'
+        wire is_digit = (b >= 48) && (b <= 57);
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_eof => Finish;
+            in_query == 0 => CheckQMark;
+            is_digit => AccumDigit;
+            _ => CheckDelim;
+        }
+
+        CheckQMark: {
+            is_qmark => StartQuery;
+            _        => SkipToQuery;
+        }
+
+        StartQuery: {
+            _ => Loop [ pos <= pos + 1, in_query <= 1 ];
+        }
+
+        SkipToQuery: {
+            _ => Loop [ pos <= pos + 1 ];
+        }
+
+        AccumDigit: {
+            let digit = b - 48;
+            _ => Loop [ pos <= pos + 1, cur_num <= (cur_num * 10) + digit, in_num <= 1 ];
+        }
+
+        CheckDelim: {
+            in_num != 0 => AddNum;
+            _           => SkipChar;
+        }
+
+        AddNum: {
+            _ => Loop [ pos <= pos + 1, sum <= sum + cur_num, cur_num <= 0, in_num <= 0 ];
+        }
+
+        SkipChar: {
+            _ => Loop [ pos <= pos + 1 ];
+        }
+
+        Finish: {
+            in_num != 0 => FinalAdd;
+            _           => Done;
+        }
+
+        FinalAdd: {
+            _ => return sum + cur_num;
+        }
+
+        Done: {
+            _ => return sum;
+        }
+    }
+}
+
+// HTTP レスポンスビルダーメインマシン
+machine http_build_response(conn: *HttpConn) -> void {
+    flow {
+        wire req_p   = &conn.req;
+        wire method  = conn.req.method;
+        wire u_ptr   = conn.req.uri_ptr;
+        wire u_len   = conn.req.uri_len;
+        wire tx      = conn.tx_buf;
+        wire is_keep = conn.req.keep_alive;
+    }
+
+    states {
+        Entry: {
+            u_len == 0 => Route404;
+            // URI 先頭判定
+            let first_b = *u_ptr;
+            first_b == 47 => CheckRoot; // '/'
+            _             => Route404;
+        }
+
+        CheckRoot: {
+            u_len == 1 => RouteRoot; // "/"
+            // 2文字目判定
+            let second_b = *(u_ptr + 1);
+            second_b == 101 => RouteEcho;       // 'e' -> /echo
+            second_b == 98  => RouteBaseline11; // 'b' -> /baseline11
+            _               => Route404;
+        }
+
+        // --------------------------------------------------------------------
+        // 1. GET / -> "Hello from StateSSA!"
+        // --------------------------------------------------------------------
+        RouteRoot: {
+            // "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 22\r\n\r\nHello from StateSSA!\n"
+            // ヘッダ書き出し (固定 70 bytes)
+            *(tx + 0)  <- 72;  // 'H'
+            *(tx + 1)  <- 84;  // 'T'
+            *(tx + 2)  <- 84;  // 'T'
+            *(tx + 3)  <- 80;  // 'P'
+            *(tx + 4)  <- 47;  // '/'
+            *(tx + 5)  <- 49;  // '1'
+            *(tx + 6)  <- 46;  // '.'
+            *(tx + 7)  <- 49;  // '1'
+            *(tx + 8)  <- 32;  // ' '
+            *(tx + 9)  <- 50;  // '2'
+            *(tx + 10) <- 48;  // '0'
+            *(tx + 11) <- 48;  // '0'
+            *(tx + 12) <- 32;  // ' '
+            *(tx + 13) <- 79;  // 'O'
+            *(tx + 14) <- 75;  // 'K'
+            *(tx + 15) <- 13;  // '\r'
+            *(tx + 16) <- 10;  // '\n'
+            
+            // "Content-Type: text/plain\r\n" (26 bytes)
+            *(tx + 17) <- 67;  // 'C'
+            *(tx + 18) <- 111; // 'o'
+            *(tx + 19) <- 110; // 'n'
+            *(tx + 20) <- 116; // 't'
+            *(tx + 21) <- 101; // 'e'
+            *(tx + 22) <- 110; // 'n'
+            *(tx + 23) <- 116; // 't'
+            *(tx + 24) <- 45;  // '-'
+            *(tx + 25) <- 84;  // 'T'
+            *(tx + 26) <- 121; // 'y'
+            *(tx + 27) <- 112; // 'p'
+            *(tx + 28) <- 101; // 'e'
+            *(tx + 29) <- 58;  // ':'
+            *(tx + 30) <- 32;  // ' '
+            *(tx + 31) <- 116; // 't'
+            *(tx + 32) <- 101; // 'e'
+            *(tx + 33) <- 120; // 'x'
+            *(tx + 34) <- 116; // 't'
+            *(tx + 35) <- 47;  // '/'
+            *(tx + 36) <- 112; // 'p'
+            *(tx + 37) <- 108; // 'l'
+            *(tx + 38) <- 97;  // 'a'
+            *(tx + 39) <- 105; // 'i'
+            *(tx + 40) <- 110; // 'n'
+            *(tx + 41) <- 13;  // '\r'
+            *(tx + 42) <- 10;  // '\n'
+
+            // "Content-Length: 21\r\n\r\n" (22 bytes)
+            *(tx + 43) <- 67;  // 'C'
+            *(tx + 44) <- 111; // 'o'
+            *(tx + 45) <- 110; // 'n'
+            *(tx + 46) <- 116; // 't'
+            *(tx + 47) <- 101; // 'e'
+            *(tx + 48) <- 110; // 'n'
+            *(tx + 49) <- 116; // 't'
+            *(tx + 50) <- 45;  // '-'
+            *(tx + 51) <- 76;  // 'L'
+            *(tx + 52) <- 101; // 'e'
+            *(tx + 53) <- 110; // 'n'
+            *(tx + 54) <- 103; // 'g'
+            *(tx + 55) <- 116; // 't'
+            *(tx + 56) <- 104; // 'h'
+            *(tx + 57) <- 58;  // ':'
+            *(tx + 58) <- 32;  // ' '
+            *(tx + 59) <- 50;  // '2'
+            *(tx + 60) <- 49;  // '1'
+            *(tx + 61) <- 13;  // '\r'
+            *(tx + 62) <- 10;  // '\n'
+            *(tx + 63) <- 13;  // '\r'
+            *(tx + 64) <- 10;  // '\n'
+
+            // ボディ "Hello from StateSSA!\n" (22 bytes)
+            *(tx + 65) <- 72;  // 'H'
+            *(tx + 66) <- 101; // 'e'
+            *(tx + 67) <- 108; // 'l'
+            *(tx + 68) <- 108; // 'l'
+            *(tx + 69) <- 111; // 'o'
+            *(tx + 70) <- 32;  // ' '
+            *(tx + 71) <- 102; // 'f'
+            *(tx + 72) <- 114; // 'r'
+            *(tx + 73) <- 111; // 'o'
+            *(tx + 74) <- 109; // 'm'
+            *(tx + 75) <- 32;  // ' '
+            *(tx + 76) <- 83;  // 'S'
+            *(tx + 77) <- 116; // 't'
+            *(tx + 78) <- 97;  // 'a'
+            *(tx + 79) <- 116; // 't'
+            *(tx + 80) <- 101; // 'e'
+            *(tx + 81) <- 83;  // 'S'
+            *(tx + 82) <- 83;  // 'S'
+            *(tx + 83) <- 65;  // 'A'
+            *(tx + 84) <- 33;  // '!'
+            *(tx + 85) <- 10;  // '\n'
+            *(tx + 86) <- 0;
+
+            conn.tx_len <- 86;
+            _ => return;
+        }
+
+        // --------------------------------------------------------------------
+        // 2. POST /echo -> 受信ボディをそのまま返す
+        // --------------------------------------------------------------------
+        RouteEcho: {
+            let blen = conn.req.body_len;
+            let bptr = conn.req.body_ptr;
+
+            // "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: "
+            *(tx + 0)  <- 72;  *(tx + 1)  <- 84;  *(tx + 2)  <- 84;  *(tx + 3)  <- 80;
+            *(tx + 4)  <- 47;  *(tx + 5)  <- 49;  *(tx + 6)  <- 46;  *(tx + 7)  <- 49;
+            *(tx + 8)  <- 32;  *(tx + 9)  <- 50;  *(tx + 10) <- 48;  *(tx + 11) <- 48;
+            *(tx + 12) <- 32;  *(tx + 13) <- 79;  *(tx + 14) <- 75;  *(tx + 15) <- 13;
+            *(tx + 16) <- 10;
+            
+            *(tx + 17) <- 67;  *(tx + 18) <- 111; *(tx + 19) <- 110; *(tx + 20) <- 116;
+            *(tx + 21) <- 101; *(tx + 22) <- 110; *(tx + 23) <- 116; *(tx + 24) <- 45;
+            *(tx + 25) <- 84;  *(tx + 26) <- 121; *(tx + 27) <- 112; *(tx + 28) <- 101;
+            *(tx + 29) <- 58;  *(tx + 30) <- 32;  *(tx + 31) <- 116; *(tx + 32) <- 101;
+            *(tx + 33) <- 120; *(tx + 34) <- 116; *(tx + 35) <- 47;  *(tx + 36) <- 112;
+            *(tx + 37) <- 108; *(tx + 38) <- 97;  *(tx + 39) <- 105; *(tx + 40) <- 110;
+            *(tx + 41) <- 13;  *(tx + 42) <- 10;
+
+            *(tx + 43) <- 67;  *(tx + 44) <- 111; *(tx + 45) <- 110; *(tx + 46) <- 116;
+            *(tx + 47) <- 101; *(tx + 48) <- 110; *(tx + 49) <- 116; *(tx + 50) <- 45;
+            *(tx + 51) <- 76;  *(tx + 52) <- 101; *(tx + 53) <- 110; *(tx + 54) <- 103;
+            *(tx + 55) <- 116; *(tx + 56) <- 104; *(tx + 57) <- 58;  *(tx + 58) <- 32;
+
+            // Content-Length 数値出力
+            let cl_digits = call resp_write_u32_ascii(tx + 59, blen);
+            let off1 = 59 + cl_digits;
+
+            // "\r\n\r\n"
+            *(tx + off1)       <- 13;
+            *(tx + (off1 + 1)) <- 10;
+            *(tx + (off1 + 2)) <- 13;
+            *(tx + (off1 + 3)) <- 10;
+            let body_dest = off1 + 4;
+
+            // ボディコピー
+            let _ = call resp_copy_bytes(tx + body_dest, bptr, blen);
+            let total_tx = body_dest + blen;
+            conn.tx_len <- total_tx;
+            _ => return;
+        }
+
+        // --------------------------------------------------------------------
+        // 3. GET /baseline11?a=X&b=Y -> 和を返す
+        // --------------------------------------------------------------------
+        RouteBaseline11: {
+            let sum_val = call parse_baseline_query(u_ptr, u_len);
+
+            // 一時的にボディ部分 (tx + 128) に合計数値を書き出し
+            let sum_digits = call resp_write_u32_ascii(tx + 128, sum_val);
+
+            // ヘッダ構築
+            *(tx + 0)  <- 72;  *(tx + 1)  <- 84;  *(tx + 2)  <- 84;  *(tx + 3)  <- 80;
+            *(tx + 4)  <- 47;  *(tx + 5)  <- 49;  *(tx + 6)  <- 46;  *(tx + 7)  <- 49;
+            *(tx + 8)  <- 32;  *(tx + 9)  <- 50;  *(tx + 10) <- 48;  *(tx + 11) <- 48;
+            *(tx + 12) <- 32;  *(tx + 13) <- 79;  *(tx + 14) <- 75;  *(tx + 15) <- 13;
+            *(tx + 16) <- 10;
+            
+            *(tx + 17) <- 67;  *(tx + 18) <- 111; *(tx + 19) <- 110; *(tx + 20) <- 116;
+            *(tx + 21) <- 101; *(tx + 22) <- 110; *(tx + 23) <- 116; *(tx + 24) <- 45;
+            *(tx + 25) <- 84;  *(tx + 26) <- 121; *(tx + 27) <- 112; *(tx + 28) <- 101;
+            *(tx + 29) <- 58;  *(tx + 30) <- 32;  *(tx + 31) <- 116; *(tx + 32) <- 101;
+            *(tx + 33) <- 120; *(tx + 34) <- 116; *(tx + 35) <- 47;  *(tx + 36) <- 112;
+            *(tx + 37) <- 108; *(tx + 38) <- 97;  *(tx + 39) <- 105; *(tx + 40) <- 110;
+            *(tx + 41) <- 13;  *(tx + 42) <- 10;
+
+            *(tx + 43) <- 67;  *(tx + 44) <- 111; *(tx + 45) <- 110; *(tx + 46) <- 116;
+            *(tx + 47) <- 101; *(tx + 48) <- 110; *(tx + 49) <- 116; *(tx + 50) <- 45;
+            *(tx + 51) <- 76;  *(tx + 52) <- 101; *(tx + 53) <- 110; *(tx + 54) <- 103;
+            *(tx + 55) <- 116; *(tx + 56) <- 104; *(tx + 57) <- 58;  *(tx + 58) <- 32;
+
+            let cl_digits = call resp_write_u32_ascii(tx + 59, sum_digits);
+            let off1 = 59 + cl_digits;
+
+            *(tx + off1)       <- 13;
+            *(tx + (off1 + 1)) <- 10;
+            *(tx + (off1 + 2)) <- 13;
+            *(tx + (off1 + 3)) <- 10;
+            let body_dest = off1 + 4;
+
+            // ボディコピー
+            let _ = call resp_copy_bytes(tx + body_dest, tx + 128, sum_digits);
+            let total_tx = body_dest + sum_digits;
+            conn.tx_len <- total_tx;
+            _ => return;
+        }
+
+        // --------------------------------------------------------------------
+        // 4. 404 Not Found
+        // --------------------------------------------------------------------
+        Route404: {
+            // "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found"
+            *(tx + 0)  <- 72;  *(tx + 1)  <- 84;  *(tx + 2)  <- 84;  *(tx + 3)  <- 80;
+            *(tx + 4)  <- 47;  *(tx + 5)  <- 49;  *(tx + 6)  <- 46;  *(tx + 7)  <- 49;
+            *(tx + 8)  <- 32;  *(tx + 9)  <- 52;  *(tx + 10) <- 48;  *(tx + 11) <- 52;
+            *(tx + 12) <- 32;  *(tx + 13) <- 78;  *(tx + 14) <- 111; *(tx + 15) <- 116;
+            *(tx + 16) <- 32;  *(tx + 17) <- 70;  *(tx + 18) <- 111; *(tx + 19) <- 117;
+            *(tx + 20) <- 110; *(tx + 21) <- 100; *(tx + 22) <- 13;  *(tx + 23) <- 10;
+
+            *(tx + 24) <- 67;  *(tx + 25) <- 111; *(tx + 26) <- 110; *(tx + 27) <- 116;
+            *(tx + 28) <- 101; *(tx + 29) <- 110; *(tx + 30) <- 116; *(tx + 31) <- 45;
+            *(tx + 32) <- 76;  *(tx + 33) <- 101; *(tx + 34) <- 110; *(tx + 35) <- 103;
+            *(tx + 36) <- 116; *(tx + 37) <- 104; *(tx + 38) <- 58;  *(tx + 39) <- 32;
+            *(tx + 40) <- 57;  // '9'
+            *(tx + 41) <- 13;  *(tx + 42) <- 10;
+            *(tx + 43) <- 13;  *(tx + 44) <- 10;
+
+            // "Not Found"
+            *(tx + 45) <- 78;  *(tx + 46) <- 111; *(tx + 47) <- 116; *(tx + 48) <- 32;
+            *(tx + 49) <- 70;  *(tx + 50) <- 111; *(tx + 51) <- 117; *(tx + 52) <- 110;
+            *(tx + 53) <- 100;
+
+            conn.tx_len <- 54;
+            _ => return;
+        }
+    }
+}

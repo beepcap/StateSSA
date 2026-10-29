@@ -1,0 +1,140 @@
+// ============================================================================
+// StateSSA STL: Common Memory & Allocators (common.ssa)
+// 汎用メモリ管理標準ライブラリ (v0.12.0)
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. 汎用メモリスライス
+// ----------------------------------------------------------------------------
+type MemSlice = {
+    ptr: *u8,
+    len: u32
+};
+
+// ----------------------------------------------------------------------------
+// 2. 汎用バンプアロケータ (BumpAlloc)
+// ----------------------------------------------------------------------------
+type BumpAlloc = {
+    base_ptr: *u8,
+    offset:   u32,
+    capacity: u32
+};
+
+// ----------------------------------------------------------------------------
+// 3. 非重畳メモリパーティション (MemPartition)
+// ----------------------------------------------------------------------------
+type MemPartition = {
+    base_ptr: *u8,
+    offset:   u32,
+    capacity: u32,
+    alloc_id: u32,
+    err_flag: u32
+};
+
+// ----------------------------------------------------------------------------
+// 4. モノリシックアリーナ (MonolithicArena)
+// ----------------------------------------------------------------------------
+type MonolithicArena = {
+    raw_mem:   *u8,
+    total_cap: u32
+};
+
+// ============================================================================
+// バンプアロケータ初期化マシン (bump_init)
+// ============================================================================
+machine bump_init(alloc: *BumpAlloc, base: *u8, cap: u32) -> *BumpAlloc {
+    flow {}
+    states {
+        Entry: {
+            alloc.base_ptr <- base;
+            alloc.offset   <- 0;
+            alloc.capacity <- cap;
+            _ => return alloc;
+        }
+    }
+}
+
+// ============================================================================
+// 監視付きバンプアロケーションマシン (bump_alloc)
+// オーバーフロー時はサイレント破壊を防ぎ、即座に panic(1) を発行する
+// ============================================================================
+machine bump_alloc(alloc: *BumpAlloc, size: u32, align: u32) -> *u8 {
+    flow {
+        wire base          = alloc.base_ptr;
+        wire cap           = alloc.capacity;
+        wire cur_off       = alloc.offset;
+        wire align_mask    = align - 1;
+        wire inv_mask      = 0xFFFFFFFF ^ align_mask;
+        wire off_with_mask = cur_off + align_mask;
+        wire aligned_off   = off_with_mask & inv_mask;
+        wire next_off      = aligned_off + size;
+        wire is_overflow   = next_off > cap;
+        wire ret_ptr       = base + aligned_off;
+    }
+    states {
+        Entry: {
+            is_overflow => AllocFail;
+            _           => AllocSuccess;
+        }
+        AllocSuccess: {
+            let res_ptr = ret_ptr;
+            alloc.offset <- next_off;
+            _ => return res_ptr;
+        }
+        AllocFail: {
+            _ => panic(1);
+        }
+    }
+}
+
+// ============================================================================
+// パーティション初期化マシン (partition_init)
+// ============================================================================
+machine partition_init(part: *MemPartition, base: *u8, cap: u32, alloc_id: u32) -> void {
+    flow {}
+    states {
+        Entry: {
+            part.base_ptr <- base;
+            part.offset   <- 0;
+            part.capacity <- cap;
+            part.alloc_id <- alloc_id;
+            part.err_flag <- 0;
+            _ => return;
+        }
+    }
+}
+
+// ============================================================================
+// 監視付きアロケーションマシン (partition_alloc)
+// ============================================================================
+machine partition_alloc(part: *MemPartition, size: u32, align: u32) -> *u8 {
+    flow {
+        wire base        = part.base_ptr;
+        wire off         = part.offset;
+        wire cap         = part.capacity;
+        wire align_mask  = align - 1;
+        wire inv_mask    = 0xFFFFFFFF ^ align_mask;
+        wire add_mask    = off + align_mask;
+        wire aligned_off = add_mask & inv_mask;
+        wire next_off    = aligned_off + size;
+        wire is_overflow = next_off > cap;
+        wire ret_ptr     = base + aligned_off;
+    }
+    states {
+        Entry: {
+            is_overflow => Overflow;
+            _           => Success;
+        }
+        Success: {
+            let res_ptr = ret_ptr;
+            part.offset <- next_off;
+            _ => return res_ptr;
+        }
+        Overflow: {
+            part.err_flag <- 1;
+            _ => panic(1);
+        }
+    }
+}
+
+

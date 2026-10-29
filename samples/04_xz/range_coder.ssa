@@ -1,0 +1,250 @@
+// ============================================================================
+// StateSSA LZMA Core: Range Decoder Primitives
+// レンジデコーダ（算術復号）の初期化・ビット復号・正規化
+// ============================================================================
+
+type RangeDecoder = {
+    range:  u32,
+    code:   u32,
+    in_ptr: *u8
+};
+
+// レンジデコーダの初期化 (先頭5バイトの読み込み)
+machine rc_init(rd: *RangeDecoder, in_buf: *u8) -> void {
+    flow {
+        wire b1 = *(in_buf + 1);
+        wire b2 = *(in_buf + 2);
+        wire b3 = *(in_buf + 3);
+        wire b4 = *(in_buf + 4);
+
+        wire code_12  = (b1 << 24) | (b2 << 16);
+        wire code_34  = (b3 << 8) | b4;
+        wire code_val = code_12 | code_34;
+        wire next_ptr = in_buf + 5;
+    }
+
+    states {
+        Entry: {
+            rd.range  <- 0xFFFFFFFF;
+            rd.code   <- code_val;
+            rd.in_ptr <- next_ptr;
+            _ => Exit;
+        }
+
+        Exit: {
+            _ => return;
+        }
+    }
+}
+
+// レンジデコーダの正規化 (range < 0x01000000 のとき1バイト吸い上げる)
+machine rc_normalize(rd: *RangeDecoder) -> void {
+    flow {
+        wire cur_range   = rd.range;
+        wire cur_code    = rd.code;
+        wire cur_ptr     = rd.in_ptr;
+
+        wire need_norm   = cur_range < 0x01000000;
+        wire next_byte   = *cur_ptr;
+
+        wire new_range   = cur_range << 8;
+        wire new_code    = (cur_code << 8) | next_byte;
+        wire next_ptr    = cur_ptr + 1;
+    }
+
+    states {
+        Entry: {
+            need_norm => DoNorm;
+            _         => Exit;
+        }
+
+        DoNorm: {
+            rd.range  <- new_range;
+            rd.code   <- new_code;
+            rd.in_ptr <- next_ptr;
+            _ => Exit;
+        }
+
+        Exit: {
+            _ => return;
+        }
+    }
+}
+
+// 1ビット復号 (確率モデル prob_ptr を用いた二値算術復号)
+machine rc_decode_bit(rd: *RangeDecoder, prob_ptr: *u16) -> i32 {
+    flow {
+        wire cur_range = rd.range;
+        wire cur_code  = rd.code;
+        wire cur_prob  = *prob_ptr;
+
+        // 境界計算: bound = (range >> 11) * prob
+        wire bound     = (cur_range >> 11) * cur_prob;
+        wire is_one    = cur_code >= bound;
+
+        // bit == 0 のときの計算
+        wire r0_range  = bound;
+        wire r0_prob   = cur_prob + ((2048 - cur_prob) >> 5);
+
+        // bit == 1 のときの計算
+        wire r1_range  = cur_range - bound;
+        wire r1_code   = cur_code - bound;
+        wire r1_prob   = cur_prob - (cur_prob >> 5);
+    }
+
+    states {
+        Entry: {
+            is_one => BitOne;
+            _      => BitZero;
+        }
+
+        BitZero: {
+            rd.range  <- r0_range;
+            *prob_ptr <- r0_prob;
+            call rc_normalize(rd);
+            _ => ExitZero;
+        }
+
+        BitOne: {
+            let next_range = r1_range;
+            let next_code  = r1_code;
+            rd.range  <- next_range;
+            rd.code   <- next_code;
+            *prob_ptr <- r1_prob;
+            call rc_normalize(rd);
+            _ => ExitOne;
+        }
+
+        ExitZero: {
+            _ => return 0;
+        }
+
+        ExitOne: {
+            _ => return 1;
+        }
+    }
+}
+
+// 直接ビット復号 (確率 50% で num_bits を復号)
+machine rc_decode_direct_bits(rd: *RangeDecoder, num_bits: u32) -> u32 {
+    flow {
+        reg res:  u32 = 0;
+        reg step: u32 = 0;
+
+        wire is_done    = step == num_bits;
+        wire cur_range  = rd.range >> 1;
+        wire cur_code   = rd.code;
+        wire is_one     = cur_code >= cur_range;
+
+        wire next_step  = step + 1;
+        wire res_zero   = res << 1;
+        wire res_one    = (res << 1) | 1;
+        wire code_sub   = cur_code - cur_range;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => CheckBit;
+        }
+
+        CheckBit: {
+            is_one => BitOne;
+            _      => BitZero;
+        }
+
+        BitZero: {
+            rd.range <- cur_range;
+            call rc_normalize(rd);
+            _ => Loop [ res <= res_zero, step <= next_step ];
+        }
+
+        BitOne: {
+            let next_range = cur_range;
+            let next_code  = code_sub;
+            rd.range <- next_range;
+            rd.code  <- next_code;
+            call rc_normalize(rd);
+            _ => Loop [ res <= res_one, step <= next_step ];
+        }
+
+        Done: {
+            _ => return res;
+        }
+    }
+}
+
+// ビット木復号 (MSB first で num_bits を復号)
+machine rc_decode_bit_tree(rd: *RangeDecoder, probs: *u16, num_bits: u32) -> u32 {
+    flow {
+        reg m:    u32 = 1;
+        reg step: u32 = 0;
+
+        wire is_done   = step == num_bits;
+        wire prob_ptr  = probs + m;
+
+        wire next_m    = (m << 1) | bit;
+        wire next_step = step + 1;
+        wire res_val   = m - (1 << num_bits);
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => DecodeBit;
+        }
+
+        DecodeBit: {
+            let bit = call rc_decode_bit(rd, prob_ptr);
+            _ => Loop [ m <= next_m, step <= next_step ];
+        }
+
+        Done: {
+            _ => return res_val;
+        }
+    }
+}
+
+// 逆ビット木復号 (LSB first で num_bits を復号)
+machine rc_decode_reverse_bit_tree(rd: *RangeDecoder, probs: *u16, num_bits: u32) -> u32 {
+    flow {
+        reg m:      u32 = 1;
+        reg symbol: u32 = 0;
+        reg step:   u32 = 0;
+
+        wire is_done   = step == num_bits;
+        wire prob_ptr  = probs + m;
+
+        wire next_m      = (m << 1) | bit;
+        wire next_symbol = symbol | (bit << step);
+        wire next_step   = step + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => DecodeBit;
+        }
+
+        DecodeBit: {
+            let bit = call rc_decode_bit(rd, prob_ptr);
+            _ => Loop [ m <= next_m, symbol <= next_symbol, step <= next_step ];
+        }
+
+        Done: {
+            _ => return symbol;
+        }
+    }
+}

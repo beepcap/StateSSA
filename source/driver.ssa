@@ -1,0 +1,140 @@
+// ============================================================================
+// StateSSA Compiler: Pure StateSSA CLI Driver (driver.ssa)
+// コマンドライン引数を解析し、ファイルを読み込んで ssac_compile_source を実行する
+// ============================================================================
+
+extern "C" {
+    fn fopen(path: *u8, mode: *u8) -> *void;
+    fn fread(ptr: *u8, size: u32, nmemb: u32, stream: *void) -> u32;
+    fn fwrite(ptr: *u8, size: u32, nmemb: u32, stream: *void) -> u32;
+    fn fclose(stream: *void) -> i32;
+    fn fseek(stream: *void, offset: i64, whence: i32) -> i32;
+    fn ftell(stream: *void) -> i64;
+    fn puts(str: *u8) -> i32;
+    fn strcmp(s1: *u8, s2: *u8) -> i32;
+}
+
+machine main(argc: i32, argv: *u64) -> i32 {
+    flow {
+        reg arg_idx:  i32 = 1;
+        reg in_path:  *u8 = null;
+        reg out_path: *u8 = null;
+        reg res_code: i32 = 0;
+
+        wire is_arg_done = arg_idx >= argc;
+        wire cur_arg_ptr = argv + arg_idx;
+        wire cur_arg_val = *cur_arg_ptr;
+        wire cur_arg     = cast(*u8) cur_arg_val;
+        wire next_idx    = arg_idx + 1;
+    }
+
+    states {
+        Entry: {
+            argc < 2 => ShowUsage;
+            _        => ParseArgs;
+        }
+
+        ShowUsage: {
+            let _ = call puts("Usage: ssac <input.ssa> [-o <output.ll>]");
+            _ => Exit [ res_code <= 1 ];
+        }
+
+        ParseArgs: {
+            is_arg_done => CheckArgs;
+            _           => CheckOpt;
+        }
+
+        CheckOpt: {
+            let is_dash_o = call strcmp(cur_arg, "-o");
+            is_dash_o == 0 => SetOutputOpt;
+            _              => SetInputFile;
+        }
+
+        SetOutputOpt: {
+            let next_pos = arg_idx + 1;
+            next_pos >= argc => ShowUsage;
+
+            let opt_val_ptr = argv + next_pos;
+            let opt_val_u64 = *opt_val_ptr;
+            let opt_val = cast(*u8) opt_val_u64;
+            _ => ParseArgs [ out_path <= opt_val, arg_idx <= arg_idx + 2 ];
+        }
+
+        SetInputFile: {
+            in_path == null => AssignIn;
+            _               => ParseArgs [ arg_idx <= next_idx ];
+        }
+
+        AssignIn: {
+            _ => ParseArgs [ in_path <= cur_arg, arg_idx <= next_idx ];
+        }
+
+        CheckArgs: {
+            in_path == null => ShowUsage;
+            out_path == null => SetDefaultOut;
+            _                => ReadSource;
+        }
+
+        SetDefaultOut: {
+            _ => ReadSource [ out_path <= "output.ll" ];
+        }
+
+        // --- ファイル読み込み ---
+        ReadSource: {
+            let fp_in = call fopen(in_path, "rb");
+            fp_in == null => ErrOpenIn;
+
+            let _ = call fseek(fp_in, 0, 2); // SEEK_END = 2
+            let f_sz_64 = call ftell(fp_in);
+            let f_sz = cast(u32) f_sz_64;
+            let _ = call fseek(fp_in, 0, 0); // SEEK_SET = 0
+
+            let src_buf = call malloc(f_sz + 1);
+            let n_read = call fread(src_buf, 1, f_sz, fp_in);
+            let _ = call fclose(fp_in);
+
+            // null 終端
+            let end_p = src_buf + n_read;
+            *end_p <- 0;
+
+            // コンパイル実行
+            // 64MB 出力バッファ
+            let out_buf = call malloc(67108864);
+            let comp_res = call ssac_compile_source(src_buf, n_read, out_buf, 67108864);
+            let _ = call free(src_buf);
+
+            comp_res <= 0 => ErrCompile;
+
+            // 出力ファイル書き込み
+            let fp_out = call fopen(out_path, "wb");
+            fp_out == null => ErrOpenOut;
+
+            let out_bytes = cast(u32) comp_res;
+            let _ = call fwrite(out_buf, 1, out_bytes, fp_out);
+            let _ = call fclose(fp_out);
+            let _ = call free(out_buf);
+
+            let _ = call puts("StateSSA compilation successful!");
+            _ => Exit [ res_code <= 0 ];
+        }
+
+        ErrOpenIn: {
+            let _ = call puts("Error: Cannot open input file.");
+            _ => Exit [ res_code <= 2 ];
+        }
+
+        ErrCompile: {
+            let _ = call puts("Error: Compilation failed.");
+            _ => Exit [ res_code <= 3 ];
+        }
+
+        ErrOpenOut: {
+            let _ = call puts("Error: Cannot open output file for writing.");
+            _ => Exit [ res_code <= 4 ];
+        }
+
+        Exit: {
+            _ => return res_code;
+        }
+    }
+}

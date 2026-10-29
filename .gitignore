@@ -1,0 +1,9 @@
+# Build and binary artifacts
+bin/
+build/
+*.ll
+*.o
+*.out
+__pycache__/
+*.pyc
+Makefile

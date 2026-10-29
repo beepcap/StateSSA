@@ -1,0 +1,30 @@
+// ============================================================================
+// 最初の一歩：1からnまでの合計を計算する単純ループマシン
+// ============================================================================
+
+machine simple_loop(n: i32) -> i32 {
+
+    flow {
+        reg i:   i32 = 0;
+        reg sum: i32 = 0;
+
+        wire is_done  = (i >= n);
+        wire next_i   = i + 1;
+        wire next_sum = sum + i;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Exit;
+            _       => Loop [ i <= next_i, sum <= next_sum ];
+        }
+
+        Exit: {
+            _ => return sum;
+        }
+    }
+}

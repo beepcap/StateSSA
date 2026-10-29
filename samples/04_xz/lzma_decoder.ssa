@@ -1,0 +1,504 @@
+// ============================================================================
+// StateSSA LZMA Core: LZMA Decoder Implementation
+// LZMA 圧縮ストリーム復号エンジン (12状態マシン & 辞書スライドコピー)
+// ============================================================================
+
+include "range_coder.ssa";
+
+type LzmaDecoder = {
+    range:             u32,
+    code:              u32,
+    in_ptr:            *u8,
+
+    dict:              *u8,
+    out_pos:           u32,
+    uncompressed_size: u32,
+    state:             u32,
+
+    rep0:              u32,
+    rep1:              u32,
+    rep2:              u32,
+    rep3:              u32,
+
+    is_match:          *u16,
+    is_rep:            *u16,
+    is_rep0:           *u16,
+    is_rep1:           *u16,
+    is_rep2:           *u16,
+    is_rep0_long:      *u16,
+    pos_slot:          *u16,
+    spec_pos:          *u16,
+    align_probs:       *u16,
+    len_probs:         *u16,
+    rep_len_probs:     *u16,
+    lit_probs:         *u16
+};
+
+// 確率テーブルの初期化 (全要素を 1024 = 50% にセット)
+machine lzma_init_probs(probs: *u16, count: u32) -> void {
+    flow {
+        reg idx: u32 = 0;
+        wire is_done  = idx == count;
+        wire cur_ptr  = probs + idx;
+        wire next_idx = idx + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            *cur_ptr <- 1024;
+            _ => Loop [ idx <= next_idx ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// 辞書スライディングコピー (len バイトを out_pos - rep - 1 から out_pos へ転送)
+machine lzma_copy_match(dict: *u8, out_pos: u32, rep: u32, len: u32) -> void {
+    flow {
+        reg step: u32 = 0;
+        wire is_done   = step == len;
+        wire cur_pos   = out_pos + step;
+        wire rep_offset = rep + 1;
+        wire src_pos   = cur_pos - rep_offset;
+        wire src_ptr   = dict + src_pos;
+        wire dst_ptr   = dict + cur_pos;
+        wire byte_val  = *src_ptr;
+        wire next_step = step + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => Step;
+        }
+
+        Step: {
+            *dst_ptr <- byte_val;
+            _ => Loop [ step <= next_step ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// 一致長復号 (LenDecoder)
+machine lzma_decode_len(rd: *RangeDecoder, len_probs: *u16, pos_state: u32) -> u32 {
+    flow {
+        wire choice1_ptr = len_probs + 0;
+        wire choice2_ptr = len_probs + 1;
+        wire pos_shift   = pos_state << 3;
+        wire low_offset  = 2 + pos_shift;
+        wire low_base    = len_probs + low_offset;
+        wire mid_offset  = 130 + pos_shift;
+        wire mid_base    = len_probs + mid_offset;
+        wire high_base   = len_probs + 258;
+    }
+
+    states {
+        Entry: {
+            let b1 = call rc_decode_bit(rd, choice1_ptr);
+            b1 == 0 => DecodeLow;
+            _       => CheckMid;
+        }
+
+        DecodeLow: {
+            let len0 = call rc_decode_bit_tree(rd, low_base, 3);
+            _ => return len0;
+        }
+
+        CheckMid: {
+            let b2 = call rc_decode_bit(rd, choice2_ptr);
+            b2 == 0 => DecodeMid;
+            _       => DecodeHigh;
+        }
+
+        DecodeMid: {
+            let len1 = call rc_decode_bit_tree(rd, mid_base, 3);
+            _ => return len1 + 8;
+        }
+
+        DecodeHigh: {
+            let len2 = call rc_decode_bit_tree(rd, high_base, 8);
+            _ => return len2 + 16;
+        }
+    }
+}
+
+// リテラルバイト復号 (Matched Literal 照合を含む 8 ビットツリー走査)
+machine lzma_decode_literal(rd: *RangeDecoder, lit_base: *u16, is_matched: i32, match_byte: u32) -> u32 {
+    flow {
+        reg symbol:     u32 = 1;
+        reg step:       u32 = 0;
+        reg match_mode: i32 = is_matched;
+
+        wire is_done    = step == 8;
+        wire shift_amt  = 7 - step;
+        wire match_bit  = (match_byte >> shift_amt) & 1;
+
+        wire norm_prob_ptr  = lit_base + symbol;
+        wire match_shift    = match_bit << 8;
+        wire match_prob_base = lit_base + 256;
+        wire match_prob_mid  = match_prob_base + match_shift;
+        wire match_prob_ptr = match_prob_mid + symbol;
+
+        wire next_step   = step + 1;
+        wire res_byte    = symbol & 255;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_done => Done;
+            _       => CheckMode;
+        }
+
+        CheckMode: {
+            match_mode != 0 => DecodeMatchedBit;
+            _               => DecodeNormalBit;
+        }
+
+        DecodeNormalBit: {
+            let bit = call rc_decode_bit(rd, norm_prob_ptr);
+            _ => Loop [ symbol <= (symbol << 1) | bit, step <= next_step, match_mode <= 0 ];
+        }
+
+        DecodeMatchedBit: {
+            let bit = call rc_decode_bit(rd, match_prob_ptr);
+            match_bit == bit => Loop [ symbol <= (symbol << 1) | bit, step <= next_step, match_mode <= 1 ];
+            _                => Loop [ symbol <= (symbol << 1) | bit, step <= next_step, match_mode <= 0 ];
+        }
+
+        Done: {
+            _ => return res_byte;
+        }
+    }
+}
+
+// 距離復号 (Distance Decoding)
+machine lzma_decode_dist(rd: *RangeDecoder, pos_slot_probs: *u16, spec_pos_probs: *u16, align_probs: *u16, len_state: u32) -> u32 {
+    flow {
+        reg slot: u32 = 0;
+
+        wire slot_shift      = len_state << 6;
+        wire slot_base       = pos_slot_probs + slot_shift;
+        wire slot_div2       = slot >> 1;
+        wire num_direct_bits = slot_div2 - 1;
+        wire slot_and1       = slot & 1;
+        wire slot_base_elem  = 2 | slot_and1;
+        wire base_dist       = slot_base_elem << num_direct_bits;
+        wire dist_sub_slot   = base_dist - slot;
+        wire spec_offset     = dist_sub_slot - 1;
+        wire spec_base       = spec_pos_probs + spec_offset;
+
+        wire is_simple       = slot < 4;
+        wire is_spec         = slot < 14;
+    }
+
+    states {
+        Entry: {
+            let s = call rc_decode_bit_tree(rd, slot_base, 6);
+            _ => CheckSlot [ slot <= s ];
+        }
+
+        CheckSlot: {
+            is_simple => ReturnSlot;
+            is_spec   => DecodeSpec;
+            _         => DecodeAlign;
+        }
+
+        ReturnSlot: {
+            _ => return slot;
+        }
+
+        DecodeSpec: {
+            let dist_sub = call rc_decode_reverse_bit_tree(rd, spec_base, num_direct_bits);
+            _ => return base_dist + dist_sub;
+        }
+
+        DecodeAlign: {
+            let direct_part  = call rc_decode_direct_bits(rd, num_direct_bits - 4);
+            let align_part   = call rc_decode_reverse_bit_tree(rd, align_probs, 4);
+            let direct_shift = direct_part << 4;
+            let full_direct  = base_dist + direct_shift;
+            let final_dist   = full_direct + align_part;
+            _ => return final_dist;
+        }
+    }
+}
+
+// LZMA ストリーム復号メインマシン
+machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
+    flow {
+        reg reg_dist:       u32 = 0;
+        reg reg_len:        u32 = 0;
+        reg reg_lit_base:   *u16 = null;
+        reg reg_match_mode: u32 = 0;
+        reg reg_match_byte: u32 = 0;
+
+        wire cur_out_pos   = dec.out_pos;
+        wire cur_size      = dec.uncompressed_size;
+        wire cur_state     = dec.state;
+        wire cur_rep0      = dec.rep0;
+        wire cur_rep1      = dec.rep1;
+        wire cur_rep2      = dec.rep2;
+        wire cur_rep3      = dec.rep3;
+        wire dict_ptr      = dec.dict;
+
+        wire is_finished   = cur_out_pos >= cur_size;
+
+        wire pos_state     = cur_out_pos & 3;
+        wire state_shift   = cur_state << 4;
+        wire match_prob_base = dec.is_match + state_shift;
+        wire match_prob_ptr= match_prob_base + pos_state;
+        wire rep_prob_ptr  = dec.is_rep + cur_state;
+
+        wire prev_pos      = cur_out_pos - 1;
+        wire prev_byte_ptr = dict_ptr + prev_pos;
+        wire rep0_offset   = cur_rep0 + 1;
+        wire match_dist    = cur_out_pos - rep0_offset;
+        wire match_byte_ptr= dict_ptr + match_dist;
+
+        wire out_ptr       = dict_ptr + cur_out_pos;
+        wire next_out_pos  = cur_out_pos + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_finished => Finish;
+            _           => CheckMatch;
+        }
+
+        CheckMatch: {
+            let is_match_bit = call rc_decode_bit(dec, match_prob_ptr);
+            is_match_bit == 0 => PrepLit;
+            _                 => CheckRep;
+        }
+
+        PrepLit: {
+            cur_out_pos == 0 => LitFirst;
+            cur_state >= 7   => LitMatched;
+            _                => LitNormal;
+        }
+
+        LitFirst: {
+            let lit_base = dec.lit_probs;
+            _ => DoDecodeLit [ reg_lit_base <= lit_base, reg_match_mode <= 0, reg_match_byte <= 0 ];
+        }
+
+        LitMatched: {
+            let prev_byte  = *prev_byte_ptr;
+            let lit_state  = prev_byte >> 5;
+            let lit_base   = dec.lit_probs + (lit_state * 768);
+            let match_byte = cast(i32) *match_byte_ptr;
+            _ => DoDecodeLit [ reg_lit_base <= lit_base, reg_match_mode <= 1, reg_match_byte <= match_byte ];
+        }
+
+        LitNormal: {
+            let prev_byte  = *prev_byte_ptr;
+            let lit_state  = prev_byte >> 5;
+            let lit_base   = dec.lit_probs + (lit_state * 768);
+            _ => DoDecodeLit [ reg_lit_base <= lit_base, reg_match_mode <= 0, reg_match_byte <= 0 ];
+        }
+
+        DoDecodeLit: {
+            let lit_val = call lzma_decode_literal(dec, reg_lit_base, reg_match_mode, reg_match_byte);
+            *out_ptr <- lit_val;
+            dec.out_pos <- next_out_pos;
+            cur_state < 4  => LitUpdateState0;
+            cur_state < 10 => LitUpdateStateSub3;
+            _              => LitUpdateStateSub6;
+        }
+
+        LitUpdateState0: {
+            dec.state <- 0;
+            _ => Loop;
+        }
+
+        LitUpdateStateSub3: {
+            dec.state <- cur_state - 3;
+            _ => Loop;
+        }
+
+        LitUpdateStateSub6: {
+            dec.state <- cur_state - 6;
+            _ => Loop;
+        }
+
+        CheckRep: {
+            let is_rep_bit = call rc_decode_bit(dec, rep_prob_ptr);
+            is_rep_bit == 0 => DecodeNewMatch;
+            _               => DecodeRepMatch;
+        }
+
+        DecodeNewMatch: {
+            dec.rep3 <- cur_rep2;
+            dec.rep2 <- cur_rep1;
+            dec.rep1 <- cur_rep0;
+
+            let raw_len = call lzma_decode_len(dec, dec.len_probs, pos_state);
+            let len = raw_len + 2;
+            len < 6 => DistLenShort [ reg_len <= len ];
+            _       => DistLenLong  [ reg_len <= len ];
+        }
+
+        DistLenShort: {
+            let len_state = reg_len - 2;
+            let dist = call lzma_decode_dist(dec, dec.pos_slot, dec.spec_pos, dec.align_probs, len_state);
+            _ => CheckMatchDist [ reg_dist <= dist ];
+        }
+
+        DistLenLong: {
+            let len_state = 3;
+            let dist = call lzma_decode_dist(dec, dec.pos_slot, dec.spec_pos, dec.align_probs, len_state);
+            _ => CheckMatchDist [ reg_dist <= dist ];
+        }
+
+        CheckMatchDist: {
+            reg_dist == 0xFFFFFFFF => Finish;
+            _                      => ApplyMatch;
+        }
+
+        ApplyMatch: {
+            dec.rep0 <- reg_dist;
+            call lzma_copy_match(dict_ptr, cur_out_pos, reg_dist, reg_len);
+            dec.out_pos <- cur_out_pos + reg_len;
+            cur_state < 7 => MatchSetState7;
+            _             => MatchSetState10;
+        }
+
+        MatchSetState7: {
+            dec.state <- 7;
+            _ => Loop;
+        }
+
+        MatchSetState10: {
+            dec.state <- 10;
+            _ => Loop;
+        }
+
+        DecodeRepMatch: {
+            let is_rep0_bit = call rc_decode_bit(dec, dec.is_rep0 + cur_state);
+            is_rep0_bit == 0 => CheckShortRep;
+            _                => CheckOtherReps;
+        }
+
+        CheckShortRep: {
+            let state_shift   = cur_state << 4;
+            let long_prob_base = dec.is_rep0_long + state_shift;
+            let long_prob_ptr = long_prob_base + pos_state;
+            let is_long_bit   = call rc_decode_bit(dec, long_prob_ptr);
+            is_long_bit == 0 => DecodeShortRep;
+            _                => DecodeLongRep0;
+        }
+
+        DecodeShortRep: {
+            call lzma_copy_match(dict_ptr, cur_out_pos, cur_rep0, 1);
+            dec.out_pos <- cur_out_pos + 1;
+            cur_state < 7 => ShortRepSetState9;
+            _             => ShortRepSetState11;
+        }
+
+        ShortRepSetState9: {
+            dec.state <- 9;
+            _ => Loop;
+        }
+
+        ShortRepSetState11: {
+            dec.state <- 11;
+            _ => Loop;
+        }
+
+        DecodeLongRep0: {
+            let raw_len = call lzma_decode_len(dec, dec.rep_len_probs, pos_state);
+            let len = raw_len + 2;
+            call lzma_copy_match(dict_ptr, cur_out_pos, cur_rep0, len);
+            dec.out_pos <- cur_out_pos + len;
+            cur_state < 7 => RepSetState8;
+            _             => RepSetState11;
+        }
+
+        CheckOtherReps: {
+            let is_rep1_bit = call rc_decode_bit(dec, dec.is_rep1 + cur_state);
+            is_rep1_bit == 0 => SelectRep1;
+            _                => CheckRep2;
+        }
+
+        SelectRep1: {
+            let dist = cur_rep1;
+            dec.rep1 <- cur_rep0;
+            dec.rep0 <- dist;
+            _ => DecodeOtherRepLen;
+        }
+
+        CheckRep2: {
+            let is_rep2_bit = call rc_decode_bit(dec, dec.is_rep2 + cur_state);
+            is_rep2_bit == 0 => SelectRep2;
+            _                => SelectRep3;
+        }
+
+        SelectRep2: {
+            let dist = cur_rep2;
+            dec.rep2 <- cur_rep1;
+            dec.rep1 <- cur_rep0;
+            dec.rep0 <- dist;
+            _ => DecodeOtherRepLen;
+        }
+
+        SelectRep3: {
+            let dist = cur_rep3;
+            dec.rep3 <- cur_rep2;
+            dec.rep2 <- cur_rep1;
+            dec.rep1 <- cur_rep0;
+            dec.rep0 <- dist;
+            _ => DecodeOtherRepLen;
+        }
+
+        DecodeOtherRepLen: {
+            let raw_len = call lzma_decode_len(dec, dec.rep_len_probs, pos_state);
+            let len = raw_len + 2;
+            call lzma_copy_match(dict_ptr, cur_out_pos, dec.rep0, len);
+            dec.out_pos <- cur_out_pos + len;
+            cur_state < 7 => RepSetState8;
+            _             => RepSetState11;
+        }
+
+        RepSetState8: {
+            dec.state <- 8;
+            _ => Loop;
+        }
+
+        RepSetState11: {
+            dec.state <- 11;
+            _ => Loop;
+        }
+
+        Finish: {
+            _ => return dec.out_pos;
+        }
+    }
+}

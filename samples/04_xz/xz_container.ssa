@@ -1,0 +1,283 @@
+// ============================================================================
+// StateSSA xz Container Decoder Implementation
+// .xz コンテナフォーマット復号エンジン (Magic, Stream Header/Footer, Block, CRC32)
+// ============================================================================
+
+include "crc32.ssa";
+include "lzma2_decoder.ssa";
+
+// 32-bit リトルエンディアン整数読み込み
+machine read_u32_le(ptr: *u8) -> u32 {
+    flow {
+        wire b0 = *ptr;
+        wire p1 = ptr + 1;
+        wire b1 = *p1;
+        wire p2 = ptr + 2;
+        wire b2 = *p2;
+        wire p3 = ptr + 3;
+        wire b3 = *p3;
+        wire b1_sh = b1 << 8;
+        wire b2_sh = b2 << 16;
+        wire b3_sh = b3 << 24;
+        wire v01   = b0 | b1_sh;
+        wire v23   = b2_sh | b3_sh;
+        wire val   = v01 | v23;
+    }
+
+    states {
+        Entry: {
+            _ => return val;
+        }
+    }
+}
+
+// VLI (Variable-Length Integer) バイト長カウントマシン
+machine xz_vli_size(ptr: *u8) -> u32 {
+    flow {
+        reg count: u32 = 0;
+        wire cur_ptr    = ptr + count;
+        wire b          = *cur_ptr;
+        wire is_last    = (b & 128) == 0;
+        wire next_count = count + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_last => Done;
+            _       => Next;
+        }
+
+        Next: {
+            _ => Loop [ count <= next_count ];
+        }
+
+        Done: {
+            _ => return next_count;
+        }
+    }
+}
+
+// VLI (Variable-Length Integer) 値デコードマシン
+machine xz_vli_val(ptr: *u8) -> u32 {
+    flow {
+        reg val:   u32 = 0;
+        reg shift: u32 = 0;
+        reg count: u32 = 0;
+
+        wire cur_ptr    = ptr + count;
+        wire b          = *cur_ptr;
+        wire data_bits  = b & 127;
+        wire is_last    = (b & 128) == 0;
+        wire shift_bits = data_bits << shift;
+        wire next_val   = val | shift_bits;
+        wire next_shift = shift + 7;
+        wire next_count = count + 1;
+    }
+
+    states {
+        Entry: {
+            _ => Loop;
+        }
+
+        Loop: {
+            is_last => Done;
+            _       => Next;
+        }
+
+        Next: {
+            _ => Loop [ val <= next_val, shift <= next_shift, count <= next_count ];
+        }
+
+        Done: {
+            _ => return next_val;
+        }
+    }
+}
+
+// xz ストリーム復号メインマシン
+machine xz_decompress(dec: *LzmaDecoder, in_buf: *u8, in_len: u32, crc_table: *u32) -> u32 {
+    flow {
+        reg cur_in_ptr:      *u8 = null;
+        reg block_start_pos: u32 = 0;
+        reg check_type:      u32 = 0;
+        reg filter_off:      u32 = 0;
+
+        // Stream Header: 12 bytes
+        // Magic: 0xFD, '7', 'z', 'X', 'Z', 0x00
+        wire m0 = *in_buf;
+        wire m1 = *(in_buf + 1);
+        wire m2 = *(in_buf + 2);
+        wire m3 = *(in_buf + 3);
+        wire m4 = *(in_buf + 4);
+        wire m5 = *(in_buf + 5);
+
+        wire ok0 = m0 == 0xFD;
+        wire ok1 = m1 == 0x37;
+        wire ok2 = m2 == 0x7A;
+        wire ok3 = m3 == 0x58;
+        wire ok4 = m4 == 0x5A;
+        wire ok5 = m5 == 0x00;
+        wire ok01 = ok0 && ok1;
+        wire ok23 = ok2 && ok3;
+        wire ok45 = ok4 && ok5;
+        wire ok03 = ok01 && ok23;
+        wire is_magic_ok = ok03 && ok45;
+
+        wire flag0 = *(in_buf + 6);
+        wire flag1 = cast(u32) *(in_buf + 7);
+        wire is_flag0_ok = flag0 == 0;
+    }
+
+    states {
+        Entry: {
+            in_len < 32 => Error;
+            is_magic_ok => CheckHeaderFlags;
+            _           => Error;
+        }
+
+        CheckHeaderFlags: {
+            is_flag0_ok => VerifyHeaderCRC;
+            _           => Error;
+        }
+
+        VerifyHeaderCRC: {
+            let hdr_stored_crc = call read_u32_le(in_buf + 8);
+            let hdr_calc_crc   = call crc32_calculate(crc_table, in_buf + 6, 2);
+            hdr_stored_crc == hdr_calc_crc => InitStream [ cur_in_ptr <= in_buf + 12, check_type <= flag1 ];
+            _                              => Error;
+        }
+
+        InitStream: {
+            dec.out_pos <- 0;
+            _ => BlockLoop;
+        }
+
+        BlockLoop: {
+            let indicator = *cur_in_ptr;
+            indicator == 0 => VerifyIndex;
+            _              => ParseBlockHeader;
+        }
+
+        ParseBlockHeader: {
+            let indicator = *cur_in_ptr;
+            let ind1 = indicator + 1;
+            let hdr_size = ind1 * 4;
+
+            let crc_off = hdr_size - 4;
+            let hdr_crc_ptr = cur_in_ptr + crc_off;
+            let blk_hdr_stored = call read_u32_le(hdr_crc_ptr);
+            let blk_hdr_calc = call crc32_calculate(crc_table, cur_in_ptr, crc_off);
+            blk_hdr_stored == blk_hdr_calc => ParseBlockFlags;
+            _                              => Error;
+        }
+
+        ParseBlockFlags: {
+            let blk_flags = *(cur_in_ptr + 1);
+            let f_mask = blk_flags & 3;
+            let num_filters = f_mask + 1;
+            num_filters == 1 => ParseBlockSizes;
+            _                => Error;
+        }
+
+        ParseBlockSizes: {
+            let blk_flags = *(cur_in_ptr + 1);
+            blk_flags == 0xC0 => ReadBothSizes;
+            blk_flags == 0x00 => ReadFilterDirect;
+            _                 => Error;
+        }
+
+        ReadBothSizes: {
+            let sz1 = call xz_vli_size(cur_in_ptr + 2);
+            let off1 = 2 + sz1;
+            let sz2 = call xz_vli_size(cur_in_ptr + off1);
+            let fo  = off1 + sz2;
+            _ => CheckFilterID [ filter_off <= fo ];
+        }
+
+        ReadFilterDirect: {
+            _ => CheckFilterID [ filter_off <= 2 ];
+        }
+
+        CheckFilterID: {
+            let f_ptr = cur_in_ptr + filter_off;
+            let filter_id = *f_ptr;
+            filter_id == 0x21 => LaunchBlockLZMA2;
+            _                 => Error;
+        }
+
+        LaunchBlockLZMA2: {
+            let indicator = *cur_in_ptr;
+            let ind1 = indicator + 1;
+            let hdr_size = ind1 * 4;
+            let data_ptr = cur_in_ptr + hdr_size;
+
+            dec.in_ptr <- data_ptr;
+            let start_pos = dec.out_pos;
+            _ => RunLZMA2 [ block_start_pos <= start_pos, cur_in_ptr <= data_ptr ];
+        }
+
+        RunLZMA2: {
+            let _ = call lzma2_decode_stream(dec);
+            let comp_bytes = dec.in_ptr - cur_in_ptr;
+            let pad_mod = comp_bytes & 3;
+            let pad_sub = 4 - pad_mod;
+            let pad_len = pad_sub & 3;
+            let check_ptr = dec.in_ptr + pad_len;
+
+            check_type == 1 => VerifyBlockCRC32 [ cur_in_ptr <= check_ptr ];
+            check_type == 0 => NextBlock [ cur_in_ptr <= check_ptr ];
+            _               => Error;
+        }
+
+        VerifyBlockCRC32: {
+            let stored_blk_crc = call read_u32_le(cur_in_ptr);
+            let uncomp_len = dec.out_pos - block_start_pos;
+            let dict_ptr = dec.dict;
+            let block_data_ptr = dict_ptr + block_start_pos;
+            let calc_blk_crc = call crc32_calculate(crc_table, block_data_ptr, uncomp_len);
+
+            stored_blk_crc == calc_blk_crc => NextBlock [ cur_in_ptr <= cur_in_ptr + 4 ];
+            _                              => Error;
+        }
+
+        NextBlock: {
+            _ => BlockLoop;
+        }
+
+        VerifyIndex: {
+            let f_off = in_len - 12;
+            let footer_ptr = in_buf + f_off;
+            let f_m0_ptr = footer_ptr + 10;
+            let footer_m0 = *f_m0_ptr;
+            let f_m1_ptr = footer_ptr + 11;
+            let footer_m1 = *f_m1_ptr;
+            let fm0_ok = footer_m0 == 0x59;
+            let fm1_ok = footer_m1 == 0x5A;
+            let is_footer_magic = fm0_ok && fm1_ok;
+            is_footer_magic => VerifyFooterCRC;
+            _               => Error;
+        }
+
+        VerifyFooterCRC: {
+            let f_off = in_len - 12;
+            let footer_ptr = in_buf + f_off;
+            let stored_f_crc = call read_u32_le(footer_ptr);
+            let f_crc_ptr = footer_ptr + 4;
+            let calc_f_crc = call crc32_calculate(crc_table, f_crc_ptr, 6);
+            stored_f_crc == calc_f_crc => Success;
+            _                          => Error;
+        }
+
+        Success: {
+            _ => return dec.out_pos;
+        }
+
+        Error: {
+            _ => return 0xFFFFFFFF;
+        }
+    }
+}
