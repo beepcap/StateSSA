@@ -3,6 +3,9 @@
 // xz_compress で圧縮し、xz_decompress で解凍して原本と完全一致を検証する
 // ============================================================================
 
+include "xz_encoder.ssa";
+include "xz_container.ssa";
+
 extern "C" {
     fn malloc(size: u32) -> *u8;
     fn free(ptr: *u8) -> void;

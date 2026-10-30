@@ -1,7 +1,15 @@
 // ============================================================================
-// StateSSA Compiler: Pure StateSSA CLI Driver (driver.ssa)
-// コマンドライン引数を解析し、ファイルを読み込んで ssac_compile_source を実行する
+// StateSSA Compiler: Pure StateSSA Unified Queue CLI Driver (driver.ssa)
+// 1. common.ssa モノリシックアリーナによる一括確保・内部API切り出し (malloc 1回)
+// 2. コマンドライン複数引数と include 依存関係を統一処理キューで解決
+// 3. 親ディレクトリ基準の相対パス自動解決
+// 4. 入力規模に基づく動的メモリ厳密算定 (calc_compiler_required_memory)
 // ============================================================================
+
+include "common.ssa";
+include "lexer.ssa";
+include "parser.ssa";
+include "codegen.ssa";
 
 extern "C" {
     fn fopen(path: *u8, mode: *u8) -> *void;
@@ -12,42 +20,171 @@ extern "C" {
     fn ftell(stream: *void) -> i64;
     fn puts(str: *u8) -> i32;
     fn strcmp(s1: *u8, s2: *u8) -> i32;
+    fn malloc(size: u32) -> *u8;
+    fn free(ptr: *u8) -> void;
 }
 
+// ============================================================================
+// パス解決・文字列ヘルパーマシン群 (driver.ssa 内自己完結)
+// ============================================================================
+
+machine driver_str_eq(s1: *u8, len1: u32, s2: *u8, len2: u32) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire len_match = len1 == len2;
+        wire has_more = i < len1;
+        wire ptr_c1 = s1 + i;
+        wire c1 = *ptr_c1;
+        wire ptr_c2 = s2 + i;
+        wire c2 = *ptr_c2;
+        wire char_match = c1 == c2;
+    }
+    states {
+        Entry: {
+            len_match == 0 => NoMatch;
+            len1 == 0      => Match;
+            _              => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0   => Match;
+            char_match == 0 => NoMatch;
+            _               => Loop [ i <= i + 1 ];
+        }
+        Match:   { _ => return 1; }
+        NoMatch: { _ => return 0; }
+    }
+}
+
+// find_dir_len: パス文字列内の最後の '/' (ASCII 47) の位置 + 1 を返す
+machine find_dir_len(path: *u8, len: u32) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        reg last_slash: u32 = 0;
+        wire has_more = i < len;
+        wire p = path + i;
+        wire c = *p;
+        wire is_slash = c == 47; // '/'
+        wire next_i = i + 1;
+    }
+    states {
+        Entry: {
+            len == 0 => ExitZero;
+            _        => Loop [ i <= 0, last_slash <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => ExitFound;
+            is_slash != 0 => FoundSlash;
+            _             => Loop [ i <= next_i ];
+        }
+        FoundSlash: {
+            _ => Loop [ i <= next_i, last_slash <= next_i ];
+        }
+        ExitFound: {
+            _ => return last_slash;
+        }
+        ExitZero: {
+            _ => return 0;
+        }
+    }
+}
+
+// check_path_loaded: 既読パステーブルとの照合 (多重読み込みガード)
+machine check_path_loaded(loaded_paths: *u64, loaded_lens: *u32, count: u32, target_path: *u8, target_len: u32) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire has_more = i < count;
+        wire p_slot = loaded_paths + i;
+        wire l_slot = loaded_lens + i;
+        wire path_u64 = *p_slot;
+        wire cur_p = cast(*u8) path_u64;
+        wire cur_l = *l_slot;
+        wire is_match = call driver_str_eq(cur_p, cur_l, target_path, target_len);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return 1;
+        }
+        NotFound: {
+            _ => return 0;
+        }
+    }
+}
+
+// ============================================================================
+// メイン CLI エントリポイント
+// ============================================================================
 machine main(argc: i32, argv: *u64) -> i32 {
     flow {
-        reg arg_idx:  i32 = 1;
-        reg in_path:  *u8 = null;
-        reg out_path: *u8 = null;
-        reg res_code: i32 = 0;
+        reg arg_idx:         i32 = 1;
+        reg out_path:        *u8 = null;
+        reg res_code:        i32 = 0;
+        reg total_src_bytes: u32 = 0;
+
+        reg queue_head:      u32 = 0;
+        reg queue_tail:      u32 = 0;
+        reg loaded_count:    u32 = 0;
+
+        // モノリシックアリーナ (common.ssa)
+        reg arena_raw:       *u8 = null;
+        reg alloc_obj:       *BumpAlloc = null;
+
+        // キュー・パステーブル・AST
+        reg queue_paths:     *u64 = null;
+        reg queue_lens:      *u32 = null;
+        reg loaded_paths:    *u64 = null;
+        reg loaded_lens:     *u32 = null;
+        reg prog_ast:        *ProgramDef = null;
+        reg tail_box:        *u32 = null;
+        reg out_buf_ptr:     *u8 = null;
+        reg out_buf_cap:     u32 = 0;
+
+        // ファイル I/O レジスタ
+        reg cur_fp:          *void = null;
+        reg cur_file_sz:     u32 = 0;
+        reg cur_src_buf:     *u8 = null;
 
         wire is_arg_done = arg_idx >= argc;
         wire cur_arg_ptr = argv + arg_idx;
         wire cur_arg_val = *cur_arg_ptr;
         wire cur_arg     = cast(*u8) cur_arg_val;
-        wire next_idx    = arg_idx + 1;
+
+        wire is_queue_empty = queue_head >= queue_tail;
+        wire cur_q_slot     = queue_paths + queue_head;
+        wire cur_q_val      = *cur_q_slot;
+        wire cur_file_path  = cast(*u8) cur_q_val;
+        wire cur_len_slot   = queue_lens + queue_head;
+        wire cur_file_len   = *cur_len_slot;
     }
 
     states {
         Entry: {
             argc < 2 => ShowUsage;
-            _        => ParseArgs;
+            _        => ScanArgs [ arg_idx <= 1, total_src_bytes <= 0 ];
         }
 
         ShowUsage: {
-            let _ = call puts("Usage: ssac <input.ssa> [-o <output.ll>]");
+            let _ = call puts("Usage: ssac <input.ssa ...> [-o <output.ll>]");
             _ => Exit [ res_code <= 1 ];
         }
 
-        ParseArgs: {
-            is_arg_done => CheckArgs;
+        // --- 1. CLI 引数の初期走査 (サイズ合算 & オプション解析) ---
+        ScanArgs: {
+            is_arg_done => FinishScan;
             _           => CheckOpt;
         }
 
         CheckOpt: {
             let is_dash_o = call strcmp(cur_arg, "-o");
             is_dash_o == 0 => SetOutputOpt;
-            _              => SetInputFile;
+            _              => MeasureFile;
         }
 
         SetOutputOpt: {
@@ -57,84 +194,276 @@ machine main(argc: i32, argv: *u64) -> i32 {
             let opt_val_ptr = argv + next_pos;
             let opt_val_u64 = *opt_val_ptr;
             let opt_val = cast(*u8) opt_val_u64;
-            _ => ParseArgs [ out_path <= opt_val, arg_idx <= arg_idx + 2 ];
+            let next_arg_idx = arg_idx + 2;
+            _ => ScanArgs [ out_path <= opt_val, arg_idx <= next_arg_idx ];
         }
 
-        SetInputFile: {
-            in_path == null => AssignIn;
-            _               => ParseArgs [ arg_idx <= next_idx ];
+        MeasureFile: {
+            let fp = call fopen(cur_arg, "rb");
+            _ => CheckMeasureFp [ cur_fp <= fp ];
         }
 
-        AssignIn: {
-            _ => ParseArgs [ in_path <= cur_arg, arg_idx <= next_idx ];
+        CheckMeasureFp: {
+            cur_fp == null => ErrOpenIn;
+            _              => DoMeasure;
         }
 
-        CheckArgs: {
-            in_path == null => ShowUsage;
-            out_path == null => SetDefaultOut;
-            _                => ReadSource;
+        DoMeasure: {
+            let _ = call fseek(cur_fp, 0, 2); // SEEK_END = 2
+            let f_sz_64 = call ftell(cur_fp);
+            let f_sz = cast(u32) f_sz_64;
+            let _ = call fclose(cur_fp);
+
+            let next_total = total_src_bytes + f_sz;
+            let next_arg_idx = arg_idx + 1;
+            _ => ScanArgs [ total_src_bytes <= next_total, arg_idx <= next_arg_idx ];
+        }
+
+        FinishScan: {
+            total_src_bytes == 0 => ShowUsage;
+            out_path == null     => SetDefaultOut;
+            _                    => InitMonolithicArena;
         }
 
         SetDefaultOut: {
-            _ => ReadSource [ out_path <= "output.ll" ];
+            _ => InitMonolithicArena [ out_path <= "output.ll" ];
         }
 
-        // --- ファイル読み込み ---
+        // --- 2. 動的メモリ算定とモノリシックアリーナ確保 ---
+        InitMonolithicArena: {
+            // include 展開を見込んだ推定総ソース規模 (初期合計 * 4 + 64KB)
+            let scaled_src = total_src_bytes * 4;
+            let est_src = scaled_src + 65536;
+
+            // アリーナ容量算定 (calc_compiler_required_memory: est_src * 500 + 1MB, 最小2MB)
+            let arena_cap = call calc_compiler_required_memory(est_src);
+
+            // 出力バッファ容量算定 (est_src * 50 + 1MB)
+            let scaled_out = est_src * 50;
+            let est_out = scaled_out + 1048576;
+
+            // 総 malloc サイズ (アリーナ + 出力バッファ + ヘッダ余裕)
+            let total_alloc = arena_cap + est_out;
+            let total_malloc = total_alloc + 65536;
+
+            let raw = call malloc(total_malloc);
+            raw == null => ErrMemory;
+
+            // アロケータ管理構造体自体をブロック先頭に配置
+            let alloc = cast(*BumpAlloc) raw;
+            let mem_base = raw + 64;
+            let alloc_cap = total_malloc - 64;
+            let _ = call bump_init(alloc, mem_base, alloc_cap);
+
+            // 内部 API (bump_alloc) による各作業領域の切り出し
+            let q_p = call bump_alloc(alloc, 1024, 8); // queue_paths (128 * 8)
+            let q_l = call bump_alloc(alloc, 512, 4);  // queue_lens (128 * 4)
+            let l_p = call bump_alloc(alloc, 1024, 8); // loaded_paths (128 * 8)
+            let l_l = call bump_alloc(alloc, 512, 4);  // loaded_lens (128 * 4)
+            let p_m = call bump_alloc(alloc, 64, 8);   // ProgramDef
+            let t_b = call bump_alloc(alloc, 16, 8);   // tail_box
+
+            // 出力バッファをアリーナから切り出し
+            let out_mem = call bump_alloc(alloc, est_out, 8);
+
+            // ProgramDef のエンティティ容量動的算定
+            let ent_cap_calc = est_src / 64;
+            let ent_cap = ent_cap_calc + 128;
+            let _ = call init_program_storage(p_m, alloc, ent_cap, ent_cap, ent_cap);
+
+            _ => EnqueueCLIArgs [
+                arena_raw <= raw, alloc_obj <= alloc,
+                queue_paths <= q_p, queue_lens <= q_l,
+                loaded_paths <= l_p, loaded_lens <= l_l,
+                prog_ast <= p_m, tail_box <= t_b,
+                out_buf_ptr <= out_mem, out_buf_cap <= est_out,
+                arg_idx <= 1, queue_tail <= 0
+            ];
+        }
+
+        // --- 3. CLI 引数の初期キュー登録 ---
+        EnqueueCLIArgs: {
+            is_arg_done => QueueLoop;
+            _           => CheckOptForEnqueue;
+        }
+
+        CheckOptForEnqueue: {
+            let is_dash_o = call strcmp(cur_arg, "-o");
+            is_dash_o != 0 => DoEnqueueArg;
+            _              => SkipOptArg;
+        }
+
+        SkipOptArg: {
+            let next_idx2 = arg_idx + 2;
+            _ => EnqueueCLIArgs [ arg_idx <= next_idx2 ];
+        }
+
+        DoEnqueueArg: {
+            let cur_l = call strlen(cur_arg);
+            let slot_p = queue_paths + queue_tail;
+            let slot_l = queue_lens + queue_tail;
+            *slot_p <- cur_arg_val;
+            *slot_l <- cur_l;
+            let next_tail = queue_tail + 1;
+            let next_idx1 = arg_idx + 1;
+            _ => EnqueueCLIArgs [ queue_tail <= next_tail, arg_idx <= next_idx1 ];
+        }
+
+        // --- 4. 統一ファイルキュー処理ループ ---
+        QueueLoop: {
+            is_queue_empty => DoCodegen;
+            _              => CheckLoaded;
+        }
+
+        CheckLoaded: {
+            let is_loaded = call check_path_loaded(loaded_paths, loaded_lens, loaded_count, cur_file_path, cur_file_len);
+            is_loaded != 0 => AdvanceQueue;
+            _              => RegisterLoaded;
+        }
+
+        RegisterLoaded: {
+            let slot_lp = loaded_paths + loaded_count;
+            let slot_ll = loaded_lens + loaded_count;
+            *slot_lp <- cur_q_val;
+            *slot_ll <- cur_file_len;
+            let next_lc = loaded_count + 1;
+            _ => OpenFile [ loaded_count <= next_lc ];
+        }
+
+        OpenFile: {
+            let fp = call fopen(cur_file_path, "rb");
+            _ => CheckFp [ cur_fp <= fp ];
+        }
+
+        CheckFp: {
+            cur_fp == null => ErrOpenIn;
+            _              => ReadSource;
+        }
+
         ReadSource: {
-            let fp_in = call fopen(in_path, "rb");
-            fp_in == null => ErrOpenIn;
-
-            let _ = call fseek(fp_in, 0, 2); // SEEK_END = 2
-            let f_sz_64 = call ftell(fp_in);
+            let _ = call fseek(cur_fp, 0, 2); // SEEK_END = 2
+            let f_sz_64 = call ftell(cur_fp);
             let f_sz = cast(u32) f_sz_64;
-            let _ = call fseek(fp_in, 0, 0); // SEEK_SET = 0
+            let _ = call fseek(cur_fp, 0, 0); // SEEK_SET = 0
 
-            let src_buf = call malloc(f_sz + 1);
-            let n_read = call fread(src_buf, 1, f_sz, fp_in);
-            let _ = call fclose(fp_in);
+            // ソースバッファをアリーナから切り出し
+            let src_buf = call bump_alloc(alloc_obj, f_sz + 1, 1);
+            let n_read = call fread(src_buf, 1, f_sz, cur_fp);
+            let _ = call fclose(cur_fp);
 
-            // null 終端
             let end_p = src_buf + n_read;
             *end_p <- 0;
 
-            // コンパイル実行
-            // 64MB 出力バッファ
-            let out_buf = call malloc(67108864);
-            let comp_res = call ssac_compile_source(src_buf, n_read, out_buf, 67108864);
-            let _ = call free(src_buf);
+            _ => TokenizeAndParse [ cur_src_buf <= src_buf, cur_file_sz <= f_sz ];
+        }
 
-            comp_res <= 0 => ErrCompile;
+        TokenizeAndParse: {
+            let dir_l = call find_dir_len(cur_file_path, cur_file_len);
+            let dir_p = cur_file_path;
 
-            // 出力ファイル書き込み
+            // トークンメモリをアリーナから切り出し
+            let max_toks = cur_file_sz + 1024;
+            let tok_bytes = max_toks * 32;
+            let tok_mem = call bump_alloc(alloc_obj, tok_bytes, 8);
+
+            // cur_src_buf を直接渡し、逆算を完全排除
+            let num_toks = call ssac_tokenize(cur_src_buf, cur_file_sz, tok_mem, max_toks);
+            num_toks < 0 => ErrTokenize;
+
+            // 追記型パース (include 検出時は親ディレクトリを前置してキューに登録)
+            *tail_box <- queue_tail;
+            let ret_parse = call parse_file_with_dir(tok_mem, num_toks, alloc_obj, prog_ast, queue_paths, queue_lens, tail_box, 128, dir_p, dir_l);
+            ret_parse != 0 => ErrParse;
+
+            let updated_tail = *tail_box;
+            _ => AdvanceQueue [ queue_tail <= updated_tail ];
+        }
+
+        AdvanceQueue: {
+            let next_head = queue_head + 1;
+            _ => QueueLoop [ queue_head <= next_head ];
+        }
+
+        // --- 5. 全ファイル統合 AST からのコード生成 ---
+        DoCodegen: {
+            let comp_res = call ssac_codegen(prog_ast, alloc_obj, out_buf_ptr, out_buf_cap);
+            comp_res <= 0 => ErrCodegen;
+
             let fp_out = call fopen(out_path, "wb");
             fp_out == null => ErrOpenOut;
 
             let out_bytes = cast(u32) comp_res;
-            let _ = call fwrite(out_buf, 1, out_bytes, fp_out);
+            let _ = call fwrite(out_buf_ptr, 1, out_bytes, fp_out);
             let _ = call fclose(fp_out);
-            let _ = call free(out_buf);
 
             let _ = call puts("StateSSA compilation successful!");
-            _ => Exit [ res_code <= 0 ];
+            _ => CleanUp [ res_code <= 0 ];
+        }
+
+        // --- エラー処理 ---
+        ErrMemory: {
+            let _ = call puts("Error: Out of memory for monolithic arena.");
+            _ => Exit [ res_code <= 10 ];
         }
 
         ErrOpenIn: {
             let _ = call puts("Error: Cannot open input file.");
-            _ => Exit [ res_code <= 2 ];
+            _ => CleanUp [ res_code <= 2 ];
         }
 
-        ErrCompile: {
-            let _ = call puts("Error: Compilation failed.");
-            _ => Exit [ res_code <= 3 ];
+        ErrTokenize: {
+            let _ = call puts("Error: Tokenization failed.");
+            _ => CleanUp [ res_code <= 3 ];
+        }
+
+        ErrParse: {
+            let _ = call puts("Error: Parsing failed (Syntax or Duplicate Definition).");
+            _ => CleanUp [ res_code <= 4 ];
+        }
+
+        ErrCodegen: {
+            let _ = call puts("Error: Code generation failed.");
+            _ => CleanUp [ res_code <= 5 ];
         }
 
         ErrOpenOut: {
             let _ = call puts("Error: Cannot open output file for writing.");
-            _ => Exit [ res_code <= 4 ];
+            _ => CleanUp [ res_code <= 6 ];
+        }
+
+        // --- メモリ一括解放 (1 回の free で全メモリ完了) ---
+        CleanUp: {
+            let _ = call free(arena_raw);
+            _ => Exit;
         }
 
         Exit: {
             _ => return res_code;
+        }
+    }
+}
+
+// ============================================================================
+// 親ディレクトリ解決付きパースマシン (parse_file_with_dir)
+// ============================================================================
+machine parse_file_with_dir(
+    tokens: *Token, tok_cnt: u32, alloc: *BumpAlloc, out_prog: *ProgramDef,
+    q: *u64, lens: *u32, p_tail: *u32, max_q: u32,
+    dir_p: *u8, dir_l: u32
+) -> i32 {
+    flow {}
+    states {
+        Entry: {
+            let ctx_mem = call alloc_parse_context(alloc);
+            let ctx = call init_parse_context(ctx_mem, tokens, tok_cnt, alloc);
+            ctx.inc_queue    <- q;
+            ctx.inc_lens     <- lens;
+            ctx.inc_tail_ptr <- p_tail;
+            ctx.inc_max      <- max_q;
+            ctx.parent_dir_p <- dir_p;
+            ctx.parent_dir_l <- dir_l;
+            let ret = call parse_file_declarations(ctx, out_prog);
+            _ => return ret;
         }
     }
 }

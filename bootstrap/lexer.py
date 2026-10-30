@@ -52,6 +52,17 @@ SYMBOLS = [
     ("_", TokenType.UNDERSCORE),
 ]
 
+def parse_q64_str(text: str) -> int:
+    if '.' not in text:
+        return int(text) << 32
+    int_part_str, frac_part_str = text.split('.', 1)
+    int_part = int(int_part_str) if int_part_str else 0
+    frac_part_str = frac_part_str[:9]
+    num = int(frac_part_str) if frac_part_str else 0
+    denom = 10 ** len(frac_part_str) if frac_part_str else 1
+    frac_q64 = (num * 4294967296 + denom // 2) // denom
+    return (int_part << 32) + frac_q64
+
 class Lexer:
     def __init__(self, text: str):
         self.text = text
@@ -77,6 +88,15 @@ class Lexer:
                 end = self.text.find('\n', self.pos)
                 if end == -1: break
                 self.pos = end
+                continue
+
+            # Decimal float literal (e.g. 1.5, 0.125) -> Q64_LIT
+            m = re.match(r'[0-9]+\.[0-9]+', self.text[self.pos:])
+            if m:
+                num = m.group(0)
+                tokens.append(Token(TokenType.Q64_LIT, num, self.line, self.col))
+                self.pos += len(num)
+                self.col += len(num)
                 continue
 
             # Check symbols

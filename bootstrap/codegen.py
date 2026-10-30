@@ -1,6 +1,6 @@
 import codecs
 from .ast_nodes import Program, Machine, State, Rule, Action, TypeDef, ExternFn
-from .expr_nodes import BinaryExpr, UnaryExpr, CallExpr, FieldExpr, StructLit, VarExpr, IntLit, StringLit, NullLit, CastExpr
+from .expr_nodes import BinaryExpr, UnaryExpr, CallExpr, FieldExpr, StructLit, VarExpr, IntLit, StringLit, NullLit, CastExpr, Q64Lit
 
 class CodeGen:
     def __init__(self, prog: Program):
@@ -19,11 +19,20 @@ class CodeGen:
             "*u64": "i64*",
             "u16": "i16",
             "*u16": "i16*",
+            "i16": "i16",
+            "*i16": "i16*",
             "u8": "i8",
             "*u8": "i8*",
+            "i8": "i8",
             "*i8": "i8*",
             "*void": "i8*",
-            "void": "void"
+            "void": "void",
+            "q64": "i64",
+            "*q64": "i64*",
+            "f32": "float",
+            "*f32": "float*",
+            "f64": "double",
+            "*f64": "double*",
         }
         self.struct_def: dict[str, list[tuple[str, str]]] = {}
         for t in prog.types:
@@ -357,6 +366,8 @@ class CodeGen:
                     return target_m.ret_type
             for ext in self.prog.externs:
                 if ext.name == expr.func:
+                    if ext.ret_type in ("f32", "f64"):
+                        return "q64"
                     return ext.ret_type
         if isinstance(expr, FieldExpr):
             # Lookup struct
@@ -377,6 +388,8 @@ class CodeGen:
             return expr.type_name
         if isinstance(expr, CastExpr):
             return expr.target_type
+        if isinstance(expr, Q64Lit):
+            return "q64"
         if isinstance(expr, IntLit):
             if expr.val > 4294967295 or expr.val < -2147483648:
                 return "i64"
@@ -393,6 +406,8 @@ class CodeGen:
                 if lt.startswith("*"): return lt
             lt = self.get_expr_type(expr.left, m)
             rt = self.get_expr_type(expr.right, m)
+            if lt == "q64" or rt == "q64":
+                return "q64"
             if lt in ("i64", "u64") or rt in ("i64", "u64"):
                 return "u64" if (lt == "u64" or rt == "u64") else "i64"
             if lt in ("u32", "u16", "u8") or rt in ("u32", "u16", "u8"):
@@ -419,6 +434,9 @@ class CodeGen:
             return "null"
 
         if isinstance(expr, IntLit):
+            return str(expr.val)
+
+        if isinstance(expr, Q64Lit):
             return str(expr.val)
 
         if isinstance(expr, StringLit):
@@ -457,7 +475,7 @@ class CodeGen:
                 insts.append(f"{res} = icmp {cmp_op} ptr {left}, {right}")
                 return res
 
-            if left_type in ("i64", "u64") or right_type in ("i64", "u64"):
+            if left_type in ("i64", "u64", "q64") or right_type in ("i64", "u64", "q64"):
                 bin_type = "i64"
             elif left_type == "i1" or right_type == "i1":
                 bin_type = "i1"
@@ -465,16 +483,43 @@ class CodeGen:
                 bin_type = "i32"
             left_llvm = self.map_type(left_type)
             right_llvm = self.map_type(right_type)
-            if left_llvm != bin_type and not isinstance(expr.left, IntLit):
+            if left_llvm != bin_type and not isinstance(expr.left, (IntLit, Q64Lit)):
                 ext_left = self.fresh_tmp("ext")
                 op_ext = "sext" if left_type in ("i8", "i16", "i32") else "zext"
                 insts.append(f"{ext_left} = {op_ext} {left_llvm} {left} to {bin_type}")
                 left = ext_left
-            if right_llvm != bin_type and not isinstance(expr.right, IntLit):
+            if right_llvm != bin_type and not isinstance(expr.right, (IntLit, Q64Lit)):
                 ext_right = self.fresh_tmp("ext")
                 op_ext = "sext" if right_type in ("i8", "i16", "i32") else "zext"
                 insts.append(f"{ext_right} = {op_ext} {right_llvm} {right} to {bin_type}")
                 right = ext_right
+
+            # q64 special 128-bit multiplication and division
+            if (left_type == "q64" or right_type == "q64") and expr.op in ("*", "/"):
+                if expr.op == "*":
+                    sext_l = self.fresh_tmp("qmul_l")
+                    sext_r = self.fresh_tmp("qmul_r")
+                    mul128 = self.fresh_tmp("qmul128")
+                    shr128 = self.fresh_tmp("qmul_shr")
+                    res = self.fresh_tmp("qmul_res")
+                    insts.append(f"{sext_l} = sext i64 {left} to i128")
+                    insts.append(f"{sext_r} = sext i64 {right} to i128")
+                    insts.append(f"{mul128} = mul i128 {sext_l}, {sext_r}")
+                    insts.append(f"{shr128} = ashr i128 {mul128}, 32")
+                    insts.append(f"{res} = trunc i128 {shr128} to i64")
+                    return res
+                elif expr.op == "/":
+                    sext_l = self.fresh_tmp("qdiv_l")
+                    shl128 = self.fresh_tmp("qdiv_shl")
+                    sext_r = self.fresh_tmp("qdiv_r")
+                    div128 = self.fresh_tmp("qdiv128")
+                    res = self.fresh_tmp("qdiv_res")
+                    insts.append(f"{sext_l} = sext i64 {left} to i128")
+                    insts.append(f"{shl128} = shl i128 {sext_l}, 32")
+                    insts.append(f"{sext_r} = sext i64 {right} to i128")
+                    insts.append(f"{div128} = sdiv i128 {shl128}, {sext_r}")
+                    insts.append(f"{res} = trunc i128 {div128} to i64")
+                    return res
 
             is_unsigned = self.is_unsigned_type(self.get_expr_type(expr.left, m)) or self.is_unsigned_type(self.get_expr_type(expr.right, m))
             res = self.fresh_tmp()
@@ -584,7 +629,19 @@ class CodeGen:
                     actual_ssa = self.get_expr_type(a, m)
                     actual_llvm = self.map_type(actual_ssa)
                     if expected_pt != actual_llvm:
-                        if expected_pt == "i64" and actual_llvm in ("i32", "i16", "i8"):
+                        if expected_pt == "double" and actual_ssa == "q64":
+                            fp_raw = self.fresh_tmp("q2fp")
+                            insts.append(f"{fp_raw} = sitofp i64 {av} to double")
+                            fp_div = self.fresh_tmp("q2fp_div")
+                            insts.append(f"{fp_div} = fdiv double {fp_raw}, 4294967296.0")
+                            av = fp_div
+                        elif expected_pt == "float" and actual_ssa == "q64":
+                            fp_raw = self.fresh_tmp("q2fp")
+                            insts.append(f"{fp_raw} = sitofp i64 {av} to float")
+                            fp_div = self.fresh_tmp("q2fp_div")
+                            insts.append(f"{fp_div} = fdiv float {fp_raw}, 4294967296.0")
+                            av = fp_div
+                        elif expected_pt == "i64" and actual_llvm in ("i32", "i16", "i8"):
                             ext_val = self.fresh_tmp("zext")
                             insts.append(f"{ext_val} = zext {actual_llvm} {av} to i64")
                             av = ext_val
@@ -617,6 +674,18 @@ class CodeGen:
             else:
                 res = self.fresh_tmp()
                 insts.append(f"{res} = call {ret_type} @{expr.func}({args_str})")
+                if ret_type == "double":
+                    mul_res = self.fresh_tmp("fp2q_mul")
+                    insts.append(f"{mul_res} = fmul double {res}, 4294967296.0")
+                    q_res = self.fresh_tmp("fp2q")
+                    insts.append(f"{q_res} = fptosi double {mul_res} to i64")
+                    return q_res
+                elif ret_type == "float":
+                    mul_res = self.fresh_tmp("fp2q_mul")
+                    insts.append(f"{mul_res} = fmul float {res}, 4294967296.0")
+                    q_res = self.fresh_tmp("fp2q")
+                    insts.append(f"{q_res} = fptosi float {mul_res} to i64")
+                    return q_res
                 return res
 
         if isinstance(expr, CastExpr):
@@ -630,6 +699,25 @@ class CodeGen:
             to_llvm = self.map_type(to_type)
             if from_llvm == to_llvm:
                 return val
+
+            if to_type == "q64":
+                if from_llvm != "i64":
+                    ext = self.fresh_tmp("ext_q")
+                    op = "sext" if from_type in ("i8", "i16", "i32") else "zext"
+                    insts.append(f"{ext} = {op} {from_llvm} {val} to i64")
+                    val = ext
+                res = self.fresh_tmp("shl_q")
+                insts.append(f"{res} = shl i64 {val}, 32")
+                return res
+
+            if from_type == "q64":
+                shr = self.fresh_tmp("shr_q")
+                insts.append(f"{shr} = ashr i64 {val}, 32")
+                if to_llvm != "i64":
+                    res = self.fresh_tmp("trunc_q")
+                    insts.append(f"{res} = trunc i64 {shr} to {to_llvm}")
+                    return res
+                return shr
 
             is_from_ptr = from_type.startswith("*")
             is_to_ptr = to_type.startswith("*")

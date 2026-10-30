@@ -19,7 +19,7 @@ type Token = {
 //   10: MACHINE, 11: FLOW, 12: STATES, 13: REG, 14: WIRE, 15: LET, 16: CALL
 //   17: EXTERN, 18: TYPE, 19: RETURN, 20: PANIC, 21: INCLUDE, 22: CAST
 // Literals & Identifiers: 30..39
-//   30: IDENT, 31: INT_LIT, 32: STRING_LIT
+//   30: IDENT, 31: INT_LIT, 32: STRING_LIT, 33: Q64_LIT
 // 2-character Symbols: 40..59
 //   40: SHL (<<), 41: SHR (>>), 42: ARROW (->), 43: FAT_ARROW (=>)
 //   44: LEQ (<=), 45: STORE (<-), 46: EQ (==), 47: NEQ (!=)
@@ -410,6 +410,7 @@ machine ssac_tokenize(src: *u8, src_len: u32, tokens: *Token, max_tokens: u32) -
 
         ScanDec: {
             is_eof != 0 => FinishNumber;
+            c0 == 46    => CheckDot; // '.' = 46
             c0 < 48     => FinishNumber;
             c0 <= 57    => AdvanceDec;
             _           => FinishNumber;
@@ -417,6 +418,35 @@ machine ssac_tokenize(src: *u8, src_len: u32, tokens: *Token, max_tokens: u32) -
 
         AdvanceDec: {
             _ => ScanDec [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        CheckDot: {
+            has_next == 0 => FinishNumber;
+            c1 < 48       => FinishNumber;
+            c1 <= 57      => StartFrac;
+            _             => FinishNumber;
+        }
+
+        StartFrac: {
+            _ => ScanFrac [ pos <= pos + 2, col <= col + 2 ];
+        }
+
+        ScanFrac: {
+            is_eof != 0 => FinishQ64;
+            c0 < 48     => FinishQ64;
+            c0 <= 57    => AdvanceFrac;
+            _           => FinishQ64;
+        }
+
+        AdvanceFrac: {
+            _ => ScanFrac [ pos <= pos + 1, col <= col + 1 ];
+        }
+
+        FinishQ64: {
+            let num_len = pos - cur_start;
+            let num_ptr = src + cur_start;
+            let _ = call emit_token(tokens, tok_cnt, 33, num_ptr, num_len, line, cur_col); // Q64_LIT = 33
+            _ => MainLoop [ tok_cnt <= tok_cnt + 1 ];
         }
 
         FinishNumber: {

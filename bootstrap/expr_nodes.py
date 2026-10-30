@@ -40,6 +40,10 @@ class IntLit:
     val: int
 
 @dataclass
+class Q64Lit:
+    val: int
+
+@dataclass
 class StringLit:
     val: str
 

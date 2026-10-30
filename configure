@@ -58,19 +58,9 @@ else
     echo ">>> Bootstrapping StateSSA Stage-3 Compiler from Stage-0 <<<"
     echo "------------------------------------------------------------"
 
-    # ソースマージ (include 文の除去)
-    echo "[Step 0] Merging compiler source files..."
-    sed '/^[[:space:]]*include/d' \
-        source/common.ssa \
-        source/lexer.ssa \
-        source/parser.ssa \
-        source/codegen.ssa \
-        source/driver.ssa > build/compiler_all.ssa
-    echo "  -> build/compiler_all.ssa generated ($(wc -c < build/compiler_all.ssa) bytes)"
-
     # Stage-0 (Python) -> Stage-1 IR
     echo "[Step 1] Compiling Stage-1 LLVM IR via bootstrap/main.py (Stage-0 Python)..."
-    PYTHONPATH=. "$PYTHON_BIN" -m bootstrap.main build/compiler_all.ssa -o build/stage1.ll
+    PYTHONPATH=. "$PYTHON_BIN" -m bootstrap.main source/driver.ssa -o build/stage1.ll
     echo "  -> build/stage1.ll generated ($(wc -c < build/stage1.ll) bytes)"
 
     # Stage-1 ビルド
@@ -80,7 +70,7 @@ else
 
     # Stage-1 実行 -> Stage-2 IR
     echo "[Step 3] Compiling Stage-2 LLVM IR via Stage-1 compiler..."
-    build/stage1_ssac build/compiler_all.ssa -o build/stage2.ll
+    build/stage1_ssac source/driver.ssa -o build/stage2.ll
     echo "  -> build/stage2.ll generated ($(wc -c < build/stage2.ll) bytes)"
 
     # Stage-2 ビルド
@@ -90,7 +80,7 @@ else
 
     # Stage-2 実行 -> Stage-3 IR
     echo "[Step 5] Compiling Stage-3 LLVM IR via Stage-2 compiler..."
-    build/stage2_ssac build/compiler_all.ssa -o build/stage3.ll
+    build/stage2_ssac source/driver.ssa -o build/stage3.ll
     echo "  -> build/stage3.ll generated ($(wc -c < build/stage3.ll) bytes)"
 
     # 固定点検証 (Fixed-Point Verification)
@@ -123,9 +113,9 @@ SSAC ?= $(CURDIR)/bin/ssac
 CLANG ?= clang
 PYTHON ?= python3
 
-.PHONY: all test clean 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server
+.PHONY: all test clean 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math
 
-all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server
+all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math
 	@echo "All samples built successfully."
 
 01_hello_world:
@@ -135,65 +125,47 @@ all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server
 
 02_simple_loop:
 	@mkdir -p build/02
-	sed '/^[[:space:]]*include/d' samples/02_simple_loop/simple_loop.ssa samples/02_simple_loop/main.ssa > build/02/merged.ssa
-	$(SSAC) build/02/merged.ssa -o build/02/simple_loop.ll
+	$(SSAC) samples/02_simple_loop/main.ssa -o build/02/simple_loop.ll
 	$(CLANG) -O2 build/02/simple_loop.ll -o build/02/simple_loop
 
 03_parallel_sum:
 	@mkdir -p build/03
-	sed '/^[[:space:]]*include/d' samples/03_parallel_sum/parallel_sum.ssa samples/03_parallel_sum/main.ssa > build/03/merged.ssa
-	$(SSAC) build/03/merged.ssa -o build/03/parallel_sum.ll
+	$(SSAC) samples/03_parallel_sum/main.ssa -o build/03/parallel_sum.ll
 	$(CLANG) -O2 build/03/parallel_sum.ll -lpthread -o build/03/parallel_sum
 
 04_xz:
 	@mkdir -p build/04
-	sed '/^[[:space:]]*include/d' \
-		samples/04_xz/crc32.ssa \
-		samples/04_xz/range_coder.ssa \
-		samples/04_xz/lzma_decoder.ssa \
-		samples/04_xz/lzma2_decoder.ssa \
-		samples/04_xz/xz_container.ssa \
-		samples/04_xz/range_encoder.ssa \
-		samples/04_xz/match_finder.ssa \
-		samples/04_xz/lzma_encoder.ssa \
-		samples/04_xz/xz_encoder.ssa \
-		samples/04_xz/main.ssa > build/04/merged.ssa
-	$(SSAC) build/04/merged.ssa -o build/04/xz_sample.ll
+	$(SSAC) samples/04_xz/main.ssa -o build/04/xz_sample.ll
 	$(CLANG) -O2 build/04/xz_sample.ll -o build/04/xz_sample
 
 05_web_server:
 	@mkdir -p build/05
-	sed '/^[[:space:]]*include/d' \
-		samples/05_web_server/http_types.ssa \
-		samples/05_web_server/http_parser.ssa \
-		samples/05_web_server/uring_types.ssa \
-		samples/05_web_server/uring_init.ssa \
-		samples/05_web_server/uring_sqe.ssa \
-		samples/05_web_server/http_response.ssa \
-		samples/05_web_server/uring_conn.ssa \
-		samples/05_web_server/uring_server.ssa \
-		samples/05_web_server/main.ssa > build/05/merged.ssa
-	$(SSAC) build/05/merged.ssa -o build/05/web_server.ll
+	$(SSAC) samples/05_web_server/main.ssa -o build/05/web_server.ll
 	$(CLANG) -O2 build/05/web_server.ll -o build/05/web_server
+
+06_fixed_math:
+	@mkdir -p build/06
+	$(SSAC) samples/06_fixed_math/fixed_math.ssa -o build/06/fixed_math.ll
+	$(CLANG) -O2 build/06/fixed_math.ll -lm -o build/06/fixed_math
 
 test: all
 	@echo ""
 	@echo "============================================================"
 	@echo "Running All StateSSA Sample Verifications"
 	@echo "============================================================"
-	@echo "--- [Test 1/5] 01_hello_world ---"
+	@echo "--- [Test 1/6] 01_hello_world ---"
 	@./build/01/hello
 	@echo ""
-	@echo "--- [Test 2/5] 02_simple_loop ---"
+	@echo "--- [Test 2/6] 02_simple_loop ---"
 	@./build/02/simple_loop
 	@echo ""
-	@echo "--- [Test 3/5] 03_parallel_sum ---"
+	@echo "--- [Test 3/6] 03_parallel_sum ---"
 	@./build/03/parallel_sum
 	@echo ""
-	@echo "--- [Test 4/5] 04_xz ---"
+	@echo "--- [Test 4/6] 04_xz ---"
 	@./build/04/xz_sample
 	@echo ""
-	@echo "--- [Test 5/5] 05_web_server (Self-Test) ---"
+	@echo "--- [Test 5/6] 05_web_server (Self-Test) ---"
 	@./build/05/web_server & \
 	PID=$$!; \
 	sleep 0.3; \
@@ -203,6 +175,9 @@ test: all
 	kill $$PID; \
 	wait $$PID 2>/dev/null || true; \
 	echo "web_server verification passed."
+	@echo ""
+	@echo "--- [Test 6/6] 06_fixed_math ---"
+	@./build/06/fixed_math
 	@echo ""
 	@echo "============================================================"
 	@echo ">>> ALL SAMPLES PASSED 100% ON STAGE-3 BINARY COMPILER! <<<"

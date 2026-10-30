@@ -771,6 +771,12 @@ machine init_builtin_types(ctx: *CodegenCtx) -> u32 {
             let _ = call register_type_map(ctx, "*i8", 3, "i8*", 3);
             let _ = call register_type_map(ctx, "*void", 5, "i8*", 3);
             let _ = call register_type_map(ctx, "void", 4, "void", 4);
+            let _ = call register_type_map(ctx, "q64", 3, "i64", 3);
+            let _ = call register_type_map(ctx, "*q64", 4, "i64*", 4);
+            let _ = call register_type_map(ctx, "f32", 3, "float", 5);
+            let _ = call register_type_map(ctx, "*f32", 4, "float*", 6);
+            let _ = call register_type_map(ctx, "f64", 3, "double", 6);
+            let _ = call register_type_map(ctx, "*f64", 4, "double*", 7);
             _ => return 0;
         }
     }
@@ -941,6 +947,23 @@ machine is_type_64(t: *u8) -> u32 {
             is_i64 != 0 => RetOne;
             let is_u64 = call str_eq(t, l, "u64", 3);
             is_u64 != 0 => RetOne;
+            let is_q64 = call str_eq(t, l, "q64", 3);
+            is_q64 != 0 => RetOne;
+            _ => RetZero;
+        }
+        RetOne:  { _ => return 1; }
+        RetZero: { _ => return 0; }
+    }
+}
+
+machine is_type_q64(t: *u8) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            t == null => RetZero;
+            let l = call strlen(t);
+            let is_q = call str_eq(t, l, "q64", 3);
+            is_q != 0 => RetOne;
             _ => RetZero;
         }
         RetOne:  { _ => return 1; }
@@ -955,11 +978,13 @@ machine get_type_bit_width(t: *u8) -> u32 {
             t == null => RetDefault;
             let l = call strlen(t);
 
-            // i64, u64
+            // i64, u64, q64
             let is_i64 = call str_eq(t, l, "i64", 3);
             is_i64 != 0 => Ret64;
             let is_u64 = call str_eq(t, l, "u64", 3);
             is_u64 != 0 => Ret64;
+            let is_q64 = call str_eq(t, l, "q64", 3);
+            is_q64 != 0 => Ret64;
 
             // i16, u16
             let is_i16 = call str_eq(t, l, "i16", 3);
@@ -1191,6 +1216,31 @@ machine is_ptr_type(t: *u8) -> u32 {
     }
 }
 
+machine is_abi_bridge_arg(exp_p: *u8, exp_l: u32, act_p: *u8, act_l: u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            exp_p == null => RetZero;
+            act_p == null => RetZero;
+            let is_act_q64 = call str_eq(act_p, act_l, "q64", 3);
+            is_act_q64 == 0 => RetZero;
+
+            let is_f64 = call str_eq(exp_p, exp_l, "f64", 3);
+            is_f64 != 0 => RetOne;
+            let is_f32 = call str_eq(exp_p, exp_l, "f32", 3);
+            is_f32 != 0 => RetOne;
+            let is_dbl = call str_eq(exp_p, exp_l, "double", 6);
+            is_dbl != 0 => RetOne;
+            let is_flt = call str_eq(exp_p, exp_l, "float", 5);
+            is_flt != 0 => RetOne;
+
+            _ => RetZero;
+        }
+        RetOne:  { _ => return 1; }
+        RetZero: { _ => return 0; }
+    }
+}
+
 machine is_type_compatible(kind: u32, exp_p: *u8, exp_l: u32, act_p: *u8, act_l: u32, expr: *ExprNode) -> u32 {
     flow {}
     states {
@@ -1199,6 +1249,9 @@ machine is_type_compatible(kind: u32, exp_p: *u8, exp_l: u32, act_p: *u8, act_l:
             act_p == null => RetPass;
             exp_l == 0    => RetPass;
             act_l == 0    => RetPass;
+
+            let is_bridge = call is_abi_bridge_arg(exp_p, exp_l, act_p, act_l);
+            is_bridge != 0 => RetPass;
 
             let is_eq = call str_eq(exp_p, exp_l, act_p, act_l);
             is_eq != 0 => RetPass;
@@ -1445,6 +1498,7 @@ machine get_expr_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             k == 8 => ResolveCall     [ m <= m_cur ]; // CALL
             k == 9  => ResolveStruct   [ m <= m_cur ]; // STRUCT
             k == 10 => ReturnCastType;                 // CAST
+            k == 11 => ReturnQ64;                      // Q64
             _       => ReturnI32;
         }
         ReturnVoid: {
@@ -1452,6 +1506,9 @@ machine get_expr_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
         }
         ReturnI32: {
             _ => return "i32";
+        }
+        ReturnQ64: {
+            _ => return "q64";
         }
         ReturnU8Ptr: {
             _ => return "*u8";
@@ -1477,6 +1534,11 @@ machine get_expr_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
         }
         ResolveCall: {
             let res = call find_func_ret_type(ctx.prog, ctx.alloc, expr.str_ptr, expr.str_len);
+            let rl = call strlen(res);
+            let is_f64 = call str_eq(res, rl, "f64", 3);
+            is_f64 != 0 => ReturnQ64;
+            let is_f32 = call str_eq(res, rl, "f32", 3);
+            is_f32 != 0 => ReturnQ64;
             _ => return res;
         }
         ResolveStruct: {
@@ -1712,12 +1774,20 @@ machine get_binop_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
         }
         CheckArith: {
             let lt = call get_expr_type(ctx, expr.left);
+            let is_lq64 = call is_type_q64(lt);
+            is_lq64 != 0 => ReturnQ64;
+            let rt = call get_expr_type(ctx, expr.right);
+            let is_rq64 = call is_type_q64(rt);
+            is_rq64 != 0 => ReturnQ64;
+
             let is_l64 = call is_type_64(lt);
             is_l64 != 0 => ReturnI64;
-            let rt = call get_expr_type(ctx, expr.right);
             let is_r64 = call is_type_64(rt);
             is_r64 != 0 => ReturnI64;
             _           => ReturnI32;
+        }
+        ReturnQ64: {
+            _ => return "q64";
         }
         ReturnLeft: {
             _ => return left_t;
@@ -2238,6 +2308,7 @@ machine emit_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             kind == 8    => EmitCallExpr;
             kind == 9    => EmitStructLit;
             kind == 10   => EmitCastExpr;
+            kind == 11   => EmitIntLit;
             _            => ReturnNull;
         }
         ReturnNull: {
@@ -2582,12 +2653,126 @@ machine promote_bin_operand(ctx: *CodegenCtx, expr: *ExprNode, type_p: *u8, val:
     }
 }
 
+machine emit_q64_mul(ctx: *CodegenCtx, left_val: *u8, right_val: *u8) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            let sext_l = call fresh_tmp_str(ctx, "qmul_l", 6);
+            let sext_r = call fresh_tmp_str(ctx, "qmul_r", 6);
+            let mul128 = call fresh_tmp_str(ctx, "qmul128", 7);
+            let shr128 = call fresh_tmp_str(ctx, "qmul_shr", 8);
+            let res    = call fresh_tmp_str(ctx, "qmul_res", 8);
+
+            // %sext_l = sext i64 %left_val to i128
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, sext_l, call strlen(sext_l));
+            let _ = call emit_str(ctx, " = sext i64 ", 12);
+            let _ = call emit_str(ctx, left_val, call strlen(left_val));
+            let _ = call emit_str(ctx, " to i128", 8);
+            let _ = call emit_nl(ctx);
+
+            // %sext_r = sext i64 %right_val to i128
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, sext_r, call strlen(sext_r));
+            let _ = call emit_str(ctx, " = sext i64 ", 12);
+            let _ = call emit_str(ctx, right_val, call strlen(right_val));
+            let _ = call emit_str(ctx, " to i128", 8);
+            let _ = call emit_nl(ctx);
+
+            // %mul128 = mul i128 %sext_l, %sext_r
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, mul128, call strlen(mul128));
+            let _ = call emit_str(ctx, " = mul i128 ", 11);
+            let _ = call emit_str(ctx, sext_l, call strlen(sext_l));
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, sext_r, call strlen(sext_r));
+            let _ = call emit_nl(ctx);
+
+            // %shr128 = ashr i128 %mul128, 32
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, shr128, call strlen(shr128));
+            let _ = call emit_str(ctx, " = ashr i128 ", 12);
+            let _ = call emit_str(ctx, mul128, call strlen(mul128));
+            let _ = call emit_str(ctx, ", 32", 4);
+            let _ = call emit_nl(ctx);
+
+            // %res = trunc i128 %shr128 to i64
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, res, call strlen(res));
+            let _ = call emit_str(ctx, " = trunc i128 ", 13);
+            let _ = call emit_str(ctx, shr128, call strlen(shr128));
+            let _ = call emit_str(ctx, " to i64", 7);
+            let _ = call emit_nl(ctx);
+
+            _ => return res;
+        }
+    }
+}
+
+machine emit_q64_div(ctx: *CodegenCtx, left_val: *u8, right_val: *u8) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            let sext_l = call fresh_tmp_str(ctx, "qdiv_l", 6);
+            let shl128 = call fresh_tmp_str(ctx, "qdiv_shl", 8);
+            let sext_r = call fresh_tmp_str(ctx, "qdiv_r", 6);
+            let div128 = call fresh_tmp_str(ctx, "qdiv128", 7);
+            let res    = call fresh_tmp_str(ctx, "qdiv_res", 8);
+
+            // %sext_l = sext i64 %left_val to i128
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, sext_l, call strlen(sext_l));
+            let _ = call emit_str(ctx, " = sext i64 ", 12);
+            let _ = call emit_str(ctx, left_val, call strlen(left_val));
+            let _ = call emit_str(ctx, " to i128", 8);
+            let _ = call emit_nl(ctx);
+
+            // %shl128 = shl i128 %sext_l, 32
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, shl128, call strlen(shl128));
+            let _ = call emit_str(ctx, " = shl i128 ", 11);
+            let _ = call emit_str(ctx, sext_l, call strlen(sext_l));
+            let _ = call emit_str(ctx, ", 32", 4);
+            let _ = call emit_nl(ctx);
+
+            // %sext_r = sext i64 %right_val to i128
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, sext_r, call strlen(sext_r));
+            let _ = call emit_str(ctx, " = sext i64 ", 12);
+            let _ = call emit_str(ctx, right_val, call strlen(right_val));
+            let _ = call emit_str(ctx, " to i128", 8);
+            let _ = call emit_nl(ctx);
+
+            // %div128 = sdiv i128 %shl128, %sext_r
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, div128, call strlen(div128));
+            let _ = call emit_str(ctx, " = sdiv i128 ", 12);
+            let _ = call emit_str(ctx, shl128, call strlen(shl128));
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, sext_r, call strlen(sext_r));
+            let _ = call emit_nl(ctx);
+
+            // %res = trunc i128 %div128 to i64
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, res, call strlen(res));
+            let _ = call emit_str(ctx, " = trunc i128 ", 13);
+            let _ = call emit_str(ctx, div128, call strlen(div128));
+            let _ = call emit_str(ctx, " to i64", 7);
+            let _ = call emit_nl(ctx);
+
+            _ => return res;
+        }
+    }
+}
+
 machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     flow {
         reg left_val:     *u8 = null;
         reg right_val:    *u8 = null;
         reg left_type_p:  *u8 = null;
         reg right_type_p: *u8 = null;
+        reg plv_r:        *u8 = null;
+        reg prv_r:        *u8 = null;
         reg op_mode_reg:  u32 = 0; // 0: i32, 1: i1, 2: i64, 3: u64, 4: u32
         reg is_case:      u32 = 0; // 1: gep, 2: diff, 3: cmp, 4: normal
 
@@ -2651,12 +2836,32 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let plv = call promote_bin_operand(ctx, left_e, left_type_p, left_val, op_mode_reg);
             let prv = call promote_bin_operand(ctx, right_e, right_type_p, right_val, op_mode_reg);
 
+            let is_ql = call is_type_q64(left_type_p);
+            let is_qr = call is_type_q64(right_type_p);
+            let is_q = is_ql | is_qr;
+            is_q != 0 => CheckQ64Op [ plv_r <= plv, prv_r <= prv ];
+            _         => EmitStandard [ plv_r <= plv, prv_r <= prv ];
+        }
+        CheckQ64Op: {
+            op == 70 => EmitQ64Mul; // *
+            op == 73 => EmitQ64Div; // /
+            _        => EmitStandard;
+        }
+        EmitQ64Mul: {
+            let res = call emit_q64_mul(ctx, plv_r, prv_r);
+            _ => return res;
+        }
+        EmitQ64Div: {
+            let res = call emit_q64_div(ctx, plv_r, prv_r);
+            _ => return res;
+        }
+        EmitStandard: {
             let res_var = call fresh_tmp_str(ctx, "t", 1);
             let _ = call emit_str(ctx, "  ", 2);
             let _ = call emit_str(ctx, res_var, call strlen(res_var));
             let _ = call emit_str(ctx, " = ", 3);
 
-            let _ = call emit_bin_op_instruction(ctx, op, op_mode_reg, plv, prv);
+            let _ = call emit_bin_op_instruction(ctx, op, op_mode_reg, plv_r, prv_r);
             let _ = call emit_nl(ctx);
 
             _ => return res_var;
@@ -3033,6 +3238,116 @@ machine emit_field_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     }
 }
 
+machine emit_bridge_q64_to_f64(ctx: *CodegenCtx, q_val: *u8) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            let raw_fp = call fresh_tmp_str(ctx, "fp_raw", 6);
+            let fdiv_res = call fresh_tmp_str(ctx, "fp_arg", 6);
+
+            // %raw_fp = sitofp i64 %q_val to double
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, raw_fp, call strlen(raw_fp));
+            let _ = call emit_str(ctx, " = sitofp i64 ", 14);
+            let _ = call emit_str(ctx, q_val, call strlen(q_val));
+            let _ = call emit_str(ctx, " to double", 10);
+            let _ = call emit_nl(ctx);
+
+            // %fdiv_res = fdiv double %raw_fp, 4294967296.0
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, fdiv_res, call strlen(fdiv_res));
+            let _ = call emit_str(ctx, " = fdiv double ", 15);
+            let _ = call emit_str(ctx, raw_fp, call strlen(raw_fp));
+            let _ = call emit_str(ctx, ", 4294967296.0", 14);
+            let _ = call emit_nl(ctx);
+
+            _ => return fdiv_res;
+        }
+    }
+}
+
+machine emit_bridge_q64_to_f32(ctx: *CodegenCtx, q_val: *u8) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            let raw_fp = call fresh_tmp_str(ctx, "fp_raw32", 8);
+            let fdiv_res = call fresh_tmp_str(ctx, "fp_arg32", 8);
+
+            // %raw_fp = sitofp i64 %q_val to float
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, raw_fp, call strlen(raw_fp));
+            let _ = call emit_str(ctx, " = sitofp i64 ", 14);
+            let _ = call emit_str(ctx, q_val, call strlen(q_val));
+            let _ = call emit_str(ctx, " to float", 9);
+            let _ = call emit_nl(ctx);
+
+            // %fdiv_res = fdiv float %raw_fp, 4294967296.0
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, fdiv_res, call strlen(fdiv_res));
+            let _ = call emit_str(ctx, " = fdiv float ", 14);
+            let _ = call emit_str(ctx, raw_fp, call strlen(raw_fp));
+            let _ = call emit_str(ctx, ", 4294967296.0", 14);
+            let _ = call emit_nl(ctx);
+
+            _ => return fdiv_res;
+        }
+    }
+}
+
+machine emit_bridge_ret_to_q64(ctx: *CodegenCtx, ret_val: *u8, is_double: u32) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            is_double != 0 => BridgeDouble;
+            _              => BridgeFloat;
+        }
+        BridgeDouble: {
+            let mul_res = call fresh_tmp_str(ctx, "fp_mul", 6);
+            let q_res   = call fresh_tmp_str(ctx, "fp2q", 4);
+
+            // %mul_res = fmul double %ret_val, 4294967296.0
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, mul_res, call strlen(mul_res));
+            let _ = call emit_str(ctx, " = fmul double ", 15);
+            let _ = call emit_str(ctx, ret_val, call strlen(ret_val));
+            let _ = call emit_str(ctx, ", 4294967296.0", 14);
+            let _ = call emit_nl(ctx);
+
+            // %q_res = fptosi double %mul_res to i64
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, q_res, call strlen(q_res));
+            let _ = call emit_str(ctx, " = fptosi double ", 17);
+            let _ = call emit_str(ctx, mul_res, call strlen(mul_res));
+            let _ = call emit_str(ctx, " to i64", 7);
+            let _ = call emit_nl(ctx);
+
+            _ => return q_res;
+        }
+        BridgeFloat: {
+            let mul_res = call fresh_tmp_str(ctx, "fp_mul", 6);
+            let q_res   = call fresh_tmp_str(ctx, "fp2q", 4);
+
+            // %mul_res = fmul float %ret_val, 4294967296.0
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, mul_res, call strlen(mul_res));
+            let _ = call emit_str(ctx, " = fmul float ", 14);
+            let _ = call emit_str(ctx, ret_val, call strlen(ret_val));
+            let _ = call emit_str(ctx, ", 4294967296.0", 14);
+            let _ = call emit_nl(ctx);
+
+            // %q_res = fptosi float %mul_res to i64
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, q_res, call strlen(q_res));
+            let _ = call emit_str(ctx, " = fptosi float ", 16);
+            let _ = call emit_str(ctx, mul_res, call strlen(mul_res));
+            let _ = call emit_str(ctx, " to i64", 7);
+            let _ = call emit_nl(ctx);
+
+            _ => return q_res;
+        }
+    }
+}
+
 machine emit_call_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     flow {
         reg target_params:    *MachineParam = null;
@@ -3040,6 +3355,7 @@ machine emit_call_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
         reg target_ret_p:     *u8 = null;
         reg target_ret_l:     u32 = 0;
         reg slots:            *ArgValSlot = null;
+        reg call_res:         *u8 = null;
 
         wire func_p = expr.str_ptr;
         wire func_l = expr.str_len;
@@ -3102,7 +3418,26 @@ machine emit_call_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let _ = call emit_assembled_args(ctx, target_params, target_param_cnt, slots, expr.arg_count);
             let _ = call emit_char(ctx, 41); // ')'
             let _ = call emit_nl(ctx);
+
+            let is_ret_f64 = call str_eq(target_ret_p, target_ret_l, "f64", 3);
+            is_ret_f64 != 0 => BridgeRetDouble [ call_res <= res_var ];
+            let is_ret_dbl = call str_eq(target_ret_p, target_ret_l, "double", 6);
+            is_ret_dbl != 0 => BridgeRetDouble [ call_res <= res_var ];
+
+            let is_ret_f32 = call str_eq(target_ret_p, target_ret_l, "f32", 3);
+            is_ret_f32 != 0 => BridgeRetFloat [ call_res <= res_var ];
+            let is_ret_flt = call str_eq(target_ret_p, target_ret_l, "float", 5);
+            is_ret_flt != 0 => BridgeRetFloat [ call_res <= res_var ];
+
             _ => return res_var;
+        }
+        BridgeRetDouble: {
+            let q_res = call emit_bridge_ret_to_q64(ctx, call_res, 1);
+            _ => return q_res;
+        }
+        BridgeRetFloat: {
+            let q_res = call emit_bridge_ret_to_q64(ctx, call_res, 0);
+            _ => return q_res;
         }
     }
 }
@@ -3159,11 +3494,38 @@ machine eval_call_args(ctx: *CodegenCtx, fn_p: *u8, fn_l: u32, first_arg: *ExprN
 
             let ok = call validate_type(ctx, 1, fn_p, fn_l, i + 1, exp_p, exp_l, ct, ctl, cur);
 
+            let is_q = call is_type_q64(ct);
+            is_q != 0 => CheckBridgeArg [ cur_val <= val, cur_t <= ct ];
+
             let is_exp_i32 = call str_eq(exp_p, exp_l, "i32", 3);
             is_exp_i32 != 0 => CheckExtI32 [ cur_val <= val, cur_t <= ct ];
             let is_exp_i64 = call str_eq(exp_p, exp_l, "i64", 3);
             is_exp_i64 != 0 => CheckExtI64 [ cur_val <= val, cur_t <= ct ];
             _ => SaveArg [ cur_val <= val ];
+        }
+        CheckBridgeArg: {
+            let exp_p = call get_param_type_ptr(ctx, params, param_cnt, i);
+            let exp_l = call get_param_type_len(ctx, params, param_cnt, i);
+
+            let is_f64 = call str_eq(exp_p, exp_l, "f64", 3);
+            is_f64 != 0 => BridgeF64;
+            let is_dbl = call str_eq(exp_p, exp_l, "double", 6);
+            is_dbl != 0 => BridgeF64;
+
+            let is_f32 = call str_eq(exp_p, exp_l, "f32", 3);
+            is_f32 != 0 => BridgeF32;
+            let is_flt = call str_eq(exp_p, exp_l, "float", 5);
+            is_flt != 0 => BridgeF32;
+
+            _ => SaveArg;
+        }
+        BridgeF64: {
+            let bv = call emit_bridge_q64_to_f64(ctx, cur_val);
+            _ => SaveArg [ cur_val <= bv ];
+        }
+        BridgeF32: {
+            let bv = call emit_bridge_q64_to_f32(ctx, cur_val);
+            _ => SaveArg [ cur_val <= bv ];
         }
         CheckExtI32: {
             let is_sm = call is_type_small(cur_t);

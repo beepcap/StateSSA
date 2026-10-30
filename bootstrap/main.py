@@ -34,20 +34,22 @@ def load_and_merge(input_files: list[str]) -> Program:
             if inc_path not in loaded_files:
                 queue.append(inc_path)
 
-        # Merge types (deduplicate identical definitions)
+        # Check type duplicates (different files defining the same type name is a syntax error)
         for t in prog.types:
             if t.name in all_types:
-                if all_types[t.name].fields != t.fields:
-                    raise SyntaxError(f"Conflicting type definition for '{t.name}' in {curr_file}")
-            else:
-                all_types[t.name] = t
+                raise SyntaxError(f"Duplicate type definition '{t.name}' in {curr_file}")
+            all_types[t.name] = t
 
-        # Merge externs
+        # Merge externs (allow exact signature match across files, error on conflict)
         for ext in prog.externs:
-            if ext.name not in all_externs:
+            if ext.name in all_externs:
+                existing = all_externs[ext.name]
+                if existing.params != ext.params or existing.ret_type != ext.ret_type:
+                    raise SyntaxError(f"Conflicting extern definition '{ext.name}' in {curr_file}")
+            else:
                 all_externs[ext.name] = ext
 
-        # Merge machines
+        # Check machine duplicates
         for m in prog.machines:
             if m.name in all_machines:
                 raise SyntaxError(f"Duplicate machine definition '{m.name}' in {curr_file}")

@@ -21,6 +21,7 @@ class TokenType(Enum):
     IDENT = auto()
     INT_LIT = auto()
     STRING_LIT = auto()
+    Q64_LIT = auto()
 
     # Symbols & Operators
     ARROW = auto()        # ->

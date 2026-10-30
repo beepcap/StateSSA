@@ -10,7 +10,7 @@ include "lexer.ssa";
 // 1. 式ノード (ExprNode)
 // kind:
 //   1: INT_LIT, 2: STR_LIT, 3: NULL_LIT, 4: VAR,
-//   5: BINOP, 6: UNOP, 7: FIELD, 8: CALL, 9: STRUCT_LIT, 10: CAST
+//   5: BINOP, 6: UNOP, 7: FIELD, 8: CALL, 9: STRUCT_LIT, 10: CAST, 11: Q64_LIT
 // ----------------------------------------------------------------------------
 type ExprNode = {
     kind:      u32,
@@ -168,11 +168,17 @@ type TypeSlice = {
 // 11. パーサコンテキスト構造体
 // ----------------------------------------------------------------------------
 type ParseContext = {
-    tokens:      *Token,
-    pos:         u32,
-    tok_cnt:     u32,
-    alloc:       *BumpAlloc,
-    error_code:  i32
+    tokens:       *Token,
+    pos:          u32,
+    tok_cnt:      u32,
+    alloc:        *BumpAlloc,
+    error_code:   i32,
+    inc_queue:    *u64,
+    inc_lens:     *u32,
+    inc_tail_ptr: *u32,
+    inc_max:      u32,
+    parent_dir_p: *u8,
+    parent_dir_l: u32
 };
 
 // ============================================================================
@@ -352,6 +358,71 @@ machine parse_int_val(ptr: *u8, len: u32) -> i64 {
     }
 }
 
+machine parse_q64_val(ptr: *u8, len: u32) -> i64 {
+    flow {
+        reg pos:        u32 = 0;
+        reg int_val:    i64 = 0;
+        reg frac_val:   i64 = 0;
+        reg denom:      i64 = 1;
+        reg frac_cnt:   u32 = 0;
+
+        wire is_end     = pos >= len;
+        wire cur_ptr    = ptr + pos;
+        wire c          = *cur_ptr;
+        wire is_dot     = c == 46; // '.'
+        wire digit_dec  = c - 48;
+        wire digit_i64  = cast(i64) digit_dec;
+
+        wire int_next   = (int_val * 10) + digit_i64;
+        wire frac_next  = (frac_val * 10) + digit_i64;
+        wire denom_next = denom * 10;
+        wire next_pos   = pos + 1;
+    }
+    states {
+        Entry: {
+            _ => LoopInt [ pos <= 0, int_val <= 0 ];
+        }
+
+        LoopInt: {
+            is_end != 0 => CalcResult;
+            is_dot != 0 => StartFrac [ pos <= next_pos, frac_val <= 0, denom <= 1, frac_cnt <= 0 ];
+            _           => StepInt   [ int_val <= int_next, pos <= next_pos ];
+        }
+
+        StepInt: {
+            _ => LoopInt;
+        }
+
+        StartFrac: {
+            _ => LoopFrac;
+        }
+
+        LoopFrac: {
+            is_end != 0   => CalcResult;
+            frac_cnt >= 9 => SkipExtraFrac [ pos <= next_pos ];
+            _             => StepFrac      [ frac_val <= frac_next, denom <= denom_next, frac_cnt <= frac_cnt + 1, pos <= next_pos ];
+        }
+
+        StepFrac: {
+            _ => LoopFrac;
+        }
+
+        SkipExtraFrac: {
+            _ => LoopFrac;
+        }
+
+        CalcResult: {
+            let int_scaled = int_val << 32;
+            let frac_mul = frac_val * 4294967296;
+            let half_denom = denom / 2;
+            let frac_add = frac_mul + half_denom;
+            let frac_q64 = frac_add / denom;
+            let total_q64 = int_scaled + frac_q64;
+            _ => return total_q64;
+        }
+    }
+}
+
 // ============================================================================
 // AST ノード生成ファクトリマシン群
 // ============================================================================
@@ -391,6 +462,17 @@ machine make_int_node(alloc: *BumpAlloc, val: i64) -> *ExprNode {
     states {
         Entry: {
             let n = call make_expr_node(alloc, 1); // 1: INT_LIT
+            n.int_val <- val;
+            _ => return n;
+        }
+    }
+}
+
+machine make_q64_node(alloc: *BumpAlloc, val: i64) -> *ExprNode {
+    flow {}
+    states {
+        Entry: {
+            let n = call make_expr_node(alloc, 11); // 11: Q64_LIT
             n.int_val <- val;
             _ => return n;
         }
@@ -649,6 +731,7 @@ machine parse_atom(ctx: *ParseContext) -> *ExprNode {
         Entry: {
             kind == 22 => HandleCast;   // 'cast' (TOK_CAST = 22)
             kind == 31 => HandleInt;    // INT_LIT
+            kind == 33 => HandleQ64;    // Q64_LIT
             kind == 32 => HandleStr;    // STRING_LIT
             kind == 30 => HandleIdent;  // IDENT
             kind == 16 => HandleCall;   // CALL
@@ -675,6 +758,15 @@ machine parse_atom(ctx: *ParseContext) -> *ExprNode {
             let t_len = t.val_len;
             let val = call parse_int_val(t_ptr, t_len);
             let node = call make_int_node(alloc, val);
+            _ => return node;
+        }
+
+        HandleQ64: {
+            let t = call ctx_consume(ctx);
+            let t_ptr = t.val_ptr;
+            let t_len = t.val_len;
+            let val = call parse_q64_val(t_ptr, t_len);
+            let node = call make_q64_node(alloc, val);
             _ => return node;
         }
 
@@ -769,8 +861,27 @@ machine parse_atom(ctx: *ParseContext) -> *ExprNode {
         HandleNeg: {
             let _ = call ctx_consume(ctx);
             let operand = call parse_atom(ctx);
+            let op_k = operand.kind;
+            op_k == 1  => NegInt   [ left_node <= operand ];
+            op_k == 11 => NegQ64   [ left_node <= operand ];
+            _          => NegBinOp [ left_node <= operand ];
+        }
+
+        NegInt: {
+            let cur_v = left_node.int_val;
+            left_node.int_val <- 0 - cur_v;
+            _ => return left_node;
+        }
+
+        NegQ64: {
+            let cur_v = left_node.int_val;
+            left_node.int_val <- 0 - cur_v;
+            _ => return left_node;
+        }
+
+        NegBinOp: {
             let zero = call make_int_node(alloc, 0);
-            let node = call make_binop_node(alloc, 72, zero, operand);
+            let node = call make_binop_node(alloc, 72, zero, left_node);
             _ => return node;
         }
 
@@ -1820,6 +1931,22 @@ machine parse_extern(ctx: *ParseContext, out_externs: *ExternFn, base_idx: u32) 
             cur_fn.ret_type_ptr <- ts_ret_p;
             cur_fn.ret_type_len <- ts_ret_l;
 
+            // 既存の登録済み extern (0 .. fn_idx - 1) との重複照合
+            let exist_e = call parser_find_extern(out_externs, fn_idx, cur_fn_p, cur_fn_l);
+            exist_e != null => CheckSignature;
+            _               => AddNewExtern;
+        }
+
+        CheckSignature: {
+            let fn_idx = base_idx + fn_cnt;
+            let cur_fn = out_externs + fn_idx;
+            let exist_e = call parser_find_extern(out_externs, fn_idx, cur_fn_p, cur_fn_l);
+            let is_match = call parser_check_extern_signature(exist_e, cur_fn);
+            is_match == 0 => ErrorConflictingExtern;
+            _             => FnLoop; // シグネチャ完全一致: 重複排除 (fn_cnt は増やさず次の関数へ)
+        }
+
+        AddNewExtern: {
             let next_fc = fn_cnt + 1;
             _ => FnLoop [ fn_cnt <= next_fc ];
         }
@@ -1827,6 +1954,11 @@ machine parse_extern(ctx: *ParseContext, out_externs: *ExternFn, base_idx: u32) 
         FinishExtern: {
             let _ = call ctx_consume(ctx); // consume '}'
             _ => return fn_cnt;
+        }
+
+        ErrorConflictingExtern: {
+            ctx.error_code <- -33;
+            _ => return -33;
         }
 
         ErrorExtern: {
@@ -2050,13 +2182,284 @@ machine count_program_entities(tokens: *Token, tok_cnt: u32, out_types: *u32, ou
     }
 }
 
-machine parse_program(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
+// ============================================================================
+// メモリ・シンボルヘルパーマシン群 (parser.ssa 内自己完結)
+// ============================================================================
+
+machine parser_str_eq(s1: *u8, len1: u32, s2: *u8, len2: u32) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire len_match = len1 == len2;
+        wire has_more = i < len1;
+        wire ptr_c1 = s1 + i;
+        wire c1 = *ptr_c1;
+        wire ptr_c2 = s2 + i;
+        wire c2 = *ptr_c2;
+        wire char_match = c1 == c2;
+    }
+    states {
+        Entry: {
+            len_match == 0 => NoMatch;
+            len1 == 0      => Match;
+            _              => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0   => Match;
+            char_match == 0 => NoMatch;
+            _               => Loop [ i <= i + 1 ];
+        }
+        Match: { _ => return 1; }
+        NoMatch: { _ => return 0; }
+    }
+}
+
+machine copy_bytes(dst: *u8, src: *u8, n: u32) -> void {
+    flow {
+        reg i: u32 = 0;
+        wire has_more = i < n;
+        wire p_s = src + i;
+        wire c = *p_s;
+        wire p_d = dst + i;
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => Exit;
+            _             => CopyOne;
+        }
+        CopyOne: {
+            *p_d <- c;
+            _ => Loop [ i <= i + 1 ];
+        }
+        Exit: {
+            _ => return;
+        }
+    }
+}
+
+machine parser_find_type(types: *TypeDef, count: u32, name_p: *u8, name_l: u32) -> *TypeDef {
+    flow {
+        reg i: u32 = 0;
+        wire has_more = i < count;
+        wire cur_t = types + i;
+        wire is_match = call parser_str_eq(cur_t.name_ptr, cur_t.name_len, name_p, name_l);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return cur_t;
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine parser_find_machine(machines: *MachineDef, count: u32, name_p: *u8, name_l: u32) -> *MachineDef {
+    flow {
+        reg i: u32 = 0;
+        wire has_more = i < count;
+        wire cur_m = machines + i;
+        wire is_match = call parser_str_eq(cur_m.name_ptr, cur_m.name_len, name_p, name_l);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return cur_m;
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine parser_find_extern(externs: *ExternFn, count: u32, name_p: *u8, name_l: u32) -> *ExternFn {
+    flow {
+        reg i: u32 = 0;
+        wire has_more = i < count;
+        wire cur_e = externs + i;
+        wire is_match = call parser_str_eq(cur_e.name_ptr, cur_e.name_len, name_p, name_l);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return cur_e;
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine parser_check_extern_signature(e1: *ExternFn, e2: *ExternFn) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire c1 = e1.param_count;
+        wire c2 = e2.param_count;
+        wire count_eq = c1 == c2;
+
+        wire ret_eq = call parser_str_eq(e1.ret_type_ptr, e1.ret_type_len, e2.ret_type_ptr, e2.ret_type_len);
+
+        wire has_more = i < c1;
+        wire p1_base = e1.params;
+        wire p2_base = e2.params;
+        wire p1_slot = p1_base + i;
+        wire p2_slot = p2_base + i;
+        wire p_type_eq = call parser_str_eq(p1_slot.type_ptr, p1_slot.type_len, p2_slot.type_ptr, p2_slot.type_len);
+    }
+    states {
+        Entry: {
+            count_eq == 0 => NoMatch;
+            ret_eq == 0   => NoMatch;
+            _             => ParamLoop [ i <= 0 ];
+        }
+        ParamLoop: {
+            has_more == 0  => Match;
+            p_type_eq == 0 => NoMatch;
+            _              => ParamLoop [ i <= i + 1 ];
+        }
+        Match: {
+            _ => return 1;
+        }
+        NoMatch: {
+            _ => return 0;
+        }
+    }
+}
+
+machine enqueue_include_path(ctx: *ParseContext, p_str: *u8, l_str: u32) -> u32 {
+    flow {
+        wire q = ctx.inc_queue;
+        wire is_null = q == null;
+    }
+    states {
+        Entry: {
+            is_null != 0 => Exit;
+            _            => DoEnqueue;
+        }
+        DoEnqueue: {
+            let p_tail = ctx.inc_tail_ptr;
+            let tail = *p_tail;
+            let max_q = ctx.inc_max;
+            tail >= max_q => Exit;
+
+            let dir_p = ctx.parent_dir_p;
+            let dir_l = ctx.parent_dir_l;
+            let first_c = *p_str;
+            first_c == 47 => DirectPath; // 絶対パス ('/') はディレクトリ結合不要
+            dir_l == 0    => DirectPath; // 親ディレクトリなしは結合不要
+            _             => CombinePath; // 相対パスかつ親ディレクトリあり
+        }
+        DirectPath: {
+            let alloc = ctx.alloc;
+            let path_mem = call bump_alloc(alloc, l_str + 1, 1);
+            let _ = call copy_bytes(path_mem, p_str, l_str);
+            let end_p = path_mem + l_str;
+            *end_p <- 0;
+
+            let p_tail = ctx.inc_tail_ptr;
+            let tail = *p_tail;
+            let q = ctx.inc_queue;
+            let slot_q = q + tail;
+            *slot_q <- cast(u64) path_mem;
+
+            let lens = ctx.inc_lens;
+            let slot_l = lens + tail;
+            *slot_l <- l_str;
+
+            *p_tail <- tail + 1;
+            _ => Exit;
+        }
+        CombinePath: {
+            let alloc = ctx.alloc;
+            let dir_p = ctx.parent_dir_p;
+            let dir_l = ctx.parent_dir_l;
+            let total_len = dir_l + l_str;
+            let path_mem = call bump_alloc(alloc, total_len + 1, 1);
+            let _ = call copy_bytes(path_mem, dir_p, dir_l);
+            let sub_dst = path_mem + dir_l;
+            let _ = call copy_bytes(sub_dst, p_str, l_str);
+            let end_p = path_mem + total_len;
+            *end_p <- 0;
+
+            let p_tail = ctx.inc_tail_ptr;
+            let tail = *p_tail;
+            let q = ctx.inc_queue;
+            let slot_q = q + tail;
+            *slot_q <- cast(u64) path_mem;
+
+            let lens = ctx.inc_lens;
+            let slot_l = lens + tail;
+            *slot_l <- total_len;
+
+            *p_tail <- tail + 1;
+            _ => Exit;
+        }
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
+// ============================================================================
+// ProgramDef 初期化マシン (init_program_storage)
+// ============================================================================
+machine init_program_storage(prog: *ProgramDef, alloc: *BumpAlloc, max_types: u32, max_externs: u32, max_machines: u32) -> void {
+    flow {
+        wire bytes_t = max_types * 32;
+        wire bytes_e = max_externs * 48;
+        wire bytes_m = max_machines * 96;
+    }
+    states {
+        Entry: {
+            let types_mem    = call bump_alloc(alloc, bytes_t, 8);
+            let externs_mem  = call bump_alloc(alloc, bytes_e, 8);
+            let machines_mem = call bump_alloc(alloc, bytes_m, 8);
+
+            prog.types         <- types_mem;
+            prog.externs       <- externs_mem;
+            prog.machines      <- machines_mem;
+            prog.type_count    <- 0;
+            prog.extern_count  <- 0;
+            prog.machine_count <- 0;
+            _ => return;
+        }
+    }
+}
+
+// ============================================================================
+// 追記型ファイル宣言パーサ (parse_file_declarations)
+// 既存の out_prog に追記し、二重定義を厳格に検査する
+// ============================================================================
+machine parse_file_declarations(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
     flow {
         reg typ_cnt: u32 = 0;
         reg ext_cnt: u32 = 0;
         reg mac_cnt: u32 = 0;
 
-        wire alloc = ctx.alloc;
         wire kind = call ctx_peek_kind(ctx);
         wire is_eof = kind == 99; // EOF
         wire is_inc = kind == 21; // INCLUDE
@@ -2066,44 +2469,14 @@ machine parse_program(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
     }
     states {
         Entry: {
-            let toks = ctx.tokens;
-            let cnt = ctx.tok_cnt;
-
-            // 一時作業領域として 3 ワード分を alloc から切り出し
-            let counts_buf = call bump_alloc(alloc, 16, 8);
-            let ptr_t = counts_buf + 0;
-            let ptr_e = counts_buf + 4;
-            let ptr_m = counts_buf + 8;
-            let _ = call count_program_entities(toks, cnt, ptr_t, ptr_e, ptr_m);
-
-            let num_t = *ptr_t;
-            let num_e = *ptr_e;
-            let num_m = *ptr_m;
-
-            // +1 マージンを確保
-            let cap_t = num_t + 1;
-            let cap_e = num_e + 1;
-            let cap_m = num_m + 1;
-
-            let bytes_t = cap_t * 32;
-            let bytes_e = cap_e * 48;
-            let bytes_m = cap_m * 96;
-
-            let types_mem    = call bump_alloc(alloc, bytes_t, 8);
-            let externs_mem  = call bump_alloc(alloc, bytes_e, 8);
-            let machines_mem = call bump_alloc(alloc, bytes_m, 8);
-            out_prog.types    <- types_mem;
-            out_prog.externs  <- externs_mem;
-            out_prog.machines <- machines_mem;
-            out_prog.type_count <- 0;
-            out_prog.extern_count <- 0;
-            out_prog.machine_count <- 0;
-
-            _ => TopLoop [ typ_cnt <= 0, ext_cnt <= 0, mac_cnt <= 0 ];
+            let tc = out_prog.type_count;
+            let ec = out_prog.extern_count;
+            let mc = out_prog.machine_count;
+            _ => TopLoop [ typ_cnt <= tc, ext_cnt <= ec, mac_cnt <= mc ];
         }
 
         TopLoop: {
-            is_eof != 0 => FinishProgram;
+            is_eof != 0 => FinishFile;
             is_inc != 0 => HandleInclude;
             is_typ != 0 => HandleType;
             is_ext != 0 => HandleExtern;
@@ -2113,9 +2486,14 @@ machine parse_program(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
 
         HandleInclude: {
             let _ = call ctx_consume(ctx); // consume 'include' (21)
+            let tok = call ctx_peek_tok(ctx); // STRING_LIT
+            let p_str = tok.val_ptr;
+            let l_str = tok.val_len;
             let _ = call ctx_consume(ctx); // consume STRING_LIT
             let ok_semi = call ctx_match(ctx, 66); // ';'
             ok_semi == 0 => ErrorTopLevel;
+
+            let _ = call enqueue_include_path(ctx, p_str, l_str);
             _ => TopLoop;
         }
 
@@ -2124,6 +2502,11 @@ machine parse_program(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
             let cur_t = p_types + typ_cnt;
             let ret_t = call parse_type(ctx, cur_t);
             ret_t != 0 => ForwardError;
+
+            // 二重定義検査 (0 .. typ_cnt - 1)
+            let exist_t = call parser_find_type(p_types, typ_cnt, cur_t.name_ptr, cur_t.name_len);
+            exist_t != null => ErrorDuplicateType;
+
             let next_tc = typ_cnt + 1;
             _ => TopLoop [ typ_cnt <= next_tc ];
         }
@@ -2141,11 +2524,16 @@ machine parse_program(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
             let cur_m = p_macs + mac_cnt;
             let ret_m = call parse_machine(ctx, cur_m);
             ret_m != 0 => ForwardError;
+
+            // 二重定義検査 (0 .. mac_cnt - 1)
+            let exist_m = call parser_find_machine(p_macs, mac_cnt, cur_m.name_ptr, cur_m.name_len);
+            exist_m != null => ErrorDuplicateMachine;
+
             let next_mc = mac_cnt + 1;
             _ => TopLoop [ mac_cnt <= next_mc ];
         }
 
-        FinishProgram: {
+        FinishFile: {
             out_prog.type_count <- typ_cnt;
             out_prog.extern_count <- ext_cnt;
             out_prog.machine_count <- mac_cnt;
@@ -2157,9 +2545,50 @@ machine parse_program(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
             _ => return ec;
         }
 
+        ErrorDuplicateType: {
+            ctx.error_code <- -31;
+            _ => return -31;
+        }
+
+        ErrorDuplicateMachine: {
+            ctx.error_code <- -32;
+            _ => return -32;
+        }
+
         ErrorTopLevel: {
             ctx.error_code <- -30;
             _ => return -30;
+        }
+    }
+}
+
+// 従来の parse_program: 単一ファイル用のラッパー
+machine parse_program(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
+    flow {
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            let toks = ctx.tokens;
+            let cnt = ctx.tok_cnt;
+
+            let counts_buf = call bump_alloc(alloc, 16, 8);
+            let ptr_t = counts_buf + 0;
+            let ptr_e = counts_buf + 4;
+            let ptr_m = counts_buf + 8;
+            let _ = call count_program_entities(toks, cnt, ptr_t, ptr_e, ptr_m);
+
+            let num_t = *ptr_t;
+            let num_e = *ptr_e;
+            let num_m = *ptr_m;
+
+            let cap_t = num_t + 1;
+            let cap_e = num_e + 1;
+            let cap_m = num_m + 1;
+
+            let _ = call init_program_storage(out_prog, alloc, cap_t, cap_e, cap_m);
+            let ret = call parse_file_declarations(ctx, out_prog);
+            _ => return ret;
         }
     }
 }
@@ -2168,7 +2597,7 @@ machine alloc_parse_context(alloc: *BumpAlloc) -> *ParseContext {
     flow {}
     states {
         Entry: {
-            let mem = call bump_alloc(alloc, 64, 8);
+            let mem = call bump_alloc(alloc, 96, 8);
             _ => return mem;
         }
     }
@@ -2183,6 +2612,12 @@ machine init_parse_context(ctx: *ParseContext, tokens: *Token, tok_cnt: u32, all
             ctx.tok_cnt <- tok_cnt;
             ctx.alloc <- alloc;
             ctx.error_code <- 0;
+            ctx.inc_queue <- null;
+            ctx.inc_lens <- null;
+            ctx.inc_tail_ptr <- null;
+            ctx.inc_max <- 0;
+            ctx.parent_dir_p <- null;
+            ctx.parent_dir_l <- 0;
             _ => return ctx;
         }
     }
@@ -2196,6 +2631,23 @@ machine ssac_parse(tokens: *Token, tok_cnt: u32, alloc: *BumpAlloc, out_prog: *P
             let ctx_mem = call alloc_parse_context(alloc);
             let ctx = call init_parse_context(ctx_mem, tokens, tok_cnt, alloc);
             let ret = call parse_program(ctx, out_prog);
+            _ => return ret;
+        }
+    }
+}
+
+// ssac_parse_append: 既存 ProgramDef への追記 ＆ include キューイング付きパース
+machine ssac_parse_append(tokens: *Token, tok_cnt: u32, alloc: *BumpAlloc, out_prog: *ProgramDef, q: *u64, lens: *u32, p_tail: *u32, max_q: u32) -> i32 {
+    flow {}
+    states {
+        Entry: {
+            let ctx_mem = call alloc_parse_context(alloc);
+            let ctx = call init_parse_context(ctx_mem, tokens, tok_cnt, alloc);
+            ctx.inc_queue <- q;
+            ctx.inc_lens <- lens;
+            ctx.inc_tail_ptr <- p_tail;
+            ctx.inc_max <- max_q;
+            let ret = call parse_file_declarations(ctx, out_prog);
             _ => return ret;
         }
     }

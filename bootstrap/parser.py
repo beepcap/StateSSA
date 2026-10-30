@@ -1,7 +1,8 @@
 from typing import Any
 from .token import TokenType, Token
 from .ast_nodes import Program, Machine, Flow, Reg, Wire, State, Rule, Action, TypeDef, ExternFn
-from .expr_nodes import BinaryExpr, UnaryExpr, CallExpr, FieldExpr, StructLit, VarExpr, IntLit, StringLit, NullLit, CastExpr
+from .expr_nodes import BinaryExpr, UnaryExpr, CallExpr, FieldExpr, StructLit, VarExpr, IntLit, StringLit, NullLit, CastExpr, Q64Lit
+from .lexer import parse_q64_str
 
 class Parser:
     def __init__(self, tokens: list[Token]):
@@ -305,6 +306,8 @@ class Parser:
             operand = self.parse_unary()
             if isinstance(operand, IntLit):
                 return IntLit(-operand.val)
+            if isinstance(operand, Q64Lit):
+                return Q64Lit(-operand.val)
             return BinaryExpr("-", IntLit(0), operand)
         if self.match(TokenType.STAR):
             return UnaryExpr("*", self.parse_unary())
@@ -332,6 +335,10 @@ class Parser:
         if self.peek().type == TokenType.INT_LIT:
             val = int(self.expect(TokenType.INT_LIT).value, 0)
             return IntLit(val)
+        if self.peek().type == TokenType.Q64_LIT:
+            tok = self.expect(TokenType.Q64_LIT)
+            val = parse_q64_str(tok.value)
+            return Q64Lit(val)
         if self.peek().type == TokenType.STRING_LIT:
             val = self.expect(TokenType.STRING_LIT).value
             return StringLit(val)

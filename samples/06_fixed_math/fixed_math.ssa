@@ -1,0 +1,69 @@
+// ============================================================================
+// StateSSA Sample 06: Deterministic Fixed-Point Arithmetic (q64) & C-ABI Bridge
+// 完全決定論的実数 q64 (Q32.32) と、extern C-ABI 境界自動変換の実証サンプル
+// ============================================================================
+
+extern "C" {
+    fn sin(x: f64) -> f64;
+    fn cos(x: f64) -> f64;
+    fn sqrt(x: f64) -> f64;
+    fn printf(fmt: *u8, val: f64) -> i32;
+    fn puts(s: *u8) -> i32;
+}
+
+machine main() -> i32 {
+    flow {
+        reg a: q64 = 1.5;
+        reg b: q64 = 2.0;
+
+        // 四則演算ワイヤー (乗除算は128bit中間積シフトで展開される)
+        wire sum  = a + b;     // 3.5
+        wire diff = b - a;     // 0.5
+        wire prod = a * b;     // 3.0
+        wire quot = a / b;     // 0.75
+
+        // 決定論的自由落下シミュレーション (y = v0*t - 0.5*g*t^2)
+        // g = 9.8, t = 1.0, v0 = 20.0
+        reg g:  q64 = 9.8;
+        reg t:  q64 = 1.0;
+        reg v0: q64 = 20.0;
+        reg half: q64 = 0.5;
+
+        wire v0_t = v0 * t;           // 20.0
+        wire half_g = half * g;       // 4.9
+        wire t_sq = t * t;            // 1.0
+        wire drop = half_g * t_sq;    // 4.9
+        wire altitude = v0_t - drop;  // 15.1
+    }
+    states {
+        Entry: {
+            let _ = call puts("=== StateSSA Sample 06: Deterministic Math (q64) ===");
+
+            // 1. 基本四則演算の出力
+            let _ = call printf("a + b (expected 3.500000): %f\n", sum);
+            let _ = call printf("b - a (expected 0.500000): %f\n", diff);
+            let _ = call printf("a * b (expected 3.000000): %f\n", prod);
+            let _ = call printf("a / b (expected 0.750000): %f\n", quot);
+
+            // 2. 自由落下物理シミュレーション高度
+            let _ = call printf("altitude at t=1.0s (expected 15.100000): %f\n", altitude);
+
+            // 3. C-ABI 自動ブリッジ (引数: q64 -> f64 自動変換, 戻り値: f64 -> q64 自動変換)
+            let zero = 0.0;
+            let sin_zero = call sin(zero);
+            let cos_zero = call cos(zero);
+            let four = 4.0;
+            let sqrt_four = call sqrt(four);
+
+            let _ = call printf("sin(0.0) (expected 0.000000): %f\n", sin_zero);
+            let _ = call printf("cos(0.0) (expected 1.000000): %f\n", cos_zero);
+            let _ = call printf("sqrt(4.0) (expected 2.000000): %f\n", sqrt_four);
+
+            _ => Exit;
+        }
+
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
