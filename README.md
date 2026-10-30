@@ -13,7 +13,7 @@ StateSSA は、有限状態機械（Finite State Machine; FSM）と静的単一�
 ```text
 StateSSA/
 ├── configure           # POSIX 準拠の環境検証 ＆ Stage-3 自動ブートストラップスクリプト
-├── LICENSE             # ライセンスファイル (MIT)
+├── LICENSE             # ライセンスファイル (BSD 3-Clause)
 ├── README.md           # 本ドキュメント
 ├── RELEASE_NOTES.md    # リリースノート (v0.12.0)
 │
