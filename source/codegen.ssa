@@ -1,23 +1,23 @@
 // ============================================================================
-// StateSSA v0.11.0: Self-Hosting Compiler Codegen (codegen.ssa)
-// Python版 ssac/codegen.py (615行) の論理構造・データフロー 1:1 完全準拠実装
+// StateSSA Compiler: Code Generation & Static Semantic Analysis (codegen.ssa)
+// Rejoined & Streamlined Self-Hosted CodeGen Module
 // ============================================================================
 
 include "common.ssa";
 include "parser.ssa";
-
-// ----------------------------------------------------------------------------
-// 外部 C-ABI 関数宣言
-// ----------------------------------------------------------------------------
 extern "C" {
     fn malloc(size: u32) -> *u8;
     fn free(ptr: *u8) -> void;
     fn write(fd: i32, buf: *u8, count: u32) -> i32;
 }
 
-// ----------------------------------------------------------------------------
-// Codegen 専用のテーブル構造 (codegen.py の dict/list を線形メモリで再現)
-// ----------------------------------------------------------------------------
+
+// ============================================================================
+// StateSSA Compiler: Codegen Context & Buffer Utility (codegen_ctx.ssa)
+// 出力バッファ管理・数値フォーマット・SSAシンボル環境(env)・Phi追跡テーブル
+// ============================================================================
+
+
 
 type TypeMapEntry = {
     src_ptr:  *u8,
@@ -96,10 +96,6 @@ type CodegenCtx = {
     cur_state_p: *u8,
     cur_state_l: u32
 };
-
-// ----------------------------------------------------------------------------
-// 2. 基本出力ユーティリティ & ブロックバッファ管理
-// ----------------------------------------------------------------------------
 
 machine calc_bb_required_size(s: *StateDef, m: *MachineDef) -> u32 {
     flow {
@@ -270,64 +266,6 @@ machine emit_nl(ctx: *CodegenCtx) -> u32 {
     }
 }
 
-machine emit_u32(ctx: *CodegenCtx, val: u32) -> u32 {
-    flow {
-        reg v: u32 = 0;
-        reg count: u32 = 0;
-        wire is_zero = v == 0;
-        wire next_v = v / 10;
-        wire mul10 = next_v * 10;
-        wire digit = v - mul10;
-    }
-    states {
-        Entry: {
-            val == 0 => Zero;
-            _        => PushDigits [ v <= val, count <= 0 ];
-        }
-        Zero: {
-            let _ = call emit_char(ctx, 48); // '0'
-            _ => Exit;
-        }
-        PushDigits: {
-            is_zero != 0 => PopDigits;
-            _            => StepPush;
-        }
-        StepPush: {
-            let alloc = ctx.alloc;
-            let b = alloc.base_ptr;
-            let off = alloc.offset;
-            let p = b + off;
-            let next_off = off + 1;
-            alloc.offset <- next_off;
-            let dig_ch = digit + 48;
-            *p <- dig_ch;
-            let next_cnt = count + 1;
-            _ => PushDigits [ v <= next_v, count <= next_cnt ];
-        }
-        PopDigits: {
-            count == 0 => Exit;
-            _          => StepPop;
-        }
-        StepPop: {
-            let alloc = ctx.alloc;
-            let off = alloc.offset;
-            let prev_off = off - 1;
-            alloc.offset <- prev_off;
-            let b = alloc.base_ptr;
-            let p = b + prev_off;
-            let ch = *p;
-            let _ = call emit_char(ctx, ch);
-            let prev_cnt = count - 1;
-            _ => PopDigits [ count <= prev_cnt ];
-        }
-        Exit: {
-            let out_p = ctx.out_pos;
-            _ => return out_p;
-        }
-    }
-}
-
-
 machine emit_u64(ctx: *CodegenCtx, val: i64) -> u32 {
     flow {
         reg v: i64 = 0;
@@ -381,6 +319,17 @@ machine emit_u64(ctx: *CodegenCtx, val: i64) -> u32 {
         Exit: {
             let out_p = ctx.out_pos;
             _ => return out_p;
+        }
+    }
+}
+
+machine emit_u32(ctx: *CodegenCtx, val: u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            let v64 = cast(i64) val;
+            let res = call emit_u64(ctx, v64);
+            _       => return res;
         }
     }
 }
@@ -479,48 +428,6 @@ machine append_str_to_alloc(alloc: *BumpAlloc, s: *u8, len: u32) -> u32 {
     }
 }
 
-machine append_u32_to_alloc(alloc: *BumpAlloc, val: u32) -> u32 {
-    flow {
-        reg v: u32 = 0;
-        reg cnt: u32 = 0;
-        wire is_zero = v == 0;
-        wire next_v = v / 10;
-        wire mul10 = next_v * 10;
-        wire digit = v - mul10;
-    }
-    states {
-        Entry: {
-            val == 0 => EmitZero;
-            _        => Push [ v <= val, cnt <= 0 ];
-        }
-        EmitZero: {
-            let _ = call append_char_to_alloc(alloc, 48);
-            _ => Exit;
-        }
-        Push: {
-            is_zero != 0 => Pop;
-            _            => DoPush;
-        }
-        DoPush: {
-            let b_p = alloc.base_ptr;
-            let off_p = alloc.offset;
-            let p = b_p + off_p;
-            *p <- digit + 48;
-            alloc.offset <- alloc.offset + 1;
-            _ => Push [ v <= next_v, cnt <= cnt + 1 ];
-        }
-        Pop: {
-            // 文字列を反転
-            let _ = call reverse_alloc_bytes(alloc, cnt);
-            _ => Exit;
-        }
-        Exit: {
-            _ => return alloc.offset;
-        }
-    }
-}
-
-
 machine append_u64_to_alloc(alloc: *BumpAlloc, val: i64) -> u32 {
     flow {
         reg v: i64 = 0;
@@ -561,6 +468,17 @@ machine append_u64_to_alloc(alloc: *BumpAlloc, val: i64) -> u32 {
         Exit: {
             let off_ret = alloc.offset;
             _ => return off_ret;
+        }
+    }
+}
+
+machine append_u32_to_alloc(alloc: *BumpAlloc, val: u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            let v64 = cast(i64) val;
+            let res = call append_u64_to_alloc(alloc, v64);
+            _       => return res;
         }
     }
 }
@@ -652,186 +570,39 @@ machine str_eq(s1: *u8, len1: u32, s2: *u8, len2: u32) -> u32 {
     }
 }
 
-// ----------------------------------------------------------------------------
-// 3. TypeRegistry (codegen.py L11-37, L42-44)
-// ----------------------------------------------------------------------------
-
-machine register_type_map(ctx: *CodegenCtx, src_p: *u8, src_l: u32, llvm_p: *u8, llvm_l: u32) -> u32 {
+machine strlen(s: *u8) -> u32 {
     flow {
-        wire idx = ctx.type_map_cnt;
-        wire fld_entry = ctx.type_map;
-        wire entry = fld_entry + idx;
+        reg i: u32 = 0;
+        wire ptr_c = s + i;
+        wire c = *ptr_c;
     }
     states {
         Entry: {
-            entry.src_ptr  <- src_p;
-            entry.src_len  <- src_l;
-            entry.llvm_ptr <- llvm_p;
-            entry.llvm_len <- llvm_l;
-            ctx.type_map_cnt <- idx + 1;
-            _ => return ctx.type_map_cnt;
+            _ => Loop [ i <= 0 ];
         }
-    }
-}
-
-machine init_type_registry(ctx: *CodegenCtx) -> u32 {
-    flow {
-        reg t_idx: u32 = 0;
-        wire prog = ctx.prog;
-        wire t_cnt = prog.type_count;
-        wire has_more_types = t_idx < t_cnt;
-        wire fld_t_ptr = prog.types;
-        wire t_ptr = fld_t_ptr + t_idx;
-        wire alloc = ctx.alloc;
-    }
-    states {
-        Entry: {
-            // 基本型の登録
-            let _ = call register_type_map(ctx, "i32", 3, "i32", 3);
-            let _ = call register_type_map(ctx, "*i32", 4, "i32*", 4);
-            let _ = call register_type_map(ctx, "u32", 3, "i32", 3);
-            let _ = call register_type_map(ctx, "*u32", 4, "i32*", 4);
-            let _ = call register_type_map(ctx, "i64", 3, "i64", 3);
-            let _ = call register_type_map(ctx, "*i64", 4, "i64*", 4);
-            let _ = call register_type_map(ctx, "u64", 3, "i64", 3);
-            let _ = call register_type_map(ctx, "*u64", 4, "i64*", 4);
-            let _ = call register_type_map(ctx, "u16", 3, "i16", 3);
-            let _ = call register_type_map(ctx, "*u16", 4, "i16*", 4);
-            let _ = call register_type_map(ctx, "u8", 2, "i8", 2);
-            let _ = call register_type_map(ctx, "*u8", 3, "i8*", 3);
-            let _ = call register_type_map(ctx, "i8", 2, "i8", 2);
-            let _ = call register_type_map(ctx, "*i8", 3, "i8*", 3);
-            let _ = call register_type_map(ctx, "*void", 5, "i8*", 3);
-            let _ = call register_type_map(ctx, "void", 4, "void", 4);
-
-            _ => TypesLoop [ t_idx <= 0 ];
-        }
-        TypesLoop: {
-            has_more_types != 0 => ProcessType;
-            _                   => Exit;
-        }
-        ProcessType: {
-            // エイリアス判定 (field_count == 1 && fields[0].name_len == 0)
-            let f_cnt = t_ptr.field_count;
-            f_cnt == 1 => CheckAlias;
-            _          => RegisterStructType;
-        }
-        CheckAlias: {
-            let f0 = t_ptr.fields;
-            let f0_nl = f0.name_len;
-            f0_nl == 0 => RegisterAliasType;
-            _          => RegisterStructType;
-        }
-        RegisterAliasType: {
-            // type TaskHandle = *void; -> type_map["TaskHandle"] = map_type(target)
-            let f0 = t_ptr.fields;
-            let target_p = f0.type_ptr;
-            let target_l = f0.type_len;
-            let mapped_llvm = call map_type_ptr(ctx, target_p, target_l);
-            let mapped_len = call map_type_len(ctx, target_p, target_l);
-
-            let _ = call register_type_map(ctx, t_ptr.name_ptr, t_ptr.name_len, mapped_llvm, mapped_len);
-            _ => NextType;
-        }
-        RegisterStructType: {
-            // 構造体: "%struct.TypeName", "*TypeName" -> "%struct.TypeName*"
-            let name_p = t_ptr.name_ptr;
-            let name_l = t_ptr.name_len;
-
-            // "%struct.Name"
-            let b_s_start = alloc.base_ptr;
-            let off_s_start = alloc.offset;
-            let s_start = b_s_start + off_s_start;
-            let _ = call append_str_to_alloc(alloc, "%struct.", 8);
-            let _ = call append_str_to_alloc(alloc, name_p, name_l);
-            let s_len = name_l + 8;
-            let _ = call register_type_map(ctx, name_p, name_l, s_start, s_len);
-
-            // "*Name" -> "%struct.Name*"
-            let b_star_start = alloc.base_ptr;
-            let off_star_start = alloc.offset;
-            let star_start = b_star_start + off_star_start;
-            let _ = call append_char_to_alloc(alloc, 42); // '*'
-            let _ = call append_str_to_alloc(alloc, name_p, name_l);
-            let star_src_len = name_l + 1;
-
-            let b_sptr_start = alloc.base_ptr;
-            let off_sptr_start = alloc.offset;
-            let sptr_start = b_sptr_start + off_sptr_start;
-            let _ = call append_str_to_alloc(alloc, "%struct.", 8);
-            let _ = call append_str_to_alloc(alloc, name_p, name_l);
-            let _ = call append_char_to_alloc(alloc, 42); // '*'
-            let sptr_len = name_l + 9;
-
-            let _ = call register_type_map(ctx, star_start, star_src_len, sptr_start, sptr_len);
-            _ => NextType;
-        }
-        NextType: {
-            _ => TypesLoop [ t_idx <= t_idx + 1 ];
+        Loop: {
+            c == 0 => Exit;
+            _      => Loop [ i <= i + 1 ];
         }
         Exit: {
-            _ => return ctx.type_map_cnt;
+            _ => return i;
         }
     }
 }
 
-machine map_type_ptr(ctx: *CodegenCtx, type_p: *u8, type_l: u32) -> *u8 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = ctx.type_map_cnt;
-        wire has_more = i < cnt;
-        wire fld_entry = ctx.type_map;
-        wire entry = fld_entry + i;
-        wire is_match = call str_eq(entry.src_ptr, entry.src_len, type_p, type_l);
-    }
+machine make_cstr(alloc: *BumpAlloc, ptr: *u8, len: u32) -> *u8 {
+    flow {}
     states {
         Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => DefaultType;
-            is_match != 0 => Match;
-            _             => Loop [ i <= i + 1 ];
-        }
-        Match: {
-            _ => return entry.llvm_ptr;
-        }
-        DefaultType: {
-            _ => return type_p;
+            let b_start = alloc.base_ptr;
+            let off_start = alloc.offset;
+            let start = b_start + off_start;
+            let _ = call append_str_to_alloc(alloc, ptr, len);
+            let _ = call append_char_to_alloc(alloc, 0);
+            _ => return start;
         }
     }
 }
-
-machine map_type_len(ctx: *CodegenCtx, type_p: *u8, type_l: u32) -> u32 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = ctx.type_map_cnt;
-        wire has_more = i < cnt;
-        wire fld_entry = ctx.type_map;
-        wire entry = fld_entry + i;
-        wire is_match = call str_eq(entry.src_ptr, entry.src_len, type_p, type_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => DefaultType;
-            is_match != 0 => Match;
-            _             => Loop [ i <= i + 1 ];
-        }
-        Match: {
-            _ => return entry.llvm_len;
-        }
-        DefaultType: {
-            _ => return type_l;
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// 4. EnvTable (スコープ環境: var_name -> ssa_id)
-// ----------------------------------------------------------------------------
 
 machine env_set(ctx: *CodegenCtx, var_p: *u8, var_l: u32, ssa_p: *u8, ssa_l: u32) -> u32 {
     flow {
@@ -869,14 +640,14 @@ machine env_set(ctx: *CodegenCtx, var_p: *u8, var_l: u32, ssa_p: *u8, ssa_l: u32
     }
 }
 
-machine env_get_ptr(ctx: *CodegenCtx, var_p: *u8, var_l: u32) -> *u8 {
+machine find_env_entry(ctx: *CodegenCtx, var_p: *u8, var_l: u32) -> *EnvEntry {
     flow {
         reg i: u32 = 0;
         wire cnt = ctx.cur_env_cnt;
         wire has_more = i < cnt;
         wire fld_entry = ctx.cur_env;
-        wire entry = fld_entry + i;
-        wire is_match = call str_eq(entry.var_ptr, entry.var_len, var_p, var_l);
+        wire cur_entry = fld_entry + i;
+        wire is_match = call str_eq(cur_entry.var_ptr, cur_entry.var_len, var_p, var_l);
     }
     states {
         Entry: {
@@ -888,7 +659,7 @@ machine env_get_ptr(ctx: *CodegenCtx, var_p: *u8, var_l: u32) -> *u8 {
             _             => Loop [ i <= i + 1 ];
         }
         Found: {
-            _ => return entry.ssa_ptr;
+            _ => return cur_entry;
         }
         NotFound: {
             _ => return null;
@@ -896,36 +667,45 @@ machine env_get_ptr(ctx: *CodegenCtx, var_p: *u8, var_l: u32) -> *u8 {
     }
 }
 
-machine env_get_len(ctx: *CodegenCtx, var_p: *u8, var_l: u32) -> u32 {
+machine env_get_ptr(ctx: *CodegenCtx, var_p: *u8, var_l: u32) -> *u8 {
     flow {
-        reg i: u32 = 0;
-        wire cnt = ctx.cur_env_cnt;
-        wire has_more = i < cnt;
-        wire fld_entry = ctx.cur_env;
-        wire entry = fld_entry + i;
-        wire is_match = call str_eq(entry.var_ptr, entry.var_len, var_p, var_l);
+        reg e_matched: *EnvEntry = null;
     }
     states {
         Entry: {
-            _ => Loop [ i <= 0 ];
+            let e = call find_env_entry(ctx, var_p, var_l);
+            e == null => ReturnNull;
+            _         => ReturnFound [ e_matched <= e ];
         }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => Found;
-            _             => Loop [ i <= i + 1 ];
+        ReturnFound: {
+            let p = e_matched.ssa_ptr;
+            _ => return p;
         }
-        Found: {
-            _ => return entry.ssa_len;
-        }
-        NotFound: {
-            _ => return 0;
+        ReturnNull: {
+            _ => return null;
         }
     }
 }
 
-// ----------------------------------------------------------------------------
-// 5. PhiTable (遷移先ステートへの流入値記録: codegen.py record_latches)
-// ----------------------------------------------------------------------------
+machine env_get_len(ctx: *CodegenCtx, var_p: *u8, var_l: u32) -> u32 {
+    flow {
+        reg e_matched: *EnvEntry = null;
+    }
+    states {
+        Entry: {
+            let e = call find_env_entry(ctx, var_p, var_l);
+            e == null => ReturnZero;
+            _         => ReturnFound [ e_matched <= e ];
+        }
+        ReturnFound: {
+            let l = e_matched.ssa_len;
+            _ => return l;
+        }
+        ReturnZero: {
+            _ => return 0;
+        }
+    }
+}
 
 machine record_phi_incoming(ctx: *CodegenCtx, s_idx: u32, r_idx: u32, from_bb_p: *u8, from_bb_l: u32, val_p: *u8, val_l: u32) -> u32 {
     flow {
@@ -947,317 +727,207 @@ machine record_phi_incoming(ctx: *CodegenCtx, s_idx: u32, r_idx: u32, from_bb_p:
     }
 }
 
-// ----------------------------------------------------------------------------
-// 6. ヘッダ・型定義・外部関数宣言の出力
-// ----------------------------------------------------------------------------
+// ============================================================================
+// StateSSA Compiler: Semantic Analysis & Static Type Validator (sema.ssa)
+// 型環境・型推論・静的型バリデータ・型診断出力
+// ============================================================================
 
-machine emit_header(ctx: *CodegenCtx) -> u32 {
-    flow {}
+
+machine register_type_map(ctx: *CodegenCtx, src_p: *u8, src_l: u32, llvm_p: *u8, llvm_l: u32) -> u32 {
+    flow {
+        wire idx = ctx.type_map_cnt;
+        wire fld_entry = ctx.type_map;
+        wire entry = fld_entry + idx;
+    }
     states {
         Entry: {
-            let _ = call emit_str(ctx, "; Generated by StateSSA Compiler (ssac)", 39);
-            let _ = call emit_nl(ctx);
-            let _ = call emit_str(ctx, "target datalayout = ", 20);
-            let _ = call emit_char(ctx, 34); // '"'
-            let _ = call emit_str(ctx, "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", 79);
-            let _ = call emit_char(ctx, 34); // '"'
-            let _ = call emit_nl(ctx);
-            let _ = call emit_str(ctx, "target triple = ", 16);
-            let _ = call emit_char(ctx, 34); // '"'
-            let _ = call emit_str(ctx, "x86_64-pc-linux-gnu", 19);
-            let _ = call emit_char(ctx, 34); // '"'
-            let _ = call emit_nl(ctx);
-            let _ = call emit_nl(ctx);
-            _ => return ctx.out_pos;
+            entry.src_ptr  <- src_p;
+            entry.src_len  <- src_l;
+            entry.llvm_ptr <- llvm_p;
+            entry.llvm_len <- llvm_l;
+            ctx.type_map_cnt <- idx + 1;
+            _ => return ctx.type_map_cnt;
         }
     }
 }
 
-machine emit_all_types(ctx: *CodegenCtx) -> u32 {
+machine init_builtin_types(ctx: *CodegenCtx) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            let _ = call register_type_map(ctx, "i32", 3, "i32", 3);
+            let _ = call register_type_map(ctx, "*i32", 4, "i32*", 4);
+            let _ = call register_type_map(ctx, "u32", 3, "i32", 3);
+            let _ = call register_type_map(ctx, "*u32", 4, "i32*", 4);
+            let _ = call register_type_map(ctx, "i64", 3, "i64", 3);
+            let _ = call register_type_map(ctx, "*i64", 4, "i64*", 4);
+            let _ = call register_type_map(ctx, "u64", 3, "i64", 3);
+            let _ = call register_type_map(ctx, "*u64", 4, "i64*", 4);
+            let _ = call register_type_map(ctx, "u16", 3, "i16", 3);
+            let _ = call register_type_map(ctx, "*u16", 4, "i16*", 4);
+            let _ = call register_type_map(ctx, "u8", 2, "i8", 2);
+            let _ = call register_type_map(ctx, "*u8", 3, "i8*", 3);
+            let _ = call register_type_map(ctx, "i8", 2, "i8", 2);
+            let _ = call register_type_map(ctx, "*i8", 3, "i8*", 3);
+            let _ = call register_type_map(ctx, "*void", 5, "i8*", 3);
+            let _ = call register_type_map(ctx, "void", 4, "void", 4);
+            _ => return 0;
+        }
+    }
+}
+
+machine register_struct_type_map(ctx: *CodegenCtx, name_p: *u8, name_l: u32) -> u32 {
+    flow {
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            // "%struct.Name"
+            let b_s_start = alloc.base_ptr;
+            let off_s_start = alloc.offset;
+            let s_start = b_s_start + off_s_start;
+            let _ = call append_str_to_alloc(alloc, "%struct.", 8);
+            let _ = call append_str_to_alloc(alloc, name_p, name_l);
+            let s_len = name_l + 8;
+            let _ = call register_type_map(ctx, name_p, name_l, s_start, s_len);
+
+            // "*Name" -> "%struct.Name*"
+            let b_star_start = alloc.base_ptr;
+            let off_star_start = alloc.offset;
+            let star_start = b_star_start + off_star_start;
+            let _ = call append_char_to_alloc(alloc, 42); // '*'
+            let _ = call append_str_to_alloc(alloc, name_p, name_l);
+            let star_src_len = name_l + 1;
+
+            let b_sptr_start = alloc.base_ptr;
+            let off_sptr_start = alloc.offset;
+            let sptr_start = b_sptr_start + off_sptr_start;
+            let _ = call append_str_to_alloc(alloc, "%struct.", 8);
+            let _ = call append_str_to_alloc(alloc, name_p, name_l);
+            let _ = call append_char_to_alloc(alloc, 42); // '*'
+            let sptr_len = name_l + 9;
+
+            let _ = call register_type_map(ctx, star_start, star_src_len, sptr_start, sptr_len);
+            _ => return 0;
+        }
+    }
+}
+
+machine init_type_registry(ctx: *CodegenCtx) -> u32 {
     flow {
         reg t_idx: u32 = 0;
         wire prog = ctx.prog;
-        wire cnt = prog.type_count;
-        wire has_more = t_idx < cnt;
+        wire t_cnt = prog.type_count;
+        wire has_more_types = t_idx < t_cnt;
         wire fld_t_ptr = prog.types;
         wire t_ptr = fld_t_ptr + t_idx;
     }
     states {
         Entry: {
-            _ => Loop [ t_idx <= 0 ];
+            let _ = call init_builtin_types(ctx);
+            _ => TypesLoop [ t_idx <= 0 ];
         }
-        Loop: {
-            has_more != 0 => ProcessOne;
-            _             => Done;
+        TypesLoop: {
+            has_more_types != 0 => ProcessType;
+            _                   => Exit;
         }
-        ProcessOne: {
-            // エイリアス型なら構造体定義はスキップ (codegen.py L29-36)
+        ProcessType: {
             let f_cnt = t_ptr.field_count;
             f_cnt == 1 => CheckAlias;
-            _          => EmitStruct;
+            _          => RegStruct;
         }
         CheckAlias: {
             let f0 = t_ptr.fields;
             let f0_nl = f0.name_len;
-            f0_nl == 0 => SkipAlias;
-            _          => EmitStruct;
+            f0_nl == 0 => RegAlias;
+            _          => RegStruct;
         }
-        SkipAlias: {
-            _ => NextIter;
+        RegAlias: {
+            let f0 = t_ptr.fields;
+            let target_p = f0.type_ptr;
+            let target_l = f0.type_len;
+            let mapped_llvm = call map_type_ptr(ctx, target_p, target_l);
+            let mapped_len = call map_type_len(ctx, target_p, target_l);
+            let _ = call register_type_map(ctx, t_ptr.name_ptr, t_ptr.name_len, mapped_llvm, mapped_len);
+            _ => NextType;
         }
-        EmitStruct: {
-            let _ = call emit_str(ctx, "%struct.", 8);
-            let _ = call emit_str(ctx, t_ptr.name_ptr, t_ptr.name_len);
-            let _ = call emit_str(ctx, " = type { ", 10);
-
-            let _ = call emit_struct_fields(ctx, t_ptr);
-            let _ = call emit_str(ctx, " }", 2);
-            let _ = call emit_nl(ctx);
-            _ => NextIter;
+        RegStruct: {
+            let _ = call register_struct_type_map(ctx, t_ptr.name_ptr, t_ptr.name_len);
+            _ => NextType;
         }
-        NextIter: {
-            _ => Loop [ t_idx <= t_idx + 1 ];
-        }
-        Done: {
-            cnt != 0 => EmitTrailNl;
-            _        => Exit;
-        }
-        EmitTrailNl: {
-            let _ = call emit_nl(ctx);
-            _ => Exit;
+        NextType: {
+            _ => TypesLoop [ t_idx <= t_idx + 1 ];
         }
         Exit: {
-            _ => return ctx.out_pos;
+            _ => return ctx.type_map_cnt;
         }
     }
 }
 
-machine emit_struct_fields(ctx: *CodegenCtx, t: *TypeDef) -> u32 {
-    flow {
-        reg f_idx: u32 = 0;
-        wire cnt = t.field_count;
-        wire has_more = f_idx < cnt;
-        wire fld_f_ptr = t.fields;
-        wire f_ptr = fld_f_ptr + f_idx;
-        wire is_first = f_idx == 0;
-    }
-    states {
-        Entry: {
-            _ => Loop [ f_idx <= 0 ];
-        }
-        Loop: {
-            has_more != 0 => EmitField;
-            _             => Exit;
-        }
-        EmitField: {
-            is_first == 0 => EmitComma;
-            _             => EmitType;
-        }
-        EmitComma: {
-            let _ = call emit_str(ctx, ", ", 2);
-            _ => EmitType;
-        }
-        EmitType: {
-            let mapped_p = call map_type_ptr(ctx, f_ptr.type_ptr, f_ptr.type_len);
-            let mapped_l = call map_type_len(ctx, f_ptr.type_ptr, f_ptr.type_len);
-            let _ = call emit_str(ctx, mapped_p, mapped_l);
-            _ => Loop [ f_idx <= f_idx + 1 ];
-        }
-        Exit: {
-            _ => return ctx.out_pos;
-        }
-    }
-}
-
-machine emit_all_externs(ctx: *CodegenCtx) -> u32 {
-    flow {
-        reg e_idx: u32 = 0;
-        wire prog = ctx.prog;
-        wire cnt = prog.extern_count;
-        wire has_more = e_idx < cnt;
-        wire fld_ext = prog.externs;
-        wire ext = fld_ext + e_idx;
-    }
-    states {
-        Entry: {
-            _ => Loop [ e_idx <= 0 ];
-        }
-        Loop: {
-            has_more != 0 => EmitOne;
-            _             => Done;
-        }
-        EmitOne: {
-            let _ = call emit_str(ctx, "declare ", 8);
-            let ret_p = call map_type_ptr(ctx, ext.ret_type_ptr, ext.ret_type_len);
-            let ret_l = call map_type_len(ctx, ext.ret_type_ptr, ext.ret_type_len);
-            let _ = call emit_str(ctx, ret_p, ret_l);
-            let _ = call emit_str(ctx, " @", 2);
-            let _ = call emit_str(ctx, ext.name_ptr, ext.name_len);
-            let _ = call emit_char(ctx, 40); // '('
-
-            let _ = call emit_extern_params(ctx, ext);
-
-            let _ = call emit_char(ctx, 41); // ')'
-            let _ = call emit_nl(ctx);
-            _ => Loop [ e_idx <= e_idx + 1 ];
-        }
-        Done: {
-            cnt != 0 => EmitTrap;
-            _        => Exit;
-        }
-        EmitTrap: {
-            let _ = call emit_nl(ctx);
-            let _ = call emit_str(ctx, "declare void @llvm.trap() cold noreturn nounwind", 48);
-            let _ = call emit_nl(ctx);
-            let _ = call emit_nl(ctx);
-            _ => Exit;
-        }
-        Exit: {
-            _ => return ctx.out_pos;
-        }
-    }
-}
-
-machine emit_extern_params(ctx: *CodegenCtx, ext: *ExternFn) -> u32 {
-    flow {
-        reg p_idx: u32 = 0;
-        wire cnt = ext.param_count;
-        wire has_more = p_idx < cnt;
-        wire fld_p = ext.params;
-        wire p = fld_p + p_idx;
-        wire is_first = p_idx == 0;
-    }
-    states {
-        Entry: {
-            _ => Loop [ p_idx <= 0 ];
-        }
-        Loop: {
-            has_more != 0 => EmitParam;
-            _             => Exit;
-        }
-        EmitParam: {
-            is_first == 0 => EmitComma;
-            _             => EmitType;
-        }
-        EmitComma: {
-            let _ = call emit_str(ctx, ", ", 2);
-            _ => EmitType;
-        }
-        EmitType: {
-            let mapped_p = call map_type_ptr(ctx, p.type_ptr, p.type_len);
-            let mapped_l = call map_type_len(ctx, p.type_ptr, p.type_len);
-            let _ = call emit_str(ctx, mapped_p, mapped_l);
-            _ => Loop [ p_idx <= p_idx + 1 ];
-        }
-        Exit: {
-            _ => return ctx.out_pos;
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// 7. 文字列定数の収集・出力 (codegen.py string_constants)
-// ----------------------------------------------------------------------------
-
-machine collect_string_const(ctx: *CodegenCtx, val_ptr: *u8, val_len: u32) -> u32 {
-    flow {
-        wire cnt = ctx.string_cnt;
-        wire fld_entry = ctx.strings;
-        wire entry = fld_entry + cnt;
-    }
-    states {
-        Entry: {
-            let res_id = ctx.str_id + 1;
-            ctx.str_id <- res_id;
-            entry.sym_id   <- res_id;
-            entry.val_ptr  <- val_ptr;
-            entry.val_len  <- val_len;
-            entry.byte_len <- val_len + 1; // null終端含む
-            ctx.string_cnt <- cnt + 1;
-            _ => return res_id;
-        }
-    }
-}
-
-machine emit_all_strings(ctx: *CodegenCtx) -> u32 {
+machine find_type_map_entry(ctx: *CodegenCtx, type_p: *u8, type_l: u32) -> *TypeMapEntry {
     flow {
         reg i: u32 = 0;
-        wire cnt = ctx.string_cnt;
+        wire cnt = ctx.type_map_cnt;
         wire has_more = i < cnt;
-        wire fld_entry = ctx.strings;
-        wire entry = fld_entry + i;
+        wire fld_entry = ctx.type_map;
+        wire cur_entry = fld_entry + i;
+        wire is_match = call str_eq(cur_entry.src_ptr, cur_entry.src_len, type_p, type_l);
     }
     states {
         Entry: {
             _ => Loop [ i <= 0 ];
         }
         Loop: {
-            has_more != 0 => EmitOne;
-            _             => Done;
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
         }
-        EmitOne: {
-            // @.str_X = private unnamed_addr constant [L x i8] c"STR\00", align 1
-            let _ = call emit_str(ctx, "@.str_", 6);
-            let _ = call emit_u32(ctx, entry.sym_id);
-            let _ = call emit_str(ctx, " = private unnamed_addr constant [", 34);
-            let _ = call emit_u32(ctx, entry.byte_len);
-            let _ = call emit_str(ctx, " x i8] c", 8);
-            let _ = call emit_char(ctx, 34); // '"'
-            let _ = call emit_str(ctx, entry.val_ptr, entry.val_len);
-            let _ = call emit_char(ctx, 92); // '\\'
-            let _ = call emit_char(ctx, 48); // '0'
-            let _ = call emit_char(ctx, 48); // '0'
-            let _ = call emit_char(ctx, 34); // '"'
-            let _ = call emit_str(ctx, ", align 1", 9);
-            let _ = call emit_nl(ctx);
-            _ => Loop [ i <= i + 1 ];
+        Found: {
+            _ => return cur_entry;
         }
-        Done: {
-            cnt != 0 => EmitTrailNl;
-            _        => Exit;
-        }
-        EmitTrailNl: {
-            let _ = call emit_nl(ctx);
-            _ => Exit;
-        }
-        Exit: {
-            _ => return ctx.out_pos;
+        NotFound: {
+            _ => return null;
         }
     }
 }
 
-// ----------------------------------------------------------------------------
-// 8. 再帰的式展開マシン (emit_expr)
-// ----------------------------------------------------------------------------
-
-
-machine is_ptr_type(t: *u8) -> u32 {
-    flow {}
+machine map_type_ptr(ctx: *CodegenCtx, type_p: *u8, type_l: u32) -> *u8 {
+    flow {
+        reg m_matched: *TypeMapEntry = null;
+    }
     states {
         Entry: {
-            t == null => RetZero;
-            let c0 = *t;
-            c0 == 42  => RetOne; // '*'
-            _         => RetZero;
+            let m = call find_type_map_entry(ctx, type_p, type_l);
+            m == null => ReturnDefault;
+            _         => ReturnMapped [ m_matched <= m ];
         }
-        RetOne:  { _ => return 1; }
-        RetZero: { _ => return 0; }
+        ReturnMapped: {
+            let p = m_matched.llvm_ptr;
+            _ => return p;
+        }
+        ReturnDefault: {
+            _ => return type_p;
+        }
     }
 }
 
-machine is_type_64_len(t: *u8, l: u32) -> u32 {
-    flow {}
+machine map_type_len(ctx: *CodegenCtx, type_p: *u8, type_l: u32) -> u32 {
+    flow {
+        reg m_matched: *TypeMapEntry = null;
+    }
     states {
         Entry: {
-            t == null => RetZero;
-            let is_i64 = call str_eq(t, l, "i64", 3);
-            is_i64 != 0 => RetOne;
-            let is_u64 = call str_eq(t, l, "u64", 3);
-            is_u64 != 0 => RetOne;
-            _ => RetZero;
+            let m = call find_type_map_entry(ctx, type_p, type_l);
+            m == null => ReturnDefault;
+            _         => ReturnMapped [ m_matched <= m ];
         }
-        RetOne:  { _ => return 1; }
-        RetZero: { _ => return 0; }
+        ReturnMapped: {
+            let l = m_matched.llvm_len;
+            _ => return l;
+        }
+        ReturnDefault: {
+            _ => return type_l;
+        }
     }
 }
 
@@ -1271,25 +941,6 @@ machine is_type_64(t: *u8) -> u32 {
             is_i64 != 0 => RetOne;
             let is_u64 = call str_eq(t, l, "u64", 3);
             is_u64 != 0 => RetOne;
-            _ => RetZero;
-        }
-        RetOne:  { _ => return 1; }
-        RetZero: { _ => return 0; }
-    }
-}
-
-machine is_type_1(t: *u8) -> u32 {
-    flow {}
-    states {
-        Entry: {
-            t == null => RetZero;
-            let l = call strlen(t);
-            let is_i1 = call str_eq(t, l, "i1", 2);
-            is_i1 != 0 => RetOne;
-            let is_u1 = call str_eq(t, l, "u1", 2);
-            is_u1 != 0 => RetOne;
-            let is_bool = call str_eq(t, l, "bool", 4);
-            is_bool != 0 => RetOne;
             _ => RetZero;
         }
         RetOne:  { _ => return 1; }
@@ -1322,13 +973,9 @@ machine get_type_bit_width(t: *u8) -> u32 {
             let is_u8 = call str_eq(t, l, "u8", 2);
             is_u8 != 0 => Ret8;
 
-            // i1, u1, bool
+            // i1
             let is_i1 = call str_eq(t, l, "i1", 2);
             is_i1 != 0 => Ret1;
-            let is_u1 = call str_eq(t, l, "u1", 2);
-            is_u1 != 0 => Ret1;
-            let is_bool = call str_eq(t, l, "bool", 4);
-            is_bool != 0 => Ret1;
 
             // ポインタ (*...) は 64bit
             let c0 = *t;
@@ -1344,10 +991,6 @@ machine get_type_bit_width(t: *u8) -> u32 {
         RetDefault: { _ => return 32; }
     }
 }
-
-// ----------------------------------------------------------------------------
-// 診断通知エンジン & 静的型バリデータ (Diagnostic & Static Type Validator)
-// ----------------------------------------------------------------------------
 
 machine diag_nl() -> u32 {
     flow {}
@@ -1533,6 +1176,21 @@ machine is_ptr_type_str(p: *u8, len: u32) -> u32 {
     }
 }
 
+machine is_ptr_type(t: *u8) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            t == null => RetZero;
+            let l = call strlen(t);
+            let r = call is_ptr_type_str(t, l);
+            _     => return r;
+        }
+        RetZero: {
+            _ => return 0;
+        }
+    }
+}
+
 machine is_type_compatible(kind: u32, exp_p: *u8, exp_l: u32, act_p: *u8, act_l: u32, expr: *ExprNode) -> u32 {
     flow {}
     states {
@@ -1594,6 +1252,89 @@ machine is_type_compatible(kind: u32, exp_p: *u8, exp_l: u32, act_p: *u8, act_l:
     }
 }
 
+machine get_diag_kind_str(kind: u32) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            kind == 1 => RetCallArg;
+            kind == 2 => RetStore;
+            kind == 3 => RetLatch;
+            kind == 4 => RetReturn;
+            _         => RetUnknown;
+        }
+        RetCallArg: { _ => return "Function Call Argument"; }
+        RetStore:   { _ => return "Memory / Field Store"; }
+        RetLatch:   { _ => return "Register Latch Assignment"; }
+        RetReturn:  { _ => return "Machine Return Value"; }
+        RetUnknown: { _ => return "Unknown Expression"; }
+    }
+}
+
+machine emit_diag_context(ctx: *CodegenCtx, target_p: *u8, target_l: u32, kind: u32, arg_idx: u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            let _ = call diag_str("  Machine:   ");
+            let cur_m = ctx.cur_machine;
+            cur_m != null => MachName;
+            _             => MachUnknown;
+        }
+        MachName: {
+            let m = ctx.cur_machine;
+            let _ = call diag_write(m.name_ptr, m.name_len);
+            let _ = call diag_nl();
+            _ => StateEntry;
+        }
+        MachUnknown: {
+            let _ = call diag_str("<unknown>");
+            let _ = call diag_nl();
+            _ => StateEntry;
+        }
+        StateEntry: {
+            let _ = call diag_str("  State:     ");
+            let sp = ctx.cur_state_p;
+            sp != null => StateName;
+            _          => StateUnknown;
+        }
+        StateName: {
+            let _ = call diag_write(ctx.cur_state_p, ctx.cur_state_l);
+            let _ = call diag_nl();
+            _ => TargetEntry;
+        }
+        StateUnknown: {
+            let _ = call diag_str("<unknown>");
+            let _ = call diag_nl();
+            _ => TargetEntry;
+        }
+        TargetEntry: {
+            let _ = call diag_str("  Target:    ");
+            target_p != null => TargetStr;
+            _                => TargetNone;
+        }
+        TargetStr: {
+            let _ = call diag_write(target_p, target_l);
+            kind == 1 => ArgIdx;
+            _         => TargetNl;
+        }
+        ArgIdx: {
+            let _ = call diag_str(" (Argument #");
+            let _ = call diag_u32(arg_idx);
+            let _ = call diag_str(")");
+            let _ = call diag_nl();
+            _ => return 0;
+        }
+        TargetNone: {
+            let _ = call diag_str("<anonymous>");
+            let _ = call diag_nl();
+            _ => return 0;
+        }
+        TargetNl: {
+            let _ = call diag_nl();
+            _ => return 0;
+        }
+    }
+}
+
 machine emit_type_diagnostic(
     ctx: *CodegenCtx,
     kind: u32,
@@ -1616,97 +1357,12 @@ machine emit_type_diagnostic(
             let _ = call diag_nl();
 
             let _ = call diag_str("  Kind:      ");
-            kind == 1 => KindCallArg;
-            kind == 2 => KindStore;
-            kind == 3 => KindLatch;
-            kind == 4 => KindReturn;
-            _         => KindUnknown;
-        }
-        KindCallArg: {
-            let _ = call diag_str("Function Call Argument");
+            let k_str = call get_diag_kind_str(kind);
+            let _ = call diag_str(k_str);
             let _ = call diag_nl();
-            _ => PrintCtx;
-        }
-        KindStore: {
-            let _ = call diag_str("Memory / Field Store");
-            let _ = call diag_nl();
-            _ => PrintCtx;
-        }
-        KindLatch: {
-            let _ = call diag_str("Register Latch Assignment");
-            let _ = call diag_nl();
-            _ => PrintCtx;
-        }
-        KindReturn: {
-            let _ = call diag_str("Machine Return Value");
-            let _ = call diag_nl();
-            _ => PrintCtx;
-        }
-        KindUnknown: {
-            let _ = call diag_str("Unknown Expression");
-            let _ = call diag_nl();
-            _ => PrintCtx;
-        }
-        PrintCtx: {
-            let _ = call diag_str("  Machine:   ");
-            let cur_m = ctx.cur_machine;
-            cur_m != null => PrintMachName;
-            _             => PrintMachUnknown;
-        }
-        PrintMachName: {
-            let m = ctx.cur_machine;
-            let _ = call diag_write(m.name_ptr, m.name_len);
-            let _ = call diag_nl();
-            _ => PrintState;
-        }
-        PrintMachUnknown: {
-            let _ = call diag_str("<unknown>");
-            let _ = call diag_nl();
-            _ => PrintState;
-        }
-        PrintState: {
-            let _ = call diag_str("  State:     ");
-            let sp = ctx.cur_state_p;
-            sp != null => PrintStateName;
-            _          => PrintStateUnknown;
-        }
-        PrintStateName: {
-            let _ = call diag_write(ctx.cur_state_p, ctx.cur_state_l);
-            let _ = call diag_nl();
-            _ => PrintTarget;
-        }
-        PrintStateUnknown: {
-            let _ = call diag_str("<unknown>");
-            let _ = call diag_nl();
-            _ => PrintTarget;
-        }
-        PrintTarget: {
-            let _ = call diag_str("  Target:    ");
-            target_p != null => PrintTargetStr;
-            _                => PrintTargetNone;
-        }
-        PrintTargetStr: {
-            let _ = call diag_write(target_p, target_l);
-            kind == 1 => PrintArgIdx;
-            _         => PrintTargetNl;
-        }
-        PrintArgIdx: {
-            let _ = call diag_str(" (Argument #");
-            let _ = call diag_u32(arg_idx);
-            let _ = call diag_str(")");
-            let _ = call diag_nl();
-            _ => PrintTypes;
-        }
-        PrintTargetNone: {
-            let _ = call diag_str("<anonymous>");
-            let _ = call diag_nl();
-            _ => PrintTypes;
-        }
-        PrintTargetNl: {
-            let _ = call diag_nl();
-            _ => PrintTypes;
-        }
-        PrintTypes: {
+
+            let _ = call emit_diag_context(ctx, target_p, target_l, kind, arg_idx);
+
             let _ = call diag_str("  Expected:  ");
             let _ = call diag_write(exp_p, exp_l);
             let _ = call diag_nl();
@@ -1769,6 +1425,699 @@ machine validate_type(
         }
     }
 }
+
+machine get_expr_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
+    flow {
+        reg m: *MachineDef = null;
+    }
+    states {
+        Entry: {
+            expr == null => ReturnVoid;
+            let m_cur = ctx.cur_machine;
+            let k = expr.kind;
+            k == 1 => ReturnI32;       // INT
+            k == 2 => ReturnU8Ptr;     // STR
+            k == 3 => ReturnVoidPtr;   // NULL
+            k == 4 => ResolveVar      [ m <= m_cur ]; // VAR
+            k == 5 => ResolveBinOp    [ m <= m_cur ]; // BINOP
+            k == 6 => ResolveUnOp     [ m <= m_cur ]; // UNOP
+            k == 7 => ResolveField    [ m <= m_cur ]; // FIELD
+            k == 8 => ResolveCall     [ m <= m_cur ]; // CALL
+            k == 9  => ResolveStruct   [ m <= m_cur ]; // STRUCT
+            k == 10 => ReturnCastType;                 // CAST
+            _       => ReturnI32;
+        }
+        ReturnVoid: {
+            _ => return "void";
+        }
+        ReturnI32: {
+            _ => return "i32";
+        }
+        ReturnU8Ptr: {
+            _ => return "*u8";
+        }
+        ReturnVoidPtr: {
+            _ => return "*void";
+        }
+        ResolveVar: {
+            let res = call get_var_type(ctx, m, expr.str_ptr, expr.str_len);
+            _ => return res;
+        }
+        ResolveBinOp: {
+            let res = call get_binop_type(ctx, expr);
+            _ => return res;
+        }
+        ResolveUnOp: {
+            let res = call get_unop_type(ctx, expr);
+            _ => return res;
+        }
+        ResolveField: {
+            let res = call get_field_type(ctx, expr);
+            _ => return res;
+        }
+        ResolveCall: {
+            let res = call find_func_ret_type(ctx.prog, ctx.alloc, expr.str_ptr, expr.str_len);
+            _ => return res;
+        }
+        ResolveStruct: {
+            let res = call make_cstr(ctx.alloc, expr.str_ptr, expr.str_len);
+            _ => return res;
+        }
+        ReturnCastType: {
+            let res = call make_cstr(ctx.alloc, expr.str_ptr, expr.str_len);
+            _ => return res;
+        }
+    }
+}
+
+machine find_let_var_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
+    flow {
+        reg cur_s:   *StateDef = null;
+        reg cur_act: *ActionStmt = null;
+    }
+    states {
+        Entry: {
+            m == null => NotFound;
+            _ => StateLoop [ cur_s <= m.state_defs ];
+        }
+        StateLoop: {
+            cur_s == null => NotFound;
+            _             => ActionLoop [ cur_act <= cur_s.actions ];
+        }
+        ActionLoop: {
+            cur_act == null => NextState;
+            _               => CheckAction;
+        }
+        CheckAction: {
+            let k = cur_act.kind;
+            k != 1 => NextAction; // 1: LET
+            let tp = cur_act.target_ptr;
+            tp == null => NextAction;
+            let tl = cur_act.target_len;
+            let is_match = call str_eq(tp, tl, name_p, name_l);
+            is_match != 0 => FoundTarget;
+            _             => NextAction;
+        }
+        FoundTarget: {
+            let t = call get_expr_type(ctx, cur_act.expr);
+            _ => return t;
+        }
+        NextAction: {
+            _ => ActionLoop [ cur_act <= cur_act.next ];
+        }
+        NextState: {
+            _ => StateLoop [ cur_s <= cur_s.next ];
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine get_var_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
+    flow {
+        reg res_type: *u8 = "i32";
+    }
+    states {
+        Entry: {
+            m == null => Exit;
+            let pt = call find_param_type(ctx, m, name_p, name_l);
+            pt != null => Exit [ res_type <= pt ];
+            let rt = call find_reg_type(ctx, m, name_p, name_l);
+            rt != null => Exit [ res_type <= rt ];
+            let wt = call find_wire_type(ctx, m, name_p, name_l);
+            wt != null => Exit [ res_type <= wt ];
+            let lt = call find_let_var_type(ctx, m, name_p, name_l);
+            lt != null => Exit [ res_type <= lt ];
+            _          => Exit;
+        }
+        Exit: {
+            _ => return res_type;
+        }
+    }
+}
+
+machine find_param_idx(m: *MachineDef, name_p: *u8, name_l: u32) -> i32 {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = m.param_count;
+        wire has_more = i < cnt;
+        wire fld_p = m.params;
+        wire p = fld_p + i;
+        wire is_match = call str_eq(p.name_ptr, p.name_len, name_p, name_l);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return i;
+        }
+        NotFound: {
+            _ => return -1;
+        }
+    }
+}
+
+machine find_param_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
+    flow {
+        reg p_idx: i32 = -1;
+    }
+    states {
+        Entry: {
+            let idx = call find_param_idx(m, name_p, name_l);
+            idx < 0 => ReturnNull;
+            _       => ReturnFound [ p_idx <= idx ];
+        }
+        ReturnFound: {
+            let u_idx = cast(u32) p_idx;
+            let fld_p = m.params;
+            let p = fld_p + u_idx;
+            let res = call make_cstr(ctx.alloc, p.type_ptr, p.type_len);
+            _ => return res;
+        }
+        ReturnNull: {
+            _ => return null;
+        }
+    }
+}
+
+machine find_reg_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = m.reg_count;
+        wire has_more = i < cnt;
+        wire fld_r = m.regs;
+        wire r = fld_r + i;
+        wire is_match = call str_eq(r.name_ptr, r.name_len, name_p, name_l);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            let res = call make_cstr(ctx.alloc, r.type_ptr, r.type_len);
+            _ => return res;
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine find_wire(m: *MachineDef, name_p: *u8, name_l: u32) -> *WireDef {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = m.wire_count;
+        wire has_more = i < cnt;
+        wire fld_w = m.wires;
+        wire w = fld_w + i;
+        wire is_match = call str_eq(w.name_ptr, w.name_len, name_p, name_l);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return w;
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine find_wire_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
+    flow {
+        reg w_matched: *WireDef = null;
+    }
+    states {
+        Entry: {
+            let w = call find_wire(m, name_p, name_l);
+            w == null => ReturnNull;
+            _         => ReturnFound [ w_matched <= w ];
+        }
+        ReturnFound: {
+            let res = call get_expr_type(ctx, w_matched.expr);
+            _ => return res;
+        }
+        ReturnNull: {
+            _ => return null;
+        }
+    }
+}
+
+machine get_binop_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
+    flow {
+        reg left_t: *u8 = "i32";
+        wire op = expr.op;
+    }
+    states {
+        Entry: {
+            op == 46 => ReturnI1; // ==
+            op == 47 => ReturnI1; // !=
+            op == 60 => ReturnI1; // <
+            op == 44 => ReturnI1; // <=
+            op == 61 => ReturnI1; // >
+            op == 48 => ReturnI1; // >=
+            op == 50 => ReturnI1; // &&
+            op == 49 => ReturnI1; // ||
+            op == 71 => CheckAdd; // +
+            _        => CheckArith;
+        }
+        ReturnI1: {
+            _ => return "i1";
+        }
+        CheckAdd: {
+            let lt = call get_expr_type(ctx, expr.left);
+            let c0_is_ptr = *lt;
+            let is_ptr = c0_is_ptr == 42;
+            is_ptr != 0 => ReturnLeft [ left_t <= lt ];
+            _           => CheckArith;
+        }
+        CheckArith: {
+            let lt = call get_expr_type(ctx, expr.left);
+            let is_l64 = call is_type_64(lt);
+            is_l64 != 0 => ReturnI64;
+            let rt = call get_expr_type(ctx, expr.right);
+            let is_r64 = call is_type_64(rt);
+            is_r64 != 0 => ReturnI64;
+            _           => ReturnI32;
+        }
+        ReturnLeft: {
+            _ => return left_t;
+        }
+        ReturnI64: {
+            _ => return "i64";
+        }
+        ReturnI32: {
+            _ => return "i32";
+        }
+    }
+}
+
+machine get_unop_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
+    flow {
+        reg sub_type: *u8 = "i32";
+        wire op = expr.op;
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            op == 62 => HandleAddr;  // '&' (token 62)
+            op == 70 => HandleDeref; // '*' (token 70)
+            _        => HandleOther;
+        }
+        HandleAddr: {
+            let sub_t = call get_expr_type(ctx, expr.left);
+            let b_ptr_start = alloc.base_ptr;
+            let off_ptr_start = alloc.offset;
+            let ptr_start = b_ptr_start + off_ptr_start;
+            let _ = call append_char_to_alloc(alloc, 42); // '*'
+            let _ = call append_str_to_alloc(alloc, sub_t, call strlen(sub_t));
+            let _ = call append_char_to_alloc(alloc, 0);
+            _ => return ptr_start;
+        }
+        HandleDeref: {
+            let sub_t = call get_expr_type(ctx, expr.left);
+            let c0_is_ptr = *sub_t;
+            let is_ptr = c0_is_ptr == 42;
+            is_ptr != 0 => StripStar [ sub_type <= sub_t ];
+            _           => ReturnI32;
+        }
+        StripStar: {
+            _ => return sub_type + 1;
+        }
+        ReturnI32: {
+            _ => return "i32";
+        }
+        HandleOther: {
+            let sub_t = call get_expr_type(ctx, expr.left);
+            _ => return sub_t;
+        }
+    }
+}
+
+machine get_field_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
+    flow {
+        reg base_type: *u8 = null;
+    }
+    states {
+        Entry: {
+            let bt = call get_expr_type(ctx, expr.left);
+            let c0_is_ptr = *bt;
+            let is_ptr = c0_is_ptr == 42;
+            is_ptr != 0 => FromPtrType [ base_type <= bt ];
+            _           => FromValType [ base_type <= bt ];
+        }
+        FromPtrType: {
+            let sname = base_type + 1;
+            let res = call find_struct_field_type(ctx.prog, ctx.alloc, sname, expr.str_ptr, expr.str_len);
+            _ => return res;
+        }
+        FromValType: {
+            let res = call find_struct_field_type(ctx.prog, ctx.alloc, base_type, expr.str_ptr, expr.str_len);
+            _ => return res;
+        }
+    }
+}
+
+machine find_struct_def(prog: *ProgramDef, sname_p: *u8, sname_l: u32) -> *TypeDef {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = prog.type_count;
+        wire has_more = i < cnt;
+        wire fld_t = prog.types;
+        wire cur_t = fld_t + i;
+        wire is_match = call str_eq(cur_t.name_ptr, cur_t.name_len, sname_p, sname_l);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return cur_t;
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine find_field_idx_in_type(t: *TypeDef, fname_p: *u8, fname_l: u32) -> i32 {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = t.field_count;
+        wire has_more = i < cnt;
+        wire fld_f = t.fields;
+        wire cur_f = fld_f + i;
+        wire is_match = call str_eq(cur_f.name_ptr, cur_f.name_len, fname_p, fname_l);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return cast(i32) i;
+        }
+        NotFound: {
+            _ => return -1;
+        }
+    }
+}
+
+machine find_field_in_type(alloc: *BumpAlloc, t: *TypeDef, fname_p: *u8, fname_l: u32) -> *u8 {
+    flow {
+        reg res: *u8 = "i32";
+    }
+    states {
+        Entry: {
+            let idx = call find_field_idx_in_type(t, fname_p, fname_l);
+            idx < 0 => Exit;
+            let u_idx = cast(u32) idx;
+            let fld_f = t.fields;
+            let f = fld_f + u_idx;
+            let s = call make_cstr(alloc, f.type_ptr, f.type_len);
+            _       => Exit [ res <= s ];
+        }
+        Exit: {
+            _ => return res;
+        }
+    }
+}
+
+machine find_struct_field_type(prog: *ProgramDef, alloc: *BumpAlloc, sname_p: *u8, fname_p: *u8, fname_l: u32) -> *u8 {
+    flow {
+        reg res: *u8 = "i32";
+    }
+    states {
+        Entry: {
+            let sl = call strlen(sname_p);
+            let t = call find_struct_def(prog, sname_p, sl);
+            t == null => Exit;
+            let r = call find_field_in_type(alloc, t, fname_p, fname_l);
+            _         => Exit [ res <= r ];
+        }
+        Exit: {
+            _ => return res;
+        }
+    }
+}
+
+machine find_func_ret_type(prog: *ProgramDef, alloc: *BumpAlloc, name_p: *u8, name_l: u32) -> *u8 {
+    flow {
+        wire ext = call find_extern_in_prog(prog, name_p, name_l);
+        wire mach = call find_machine_in_prog(prog, name_p, name_l);
+    }
+    states {
+        Entry: {
+            ext != null  => FromExt;
+            mach != null => FromMach;
+            _            => DefaultVoid;
+        }
+        FromExt: {
+            let res = call make_cstr(alloc, ext.ret_type_ptr, ext.ret_type_len);
+            _ => return res;
+        }
+        FromMach: {
+            let res = call make_cstr(alloc, mach.ret_type_ptr, mach.ret_type_len);
+            _ => return res;
+        }
+        DefaultVoid: {
+            _ => return "void";
+        }
+    }
+}
+
+machine is_pointer_add(left_type: *u8, op: u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            left_type == null => RetZero;
+            op != 71          => RetZero; // 71 is '+'
+            let c0 = *left_type;
+            c0 == 42          => RetOne;  // 42 is '*'
+            _                 => RetZero;
+        }
+        RetOne: {
+            _ => return 1;
+        }
+        RetZero: {
+            _ => return 0;
+        }
+    }
+}
+
+machine is_pointer_diff(left_type: *u8, right_type: *u8, op: u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            left_type == null  => RetZero;
+            right_type == null => RetZero;
+            op != 72           => RetZero; // 72 is '-'
+            let cl = *left_type;
+            cl != 42           => RetZero; // '*'
+            let cr = *right_type;
+            cr == 42           => RetOne;  // '*'
+            _                  => RetZero;
+        }
+        RetOne: {
+            _ => return 1;
+        }
+        RetZero: {
+            _ => return 0;
+        }
+    }
+}
+
+machine is_pointer_cmp(left_type: *u8, right_type: *u8, op: u32) -> u32 {
+    flow {
+        wire is_eq = op == 46;
+        wire is_ne = op == 47;
+        wire is_cmp = is_eq || is_ne;
+    }
+    states {
+        Entry: {
+            is_cmp == 0 => RetZero;
+            left_type != null => CheckLeft;
+            _                 => CheckRight;
+        }
+        CheckLeft: {
+            let cl = *left_type;
+            cl == 42 => RetOne;
+            _        => CheckRight;
+        }
+        CheckRight: {
+            right_type == null => RetZero;
+            let cr = *right_type;
+            cr == 42 => RetOne;
+            _        => RetZero;
+        }
+        RetOne: {
+            _ => return 1;
+        }
+        RetZero: {
+            _ => return 0;
+        }
+    }
+}
+
+machine is_i1_type(t: *u8) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            t == null => NoMatch;
+            let c0 = *t;
+            c0 != 105 => NoMatch; // 'i'
+            let p1 = t + 1;
+            let c1 = *p1;
+            c1 != 49  => NoMatch; // '1'
+            let p2 = t + 2;
+            let c2 = *p2;
+            c2 == 0   => Match;
+            _         => NoMatch;
+        }
+        Match:   { _ => return 1; }
+        NoMatch: { _ => return 0; }
+    }
+}
+
+machine is_type_small(t: *u8) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            t == null => RetZero;
+            let l = call strlen(t);
+            let is_i8 = call str_eq(t, l, "i8", 2);
+            is_i8 != 0 => RetOne;
+            let is_u8 = call str_eq(t, l, "u8", 2);
+            is_u8 != 0 => RetOne;
+            let is_i16 = call str_eq(t, l, "i16", 3);
+            is_i16 != 0 => RetOne;
+            let is_u16 = call str_eq(t, l, "u16", 3);
+            is_u16 != 0 => RetOne;
+            _ => RetZero;
+        }
+        RetOne:  { _ => return 1; }
+        RetZero: { _ => return 0; }
+    }
+}
+
+machine is_unsigned_type(t: *u8) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            t == null => RetZero;
+            let l = call strlen(t);
+            let is_u8 = call str_eq(t, l, "u8", 2);
+            is_u8 != 0 => RetOne;
+            let is_u16 = call str_eq(t, l, "u16", 3);
+            is_u16 != 0 => RetOne;
+            let is_u32 = call str_eq(t, l, "u32", 3);
+            is_u32 != 0 => RetOne;
+            let is_u64 = call str_eq(t, l, "u64", 3);
+            is_u64 != 0 => RetOne;
+            _ => RetZero;
+        }
+        RetOne:  { _ => return 1; }
+        RetZero: { _ => return 0; }
+    }
+}
+
+machine get_struct_field_idx(prog: *ProgramDef, sname_p: *u8, sname_l: u32, fname_p: *u8, fname_l: u32) -> i32 {
+    flow {
+        reg res: i32 = -1;
+    }
+    states {
+        Entry: {
+            let t = call find_struct_def(prog, sname_p, sname_l);
+            t == null => Exit;
+            let idx = call find_field_idx_in_type(t, fname_p, fname_l);
+            _       => Exit [ res <= idx ];
+        }
+        Exit: {
+            _ => return res;
+        }
+    }
+}
+
+machine get_struct_field_type_by_idx(prog: *ProgramDef, alloc: *BumpAlloc, sname_p: *u8, sname_l: u32, idx: u32) -> *u8 {
+    flow {
+        reg res: *u8 = "i32";
+    }
+    states {
+        Entry: {
+            let t = call find_struct_def(prog, sname_p, sname_l);
+            t == null => Exit;
+            let fc = t.field_count;
+            let has_fld = idx < fc;
+            has_fld == 0 => Exit;
+            let fld_f = t.fields;
+            let f = fld_f + idx;
+            let s = call make_cstr(alloc, f.type_ptr, f.type_len);
+            _            => Exit [ res <= s ];
+        }
+        Exit: {
+            _ => return res;
+        }
+    }
+}
+
+machine resolve_var_struct_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
+    flow {
+        reg sname: *u8 = null;
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            let stype = call get_expr_type(ctx, expr);
+            let c0_is_ptr = *stype;
+            let is_ptr = c0_is_ptr == 42;
+            is_ptr != 0 => BuildStructType [ sname <= stype + 1 ];
+            _           => BuildStructType [ sname <= stype ];
+        }
+        BuildStructType: {
+            let b_s_start = alloc.base_ptr;
+            let off_s_start = alloc.offset;
+            let s_start = b_s_start + off_s_start;
+            let _ = call append_str_to_alloc(alloc, "%struct.", 8);
+            let _ = call append_str_to_alloc(alloc, sname, call strlen(sname));
+            let _ = call append_char_to_alloc(alloc, 0);
+            _ => return s_start;
+        }
+    }
+}
+
+// ============================================================================
+// StateSSA Compiler: Expression Codegen & Instruction Lowering (emit_expr.ssa)
+// 式・二項演算・キャスト・構造体・関数呼び出しの LLVM IR 生成
+// ============================================================================
+
 
 machine emit_cast_op(ctx: *CodegenCtx, op_p: *u8, op_l: u32, src_t: *u8, src_l: u32, dst_t: *u8, dst_l: u32, val: *u8) -> *u8 {
     flow {}
@@ -1994,80 +2343,6 @@ machine emit_var(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     }
 }
 
-machine find_param_idx(m: *MachineDef, name_p: *u8, name_l: u32) -> i32 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = m.param_count;
-        wire has_more = i < cnt;
-        wire fld_p = m.params;
-        wire p = fld_p + i;
-        wire is_match = call str_eq(p.name_ptr, p.name_len, name_p, name_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => Found;
-            _             => Loop [ i <= i + 1 ];
-        }
-        Found: {
-            _ => return i;
-        }
-        NotFound: {
-            _ => return -1;
-        }
-    }
-}
-
-machine find_wire(m: *MachineDef, name_p: *u8, name_l: u32) -> *WireDef {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = m.wire_count;
-        wire has_more = i < cnt;
-        wire fld_w = m.wires;
-        wire w = fld_w + i;
-        wire is_match = call str_eq(w.name_ptr, w.name_len, name_p, name_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => Found;
-            _             => Loop [ i <= i + 1 ];
-        }
-        Found: {
-            _ => return w;
-        }
-        NotFound: {
-            _ => return null;
-        }
-    }
-}
-
-machine strlen(s: *u8) -> u32 {
-    flow {
-        reg i: u32 = 0;
-        wire ptr_c = s + i;
-        wire c = *ptr_c;
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            c == 0 => Exit;
-            _      => Loop [ i <= i + 1 ];
-        }
-        Exit: {
-            _ => return i;
-        }
-    }
-}
-
 machine emit_int_lit(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     flow {
         reg start_p: *u8 = null;
@@ -2117,536 +2392,6 @@ machine emit_string_lit(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     }
 }
 
-machine get_expr_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
-    flow {
-        reg m: *MachineDef = null;
-    }
-    states {
-        Entry: {
-            expr == null => ReturnVoid;
-            let m_cur = ctx.cur_machine;
-            let k = expr.kind;
-            k == 1 => ReturnI32;       // INT
-            k == 2 => ReturnU8Ptr;     // STR
-            k == 3 => ReturnVoidPtr;   // NULL
-            k == 4 => ResolveVar      [ m <= m_cur ]; // VAR
-            k == 5 => ResolveBinOp    [ m <= m_cur ]; // BINOP
-            k == 6 => ResolveUnOp     [ m <= m_cur ]; // UNOP
-            k == 7 => ResolveField    [ m <= m_cur ]; // FIELD
-            k == 8 => ResolveCall     [ m <= m_cur ]; // CALL
-            k == 9  => ResolveStruct   [ m <= m_cur ]; // STRUCT
-            k == 10 => ReturnCastType;                 // CAST
-            _       => ReturnI32;
-        }
-        ReturnVoid: {
-            _ => return "void";
-        }
-        ReturnI32: {
-            _ => return "i32";
-        }
-        ReturnU8Ptr: {
-            _ => return "*u8";
-        }
-        ReturnVoidPtr: {
-            _ => return "*void";
-        }
-        ResolveVar: {
-            let res = call get_var_type(ctx, m, expr.str_ptr, expr.str_len);
-            _ => return res;
-        }
-        ResolveBinOp: {
-            let res = call get_binop_type(ctx, expr);
-            _ => return res;
-        }
-        ResolveUnOp: {
-            let res = call get_unop_type(ctx, expr);
-            _ => return res;
-        }
-        ResolveField: {
-            let res = call get_field_type(ctx, expr);
-            _ => return res;
-        }
-        ResolveCall: {
-            let res = call find_func_ret_type(ctx.prog, ctx.alloc, expr.str_ptr, expr.str_len);
-            _ => return res;
-        }
-        ResolveStruct: {
-            let res = call make_cstr(ctx.alloc, expr.str_ptr, expr.str_len);
-            _ => return res;
-        }
-        ReturnCastType: {
-            let res = call make_cstr(ctx.alloc, expr.str_ptr, expr.str_len);
-            _ => return res;
-        }
-    }
-}
-
-machine find_let_var_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
-    flow {
-        reg cur_s:   *StateDef = null;
-        reg cur_act: *ActionStmt = null;
-    }
-    states {
-        Entry: {
-            m == null => NotFound;
-            _ => StateLoop [ cur_s <= m.state_defs ];
-        }
-        StateLoop: {
-            cur_s == null => NotFound;
-            _             => ActionLoop [ cur_act <= cur_s.actions ];
-        }
-        ActionLoop: {
-            cur_act == null => NextState;
-            _               => CheckAction;
-        }
-        CheckAction: {
-            let k = cur_act.kind;
-            k != 1 => NextAction; // 1: LET
-            let tp = cur_act.target_ptr;
-            tp == null => NextAction;
-            let tl = cur_act.target_len;
-            let is_match = call str_eq(tp, tl, name_p, name_l);
-            is_match != 0 => FoundTarget;
-            _             => NextAction;
-        }
-        FoundTarget: {
-            let t = call get_expr_type(ctx, cur_act.expr);
-            _ => return t;
-        }
-        NextAction: {
-            _ => ActionLoop [ cur_act <= cur_act.next ];
-        }
-        NextState: {
-            _ => StateLoop [ cur_s <= cur_s.next ];
-        }
-        NotFound: {
-            _ => return null;
-        }
-    }
-}
-
-machine get_var_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
-    flow {
-        reg res_type: *u8 = "i32";
-    }
-    states {
-        Entry: {
-            m == null => Exit;
-            let pt = call find_param_type(ctx, m, name_p, name_l);
-            pt != null => FoundParam [ res_type <= pt ];
-            let rt = call find_reg_type(ctx, m, name_p, name_l);
-            rt != null => FoundReg [ res_type <= rt ];
-            let wt = call find_wire_type(ctx, m, name_p, name_l);
-            wt != null => FoundWire [ res_type <= wt ];
-            let lt = call find_let_var_type(ctx, m, name_p, name_l);
-            lt != null => FoundLet [ res_type <= lt ];
-            _ => Exit;
-        }
-        FoundParam: {
-            _ => return res_type;
-        }
-        FoundReg: {
-            _ => return res_type;
-        }
-        FoundWire: {
-            _ => return res_type;
-        }
-        FoundLet: {
-            _ => return res_type;
-        }
-        Exit: {
-            _ => return res_type;
-        }
-    }
-}
-
-machine make_cstr(alloc: *BumpAlloc, ptr: *u8, len: u32) -> *u8 {
-    flow {}
-    states {
-        Entry: {
-            let b_start = alloc.base_ptr;
-            let off_start = alloc.offset;
-            let start = b_start + off_start;
-            let _ = call append_str_to_alloc(alloc, ptr, len);
-            let _ = call append_char_to_alloc(alloc, 0);
-            _ => return start;
-        }
-    }
-}
-
-machine find_param_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = m.param_count;
-        wire has_more = i < cnt;
-        wire fld_p = m.params;
-        wire p = fld_p + i;
-        wire is_match = call str_eq(p.name_ptr, p.name_len, name_p, name_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => Found;
-            _             => Loop [ i <= i + 1 ];
-        }
-        Found: {
-            let res = call make_cstr(ctx.alloc, p.type_ptr, p.type_len);
-            _ => return res;
-        }
-        NotFound: {
-            _ => return null;
-        }
-    }
-}
-
-machine find_reg_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = m.reg_count;
-        wire has_more = i < cnt;
-        wire fld_r = m.regs;
-        wire r = fld_r + i;
-        wire is_match = call str_eq(r.name_ptr, r.name_len, name_p, name_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => Found;
-            _             => Loop [ i <= i + 1 ];
-        }
-        Found: {
-            let res = call make_cstr(ctx.alloc, r.type_ptr, r.type_len);
-            _ => return res;
-        }
-        NotFound: {
-            _ => return null;
-        }
-    }
-}
-
-machine find_wire_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = m.wire_count;
-        wire has_more = i < cnt;
-        wire fld_w = m.wires;
-        wire w = fld_w + i;
-        wire is_match = call str_eq(w.name_ptr, w.name_len, name_p, name_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => Found;
-            _             => Loop [ i <= i + 1 ];
-        }
-        Found: {
-            let res = call get_expr_type(ctx, w.expr);
-            _ => return res;
-        }
-        NotFound: {
-            _ => return null;
-        }
-    }
-}
-
-machine get_binop_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
-    flow {
-        reg left_t: *u8 = "i32";
-        wire op = expr.op;
-    }
-    states {
-        Entry: {
-            op == 46 => ReturnI1; // ==
-            op == 47 => ReturnI1; // !=
-            op == 60 => ReturnI1; // <
-            op == 44 => ReturnI1; // <=
-            op == 61 => ReturnI1; // >
-            op == 48 => ReturnI1; // >=
-            op == 50 => ReturnI1; // &&
-            op == 49 => ReturnI1; // ||
-            op == 71 => CheckAdd; // +
-            _        => CheckArith;
-        }
-        ReturnI1: {
-            _ => return "i1";
-        }
-        CheckAdd: {
-            let lt = call get_expr_type(ctx, expr.left);
-            let c0_is_ptr = *lt;
-            let is_ptr = c0_is_ptr == 42;
-            is_ptr != 0 => ReturnLeft [ left_t <= lt ];
-            _           => CheckArith;
-        }
-        CheckArith: {
-            let lt = call get_expr_type(ctx, expr.left);
-            let is_l64 = call is_type_64(lt);
-            is_l64 != 0 => ReturnI64;
-            let rt = call get_expr_type(ctx, expr.right);
-            let is_r64 = call is_type_64(rt);
-            is_r64 != 0 => ReturnI64;
-            _           => ReturnI32;
-        }
-        ReturnLeft: {
-            _ => return left_t;
-        }
-        ReturnI64: {
-            _ => return "i64";
-        }
-        ReturnI32: {
-            _ => return "i32";
-        }
-    }
-}
-
-machine get_unop_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
-    flow {
-        reg sub_type: *u8 = "i32";
-        wire op = expr.op;
-        wire alloc = ctx.alloc;
-    }
-    states {
-        Entry: {
-            op == 62 => HandleAddr;  // '&' (token 62)
-            op == 70 => HandleDeref; // '*' (token 70)
-            _        => HandleOther;
-        }
-        HandleAddr: {
-            let sub_t = call get_expr_type(ctx, expr.left);
-            let b_ptr_start = alloc.base_ptr;
-            let off_ptr_start = alloc.offset;
-            let ptr_start = b_ptr_start + off_ptr_start;
-            let _ = call append_char_to_alloc(alloc, 42); // '*'
-            let _ = call append_str_to_alloc(alloc, sub_t, call strlen(sub_t));
-            let _ = call append_char_to_alloc(alloc, 0);
-            _ => return ptr_start;
-        }
-        HandleDeref: {
-            let sub_t = call get_expr_type(ctx, expr.left);
-            let c0_is_ptr = *sub_t;
-            let is_ptr = c0_is_ptr == 42;
-            is_ptr != 0 => StripStar [ sub_type <= sub_t ];
-            _           => ReturnI32;
-        }
-        StripStar: {
-            _ => return sub_type + 1;
-        }
-        ReturnI32: {
-            _ => return "i32";
-        }
-        HandleOther: {
-            let sub_t = call get_expr_type(ctx, expr.left);
-            _ => return sub_t;
-        }
-    }
-}
-
-machine get_field_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
-    flow {
-        reg base_type: *u8 = null;
-    }
-    states {
-        Entry: {
-            let bt = call get_expr_type(ctx, expr.left);
-            let c0_is_ptr = *bt;
-            let is_ptr = c0_is_ptr == 42;
-            is_ptr != 0 => FromPtrType [ base_type <= bt ];
-            _           => FromValType [ base_type <= bt ];
-        }
-        FromPtrType: {
-            let sname = base_type + 1;
-            let res = call find_struct_field_type(ctx.prog, ctx.alloc, sname, expr.str_ptr, expr.str_len);
-            _ => return res;
-        }
-        FromValType: {
-            let res = call find_struct_field_type(ctx.prog, ctx.alloc, base_type, expr.str_ptr, expr.str_len);
-            _ => return res;
-        }
-    }
-}
-
-machine find_struct_field_type(prog: *ProgramDef, alloc: *BumpAlloc, sname_p: *u8, fname_p: *u8, fname_l: u32) -> *u8 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = prog.type_count;
-        wire has_more = i < cnt;
-        wire fld_t = prog.types;
-        wire t = fld_t + i;
-        wire is_match = call str_eq(t.name_ptr, t.name_len, sname_p, call strlen(sname_p));
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => FoundType;
-            _             => Loop [ i <= i + 1 ];
-        }
-        FoundType: {
-            let res = call find_field_in_type(alloc, t, fname_p, fname_l);
-            _ => return res;
-        }
-        NotFound: {
-            _ => return "i32";
-        }
-    }
-}
-
-machine find_field_in_type(alloc: *BumpAlloc, t: *TypeDef, fname_p: *u8, fname_l: u32) -> *u8 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = t.field_count;
-        wire has_more = i < cnt;
-        wire fld_f = t.fields;
-        wire f = fld_f + i;
-        wire is_match = call str_eq(f.name_ptr, f.name_len, fname_p, fname_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => Found;
-            _             => Loop [ i <= i + 1 ];
-        }
-        Found: {
-            let res = call make_cstr(alloc, f.type_ptr, f.type_len);
-            _ => return res;
-        }
-        NotFound: {
-            _ => return "i32";
-        }
-    }
-}
-
-machine find_func_ret_type(prog: *ProgramDef, alloc: *BumpAlloc, name_p: *u8, name_l: u32) -> *u8 {
-    flow {
-        wire ext = call find_extern_in_prog(prog, name_p, name_l);
-        wire mach = call find_machine_in_prog(prog, name_p, name_l);
-    }
-    states {
-        Entry: {
-            ext != null  => FromExt;
-            mach != null => FromMach;
-            _            => DefaultVoid;
-        }
-        FromExt: {
-            let res = call make_cstr(alloc, ext.ret_type_ptr, ext.ret_type_len);
-            _ => return res;
-        }
-        FromMach: {
-            let res = call make_cstr(alloc, mach.ret_type_ptr, mach.ret_type_len);
-            _ => return res;
-        }
-        DefaultVoid: {
-            _ => return "void";
-        }
-    }
-}
-
-machine is_pointer_add(left_type: *u8, op: u32) -> u32 {
-    flow {}
-    states {
-        Entry: {
-            left_type == null => RetZero;
-            op != 71          => RetZero; // 71 is '+'
-            let c0 = *left_type;
-            c0 == 42          => RetOne;  // 42 is '*'
-            _                 => RetZero;
-        }
-        RetOne: {
-            _ => return 1;
-        }
-        RetZero: {
-            _ => return 0;
-        }
-    }
-}
-
-machine is_pointer_diff(left_type: *u8, right_type: *u8, op: u32) -> u32 {
-    flow {}
-    states {
-        Entry: {
-            left_type == null  => RetZero;
-            right_type == null => RetZero;
-            op != 72           => RetZero; // 72 is '-'
-            let cl = *left_type;
-            cl != 42           => RetZero; // '*'
-            let cr = *right_type;
-            cr == 42           => RetOne;  // '*'
-            _                  => RetZero;
-        }
-        RetOne: {
-            _ => return 1;
-        }
-        RetZero: {
-            _ => return 0;
-        }
-    }
-}
-
-machine is_pointer_cmp(left_type: *u8, right_type: *u8, op: u32) -> u32 {
-    flow {}
-    states {
-        Entry: {
-            op == 46 => CheckPtr; // '=='
-            op == 47 => CheckPtr; // '!='
-            _        => RetZero;
-        }
-        CheckPtr: {
-            left_type != null => CheckLeft;
-            _                 => CheckRight;
-        }
-        CheckLeft: {
-            let cl = *left_type;
-            cl == 42 => RetOne; // '*'
-            _        => CheckRight;
-        }
-        CheckRight: {
-            right_type == null => RetZero;
-            let cr = *right_type;
-            cr == 42 => RetOne; // '*'
-            _        => RetZero;
-        }
-        RetOne: {
-            _ => return 1;
-        }
-        RetZero: {
-            _ => return 0;
-        }
-    }
-}
-
-machine is_i1_type(t: *u8) -> u32 {
-    flow {}
-    states {
-        Entry: {
-            t == null => NoMatch;
-            let c0 = *t;
-            c0 != 105 => NoMatch; // 'i'
-            let p1 = t + 1;
-            let c1 = *p1;
-            c1 != 49  => NoMatch; // '1'
-            let p2 = t + 2;
-            let c2 = *p2;
-            c2 == 0   => Match;
-            _         => NoMatch;
-        }
-        Match:   { _ => return 1; }
-        NoMatch: { _ => return 0; }
-    }
-}
-
 machine emit_ptr_cmp_op(ctx: *CodegenCtx, op: u32) -> u32 {
     flow {}
     states {
@@ -2662,48 +2407,6 @@ machine emit_ptr_cmp_op(ctx: *CodegenCtx, op: u32) -> u32 {
             let _ = call emit_str(ctx, "ne ptr ", 7);
             _ => return 0;
         }
-    }
-}
-
-machine is_type_small(t: *u8) -> u32 {
-    flow {}
-    states {
-        Entry: {
-            t == null => RetZero;
-            let l = call strlen(t);
-            let is_i8 = call str_eq(t, l, "i8", 2);
-            is_i8 != 0 => RetOne;
-            let is_u8 = call str_eq(t, l, "u8", 2);
-            is_u8 != 0 => RetOne;
-            let is_i16 = call str_eq(t, l, "i16", 3);
-            is_i16 != 0 => RetOne;
-            let is_u16 = call str_eq(t, l, "u16", 3);
-            is_u16 != 0 => RetOne;
-            _ => RetZero;
-        }
-        RetOne:  { _ => return 1; }
-        RetZero: { _ => return 0; }
-    }
-}
-
-machine is_unsigned_type(t: *u8) -> u32 {
-    flow {}
-    states {
-        Entry: {
-            t == null => RetZero;
-            let l = call strlen(t);
-            let is_u8 = call str_eq(t, l, "u8", 2);
-            is_u8 != 0 => RetOne;
-            let is_u16 = call str_eq(t, l, "u16", 3);
-            is_u16 != 0 => RetOne;
-            let is_u32 = call str_eq(t, l, "u32", 3);
-            is_u32 != 0 => RetOne;
-            let is_u64 = call str_eq(t, l, "u64", 3);
-            is_u64 != 0 => RetOne;
-            _ => RetZero;
-        }
-        RetOne:  { _ => return 1; }
-        RetZero: { _ => return 0; }
     }
 }
 
@@ -2762,61 +2465,37 @@ machine emit_ext_to_type(ctx: *CodegenCtx, src_t: *u8, target_t: *u8, val: *u8) 
     }
 }
 
-machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
-    flow {
-        reg left_val:     *u8 = null;
-        reg right_val:    *u8 = null;
-        reg left_type_p:  *u8 = null;
-        reg right_type_p: *u8 = null;
-        reg op_mode_reg:  u32 = 0; // 0: i32, 1: i1, 2: i64, 3: u64, 4: u32
-        reg is_u_reg:     u32 = 0;
-        wire left_e = expr.left;
-        wire right_e = expr.right;
-        wire op = expr.op;
-    }
+machine emit_ptr_gep(ctx: *CodegenCtx, left_val: *u8, left_type_p: *u8, right_val: *u8) -> *u8 {
+    flow {}
     states {
         Entry: {
-            let lt = call get_expr_type(ctx, left_e);
-            let is_ptr_add = call is_pointer_add(lt, op);
-            is_ptr_add != 0 => EvalPtrArgs [ left_type_p <= lt ];
+            let res_var = call fresh_tmp_str(ctx, "gep", 3);
+            let elem_p = left_type_p + 1;
+            let elem_l = call strlen(elem_p);
+            let mapped_p = call map_type_ptr(ctx, elem_p, elem_l);
+            let mapped_l = call map_type_len(ctx, elem_p, elem_l);
 
-            let rt = call get_expr_type(ctx, right_e);
-            let is_ptr_diff = call is_pointer_diff(lt, rt, op);
-            is_ptr_diff != 0 => EvalPtrDiffArgs [ left_type_p <= lt, right_type_p <= rt ];
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, res_var, call strlen(res_var));
+            let _ = call emit_str(ctx, " = getelementptr inbounds ", 26);
+            let _ = call emit_str(ctx, mapped_p, mapped_l);
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, mapped_p, mapped_l);
+            let _ = call emit_str(ctx, "* ", 2);
+            let _ = call emit_str(ctx, left_val, call strlen(left_val));
+            let _ = call emit_str(ctx, ", i32 ", 6);
+            let _ = call emit_str(ctx, right_val, call strlen(right_val));
+            let _ = call emit_nl(ctx);
 
-            let is_ptr_cmp = call is_pointer_cmp(lt, rt, op);
-            is_ptr_cmp != 0 => EvalPtrCmpArgs;
-
-            let is_i1_l = call is_i1_type(lt);
-            let is_i1_r = call is_i1_type(rt);
-            let is_i1_op = is_i1_l | is_i1_r;
-            is_i1_op != 0 => EvalNormalArgs [ op_mode_reg <= 1, left_type_p <= lt, right_type_p <= rt ];
-
-            let is_i64_l = call is_type_64(lt);
-            let is_i64_r = call is_type_64(rt);
-            let is_i64_op = is_i64_l | is_i64_r;
-
-            let is_u_l = call is_unsigned_type(lt);
-            let is_u_r = call is_unsigned_type(rt);
-            let is_u_op = is_u_l | is_u_r;
-
-            is_i64_op != 0 => Mode64 [ is_u_reg <= is_u_op, left_type_p <= lt, right_type_p <= rt ];
-            _              => Mode32 [ is_u_reg <= is_u_op, left_type_p <= lt, right_type_p <= rt ];
+            _ => return res_var;
         }
-        Mode64: {
-            is_u_reg != 0 => EvalNormalArgs [ op_mode_reg <= 3 ]; // u64
-            _             => EvalNormalArgs [ op_mode_reg <= 2 ]; // i64
-        }
-        Mode32: {
-            is_u_reg != 0 => EvalNormalArgs [ op_mode_reg <= 4 ]; // u32
-            _             => EvalNormalArgs [ op_mode_reg <= 0 ]; // i32
-        }
-        EvalPtrDiffArgs: {
-            let lv = call emit_expr(ctx, left_e);
-            let rv = call emit_expr(ctx, right_e);
-            _ => EmitPtrDiff [ left_val <= lv, right_val <= rv ];
-        }
-        EmitPtrDiff: {
+    }
+}
+
+machine emit_ptr_diff(ctx: *CodegenCtx, left_val: *u8, left_type_p: *u8, right_val: *u8, right_type_p: *u8) -> *u8 {
+    flow {}
+    states {
+        Entry: {
             let t1 = call fresh_tmp_str(ctx, "p2i", 3);
             let t2 = call fresh_tmp_str(ctx, "p2i", 3);
             let res_var = call fresh_tmp_str(ctx, "diff", 4);
@@ -2857,12 +2536,13 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
 
             _ => return res_var;
         }
-        EvalPtrCmpArgs: {
-            let lv = call emit_expr(ctx, left_e);
-            let rv = call emit_expr(ctx, right_e);
-            _ => EmitPtrCmp [ left_val <= lv, right_val <= rv ];
-        }
-        EmitPtrCmp: {
+    }
+}
+
+machine emit_ptr_cmp(ctx: *CodegenCtx, left_val: *u8, right_val: *u8, op: u32) -> *u8 {
+    flow {}
+    states {
+        Entry: {
             let res_var = call fresh_tmp_str(ctx, "pcmp", 4);
             let _ = call emit_str(ctx, "  ", 2);
             let _ = call emit_str(ctx, res_var, call strlen(res_var));
@@ -2872,76 +2552,111 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let _ = call emit_nl(ctx);
             _ => return res_var;
         }
-        EvalPtrArgs: {
+    }
+}
+
+machine promote_bin_operand(ctx: *CodegenCtx, expr: *ExprNode, type_p: *u8, val: *u8, op_mode: u32) -> *u8 {
+    flow {
+        wire is_i1 = op_mode == 1;
+        wire is_lit = expr.kind == 1; // INT_LIT
+        wire skip = is_i1 || is_lit;
+        wire is_64 = (op_mode == 2) || (op_mode == 3);
+    }
+    states {
+        Entry: {
+            skip  => ReturnDirect;
+            is_64 => Promote64;
+            _     => Promote32;
+        }
+        ReturnDirect: {
+            _ => return val;
+        }
+        Promote64: {
+            let res = call emit_ext_to_type(ctx, type_p, "i64", val);
+            _ => return res;
+        }
+        Promote32: {
+            let res = call emit_ext_to_type(ctx, type_p, "i32", val);
+            _ => return res;
+        }
+    }
+}
+
+machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
+    flow {
+        reg left_val:     *u8 = null;
+        reg right_val:    *u8 = null;
+        reg left_type_p:  *u8 = null;
+        reg right_type_p: *u8 = null;
+        reg op_mode_reg:  u32 = 0; // 0: i32, 1: i1, 2: i64, 3: u64, 4: u32
+        reg is_case:      u32 = 0; // 1: gep, 2: diff, 3: cmp, 4: normal
+
+        wire left_e = expr.left;
+        wire right_e = expr.right;
+        wire op = expr.op;
+    }
+    states {
+        Entry: {
+            let lt = call get_expr_type(ctx, left_e);
+            let is_ptr_add = call is_pointer_add(lt, op);
+            is_ptr_add != 0 => EvalArgs [ is_case <= 1, left_type_p <= lt ];
+
+            let rt = call get_expr_type(ctx, right_e);
+            let is_ptr_diff = call is_pointer_diff(lt, rt, op);
+            is_ptr_diff != 0 => EvalArgs [ is_case <= 2, left_type_p <= lt, right_type_p <= rt ];
+
+            let is_ptr_cmp = call is_pointer_cmp(lt, rt, op);
+            is_ptr_cmp != 0 => EvalArgs [ is_case <= 3 ];
+
+            let is_i1_l = call is_i1_type(lt);
+            let is_i1_r = call is_i1_type(rt);
+            let is_i1_op = is_i1_l | is_i1_r;
+            is_i1_op != 0 => EvalArgs [ is_case <= 4, op_mode_reg <= 1, left_type_p <= lt, right_type_p <= rt ];
+
+            let is_i64_l = call is_type_64(lt);
+            let is_i64_r = call is_type_64(rt);
+            let is_i64_op = is_i64_l | is_i64_r;
+
+            let is_u_l = call is_unsigned_type(lt);
+            let is_u_r = call is_unsigned_type(rt);
+            let is_u_op = is_u_l | is_u_r;
+
+            let is_both = is_i64_op & is_u_op;
+            is_both != 0   => EvalArgs [ is_case <= 4, op_mode_reg <= 3, left_type_p <= lt, right_type_p <= rt ];
+            is_i64_op != 0 => EvalArgs [ is_case <= 4, op_mode_reg <= 2, left_type_p <= lt, right_type_p <= rt ];
+            is_u_op != 0   => EvalArgs [ is_case <= 4, op_mode_reg <= 4, left_type_p <= lt, right_type_p <= rt ];
+            _              => EvalArgs [ is_case <= 4, op_mode_reg <= 0, left_type_p <= lt, right_type_p <= rt ];
+        }
+        EvalArgs: {
             let lv = call emit_expr(ctx, left_e);
             let rv = call emit_expr(ctx, right_e);
-            _ => EmitGep [ left_val <= lv, right_val <= rv ];
+            is_case == 1 => EmitGep     [ left_val <= lv, right_val <= rv ];
+            is_case == 2 => EmitPtrDiff [ left_val <= lv, right_val <= rv ];
+            is_case == 3 => EmitPtrCmp  [ left_val <= lv, right_val <= rv ];
+            _            => EmitNormal  [ left_val <= lv, right_val <= rv ];
         }
         EmitGep: {
-            let res_var = call fresh_tmp_str(ctx, "gep", 3);
-            let elem_p = left_type_p + 1;
-            let elem_l = call strlen(elem_p);
-            let mapped_p = call map_type_ptr(ctx, elem_p, elem_l);
-            let mapped_l = call map_type_len(ctx, elem_p, elem_l);
+            let res = call emit_ptr_gep(ctx, left_val, left_type_p, right_val);
+            _ => return res;
+        }
+        EmitPtrDiff: {
+            let res = call emit_ptr_diff(ctx, left_val, left_type_p, right_val, right_type_p);
+            _ => return res;
+        }
+        EmitPtrCmp: {
+            let res = call emit_ptr_cmp(ctx, left_val, right_val, op);
+            _ => return res;
+        }
+        EmitNormal: {
+            let plv = call promote_bin_operand(ctx, left_e, left_type_p, left_val, op_mode_reg);
+            let prv = call promote_bin_operand(ctx, right_e, right_type_p, right_val, op_mode_reg);
 
-            let _ = call emit_str(ctx, "  ", 2);
-            let _ = call emit_str(ctx, res_var, call strlen(res_var));
-            let _ = call emit_str(ctx, " = getelementptr inbounds ", 26);
-            let _ = call emit_str(ctx, mapped_p, mapped_l);
-            let _ = call emit_str(ctx, ", ", 2);
-            let _ = call emit_str(ctx, mapped_p, mapped_l);
-            let _ = call emit_str(ctx, "* ", 2);
-            let _ = call emit_str(ctx, left_val, call strlen(left_val));
-            let _ = call emit_str(ctx, ", i32 ", 6);
-            let _ = call emit_str(ctx, right_val, call strlen(right_val));
-            let _ = call emit_nl(ctx);
-
-            _ => return res_var;
-        }
-        EvalNormalArgs: {
-            let lv = call emit_expr(ctx, left_e);
-            let rv = call emit_expr(ctx, right_e);
-            _ => CheckPromoteLeft [ left_val <= lv, right_val <= rv ];
-        }
-        CheckPromoteLeft: {
-            op_mode_reg == 1 => CheckPromoteRight;
-            let lk = left_e.kind;
-            lk == 1 => CheckPromoteRight;
-            op_mode_reg == 2 => PromoteLeft64;
-            op_mode_reg == 3 => PromoteLeft64;
-            _                => PromoteLeft32;
-        }
-        PromoteLeft32: {
-            let elv = call emit_ext_to_type(ctx, left_type_p, "i32", left_val);
-            _ => CheckPromoteRight [ left_val <= elv ];
-        }
-        PromoteLeft64: {
-            let elv = call emit_ext_to_type(ctx, left_type_p, "i64", left_val);
-            _ => CheckPromoteRight [ left_val <= elv ];
-        }
-        CheckPromoteRight: {
-            op_mode_reg == 1 => EmitNormalOp;
-            let rk = right_e.kind;
-            rk == 1 => EmitNormalOp;
-            op_mode_reg == 2 => PromoteRight64;
-            op_mode_reg == 3 => PromoteRight64;
-            _                => PromoteRight32;
-        }
-        PromoteRight32: {
-            let erv = call emit_ext_to_type(ctx, right_type_p, "i32", right_val);
-            _ => EmitNormalOp [ right_val <= erv ];
-        }
-        PromoteRight64: {
-            let erv = call emit_ext_to_type(ctx, right_type_p, "i64", right_val);
-            _ => EmitNormalOp [ right_val <= erv ];
-        }
-        EmitNormalOp: {
             let res_var = call fresh_tmp_str(ctx, "t", 1);
             let _ = call emit_str(ctx, "  ", 2);
             let _ = call emit_str(ctx, res_var, call strlen(res_var));
             let _ = call emit_str(ctx, " = ", 3);
 
-            let _ = call emit_bin_op_instruction(ctx, op, op_mode_reg, left_val, right_val);
+            let _ = call emit_bin_op_instruction(ctx, op, op_mode_reg, plv, prv);
             let _ = call emit_nl(ctx);
 
             _ => return res_var;
@@ -2950,333 +2665,71 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
 }
 
 machine emit_bin_op_instruction(ctx: *CodegenCtx, op: u32, op_mode: u32, left_val: *u8, right_val: *u8) -> u32 {
-    flow {}
+    flow {
+        reg op_p: *u8 = "add ";
+        reg op_l: u32 = 4;
+
+        wire is_u    = (op_mode == 3) || (op_mode == 4);
+        wire is_udiv = is_u && (op == 73);
+        wire is_ult  = is_u && (op == 60);
+        wire is_ule  = is_u && (op == 44);
+        wire is_ugt  = is_u && (op == 61);
+        wire is_uge  = is_u && (op == 48);
+    }
     states {
         Entry: {
-            op_mode == 1 => BranchI1;
-            op_mode == 2 => BranchI64;
-            op_mode == 3 => BranchU64;
-            op_mode == 4 => BranchU32;
-            _            => BranchI32;
+            is_udiv  => Emit [ op_p <= "udiv ",     op_l <= 5 ];
+            is_ult   => Emit [ op_p <= "icmp ult ", op_l <= 9 ];
+            is_ule   => Emit [ op_p <= "icmp ule ", op_l <= 9 ];
+            is_ugt   => Emit [ op_p <= "icmp ugt ", op_l <= 9 ];
+            is_uge   => Emit [ op_p <= "icmp uge ", op_l <= 9 ];
+            op == 73 => Emit [ op_p <= "sdiv ",     op_l <= 5 ];
+            op == 60 => Emit [ op_p <= "icmp slt ", op_l <= 9 ];
+            op == 44 => Emit [ op_p <= "icmp sle ", op_l <= 9 ];
+            op == 61 => Emit [ op_p <= "icmp sgt ", op_l <= 9 ];
+            op == 48 => Emit [ op_p <= "icmp sge ", op_l <= 9 ];
+            op == 71 => Emit;
+            op == 72 => Emit [ op_p <= "sub ",      op_l <= 4 ];
+            op == 70 => Emit [ op_p <= "mul ",      op_l <= 4 ];
+            op == 62 => Emit [ op_p <= "and ",      op_l <= 4 ];
+            op == 63 => Emit [ op_p <= "or ",       op_l <= 3 ];
+            op == 64 => Emit [ op_p <= "xor ",      op_l <= 4 ];
+            op == 40 => Emit [ op_p <= "shl ",      op_l <= 4 ];
+            op == 41 => Emit [ op_p <= "lshr ",     op_l <= 5 ];
+            op == 50 => Emit [ op_p <= "and ",      op_l <= 4 ];
+            op == 49 => Emit [ op_p <= "or ",       op_l <= 3 ];
+            op == 46 => Emit [ op_p <= "icmp eq ",  op_l <= 8 ];
+            op == 47 => Emit [ op_p <= "icmp ne ",  op_l <= 8 ];
+            _        => Emit;
         }
-        BranchI1: {
-            op == 46 => EmitEqI1; // EQ '=='
-            op == 47 => EmitNeI1; // NEQ '!='
-            op == 50 => EmitAnd;  // AND '&&'
-            op == 49 => EmitOr;   // OR '||'
-            _        => EmitNeI1;
-        }
-        EmitEqI1: {
-            let _ = call emit_str(ctx, "icmp eq i1 ", 11);
+        Emit: {
+            let _ = call emit_str(ctx, op_p, op_l);
+            let _ = call emit_bin_op_type(ctx, op, op_mode);
             let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
+            _ => return 0;
         }
-        EmitNeI1: {
-            let _ = call emit_str(ctx, "icmp ne i1 ", 11);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
+    }
+}
+
+machine emit_bin_op_type(ctx: *CodegenCtx, op: u32, op_mode: u32) -> u32 {
+    flow {
+        reg type_p: *u8 = "i32 ";
+        reg type_l: u32 = 4;
+
+        wire is_64        = (op_mode == 2) || (op_mode == 3);
+        wire is_i1        = op_mode == 1;
+        wire is_log       = (op == 50) || (op == 49);
+        wire not_64       = is_64 == 0;
+        wire is_i1_target = is_i1 || (is_log && not_64);
+    }
+    states {
+        Entry: {
+            is_i1_target => Emit [ type_p <= "i1 ",  type_l <= 3 ];
+            is_64        => Emit [ type_p <= "i64 ", type_l <= 4 ];
+            _            => Emit;
         }
-        BranchI64: {
-            op == 71 => EmitAdd64; // PLUS '+'
-            op == 72 => EmitSub64; // MINUS '-'
-            op == 70 => EmitMul64; // STAR '*'
-            op == 73 => EmitDiv64; // SLASH '/'
-            op == 62 => EmitBitAnd64; // BIT_AND '&'
-            op == 63 => EmitBitOr64;  // BIT_OR '|'
-            op == 64 => EmitBitXor64; // BIT_XOR '^'
-            op == 40 => EmitShl64;    // SHL '<<'
-            op == 41 => EmitShr64;    // SHR '>>'
-            op == 46 => EmitEq64;  // EQ '=='
-            op == 47 => EmitNe64;  // NEQ '!='
-            op == 60 => EmitLt64;  // LT '<'
-            op == 44 => EmitLe64;  // LEQ '<='
-            op == 61 => EmitGt64;  // GT '>'
-            op == 48 => EmitGe64;  // GEQ '>='
-            op == 50 => EmitAnd64; // AND '&&'
-            op == 49 => EmitOr64;  // OR '||'
-            _        => EmitAdd64;
-        }
-        EmitAdd64: {
-            let _ = call emit_str(ctx, "add i64 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitSub64: {
-            let _ = call emit_str(ctx, "sub i64 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitMul64: {
-            let _ = call emit_str(ctx, "mul i64 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitDiv64: {
-            let _ = call emit_str(ctx, "sdiv i64 ", 9);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitBitAnd64: {
-            let _ = call emit_str(ctx, "and i64 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitBitOr64: {
-            let _ = call emit_str(ctx, "or i64 ", 7);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitBitXor64: {
-            let _ = call emit_str(ctx, "xor i64 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitShl64: {
-            let _ = call emit_str(ctx, "shl i64 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitShr64: {
-            let _ = call emit_str(ctx, "lshr i64 ", 9);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitEq64: {
-            let _ = call emit_str(ctx, "icmp eq i64 ", 12);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitNe64: {
-            let _ = call emit_str(ctx, "icmp ne i64 ", 12);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitLt64: {
-            let _ = call emit_str(ctx, "icmp slt i64 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitLe64: {
-            let _ = call emit_str(ctx, "icmp sle i64 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitGt64: {
-            let _ = call emit_str(ctx, "icmp sgt i64 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitGe64: {
-            let _ = call emit_str(ctx, "icmp sge i64 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitAnd64: {
-            let _ = call emit_str(ctx, "and i64 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitOr64: {
-            let _ = call emit_str(ctx, "or i64 ", 7);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        BranchI32: {
-            op == 71 => EmitAdd; // PLUS '+'
-            op == 72 => EmitSub; // MINUS '-'
-            op == 70 => EmitMul; // STAR '*'
-            op == 73 => EmitDiv; // SLASH '/'
-            op == 62 => EmitBitAnd; // BIT_AND '&'
-            op == 63 => EmitBitOr;  // BIT_OR '|'
-            op == 64 => EmitBitXor; // BIT_XOR '^'
-            op == 40 => EmitShl;    // SHL '<<'
-            op == 41 => EmitShr;    // SHR '>>'
-            op == 46 => EmitEq;  // EQ '=='
-            op == 47 => EmitNe;  // NEQ '!='
-            op == 60 => EmitLt;  // LT '<'
-            op == 44 => EmitLe;  // LEQ '<='
-            op == 61 => EmitGt;  // GT '>'
-            op == 48 => EmitGe;  // GEQ '>='
-            op == 50 => EmitAnd; // AND '&&'
-            op == 49 => EmitOr;  // OR '||'
-            _        => EmitAdd;
-        }
-        EmitAdd: {
-            let _ = call emit_str(ctx, "add i32 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitSub: {
-            let _ = call emit_str(ctx, "sub i32 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitMul: {
-            let _ = call emit_str(ctx, "mul i32 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitDiv: {
-            let _ = call emit_str(ctx, "sdiv i32 ", 9);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitBitAnd: {
-            let _ = call emit_str(ctx, "and i32 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitBitOr: {
-            let _ = call emit_str(ctx, "or i32 ", 7);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitBitXor: {
-            let _ = call emit_str(ctx, "xor i32 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitShl: {
-            let _ = call emit_str(ctx, "shl i32 ", 8);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitShr: {
-            let _ = call emit_str(ctx, "lshr i32 ", 9);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitEq: {
-            let _ = call emit_str(ctx, "icmp eq i32 ", 12);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitNe: {
-            let _ = call emit_str(ctx, "icmp ne i32 ", 12);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitLt: {
-            let _ = call emit_str(ctx, "icmp slt i32 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitLe: {
-            let _ = call emit_str(ctx, "icmp sle i32 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitGt: {
-            let _ = call emit_str(ctx, "icmp sgt i32 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitGe: {
-            let _ = call emit_str(ctx, "icmp sge i32 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitAnd: {
-            let _ = call emit_str(ctx, "and i1 ", 7);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitOr: {
-            let _ = call emit_str(ctx, "or i1 ", 6);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        BranchU32: {
-            op == 71 => EmitAdd; // PLUS '+'
-            op == 72 => EmitSub; // MINUS '-'
-            op == 70 => EmitMul; // STAR '*'
-            op == 73 => EmitUDiv; // SLASH '/'
-            op == 62 => EmitBitAnd; // BIT_AND '&'
-            op == 63 => EmitBitOr;  // BIT_OR '|'
-            op == 64 => EmitBitXor; // BIT_XOR '^'
-            op == 40 => EmitShl;    // SHL '<<'
-            op == 41 => EmitShr;    // SHR '>>'
-            op == 46 => EmitEq;  // EQ '=='
-            op == 47 => EmitNe;  // NEQ '!='
-            op == 60 => EmitULt; // LT '<'
-            op == 44 => EmitULe; // LEQ '<='
-            op == 61 => EmitUGt; // GT '>'
-            op == 48 => EmitUGe; // GEQ '>='
-            op == 50 => EmitAnd; // AND '&&'
-            op == 49 => EmitOr;  // OR '||'
-            _        => EmitAdd;
-        }
-        EmitUDiv: {
-            let _ = call emit_str(ctx, "udiv i32 ", 9);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitULt: {
-            let _ = call emit_str(ctx, "icmp ult i32 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitULe: {
-            let _ = call emit_str(ctx, "icmp ule i32 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitUGt: {
-            let _ = call emit_str(ctx, "icmp ugt i32 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitUGe: {
-            let _ = call emit_str(ctx, "icmp uge i32 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        BranchU64: {
-            op == 71 => EmitAdd64; // PLUS '+'
-            op == 72 => EmitSub64; // MINUS '-'
-            op == 70 => EmitMul64; // STAR '*'
-            op == 73 => EmitUDiv64; // SLASH '/'
-            op == 62 => EmitBitAnd64; // BIT_AND '&'
-            op == 63 => EmitBitOr64;  // BIT_OR '|'
-            op == 64 => EmitBitXor64; // BIT_XOR '^'
-            op == 40 => EmitShl64;    // SHL '<<'
-            op == 41 => EmitShr64;    // SHR '>>'
-            op == 46 => EmitEq64;  // EQ '=='
-            op == 47 => EmitNe64;  // NEQ '!='
-            op == 60 => EmitULt64; // LT '<'
-            op == 44 => EmitULe64; // LEQ '<='
-            op == 61 => EmitUGt64; // GT '>'
-            op == 48 => EmitUGe64; // GEQ '>='
-            op == 50 => EmitAnd64; // AND '&&'
-            op == 49 => EmitOr64;  // OR '||'
-            _        => EmitAdd64;
-        }
-        EmitUDiv64: {
-            let _ = call emit_str(ctx, "udiv i64 ", 9);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitULt64: {
-            let _ = call emit_str(ctx, "icmp ult i64 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitULe64: {
-            let _ = call emit_str(ctx, "icmp ule i64 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitUGt64: {
-            let _ = call emit_str(ctx, "icmp ugt i64 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        EmitUGe64: {
-            let _ = call emit_str(ctx, "icmp uge i64 ", 13);
-            let _ = call emit_operands(ctx, left_val, right_val);
-            _ => Exit;
-        }
-        Exit: {
+        Emit: {
+            let _ = call emit_str(ctx, type_p, type_l);
             _ => return 0;
         }
     }
@@ -3294,40 +2747,26 @@ machine emit_operands(ctx: *CodegenCtx, left: *u8, right: *u8) -> u32 {
     }
 }
 
-machine emit_un_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
+machine emit_deref_expr(ctx: *CodegenCtx, sub_e: *ExprNode) -> *u8 {
     flow {
-        reg m_target: *MachineDef = null;
-        reg ptr_type_str: *u8 = null;
-        reg deref_val: *u8 = null;
-        reg mapped_type_p: *u8 = null;
-        reg mapped_type_l: u32 = 0;
-        reg raw_load: *u8 = null;
-        wire op = expr.op;
-        wire sub_e = expr.left;
+        reg mapped_type_p: *u8 = "i32";
+        reg mapped_type_l: u32 = 3;
+        reg deref_val:     *u8 = null;
     }
     states {
         Entry: {
-            op == 70 => EmitDeref; // '*' (token 70)
-            op == 62 => EmitAddr;  // '&' (token 62)
-            _        => ReturnSub;
-        }
-        EmitDeref: {
             let ptr_val = call emit_expr(ctx, sub_e);
             let ptr_t = call get_expr_type(ctx, sub_e);
             let c0_is_ptr = *ptr_t;
             let is_ptr = c0_is_ptr == 42;
-            is_ptr != 0 => DerefPtrType [ ptr_type_str <= ptr_t, deref_val <= ptr_val ];
-            _           => DerefI32Type [ ptr_type_str <= "i32", deref_val <= ptr_val ];
+            is_ptr != 0 => ResolveElemType [ deref_val <= ptr_val, mapped_type_p <= ptr_t + 1 ];
+            _           => DoLoad          [ deref_val <= ptr_val ];
         }
-        DerefPtrType: {
-            let elem_p = ptr_type_str + 1;
-            let elem_l = call strlen(elem_p);
-            let mapped_p = call map_type_ptr(ctx, elem_p, elem_l);
-            let mapped_l = call map_type_len(ctx, elem_p, elem_l);
+        ResolveElemType: {
+            let elem_l = call strlen(mapped_type_p);
+            let mapped_p = call map_type_ptr(ctx, mapped_type_p, elem_l);
+            let mapped_l = call map_type_len(ctx, mapped_type_p, elem_l);
             _ => DoLoad [ mapped_type_p <= mapped_p, mapped_type_l <= mapped_l ];
-        }
-        DerefI32Type: {
-            _ => DoLoad [ mapped_type_p <= "i32", mapped_type_l <= 3 ];
         }
         DoLoad: {
             let res_var = call fresh_tmp_str(ctx, "load", 4);
@@ -3342,7 +2781,15 @@ machine emit_un_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let _ = call emit_nl(ctx);
             _ => return res_var;
         }
-        EmitAddr: {
+    }
+}
+
+machine emit_addr_expr(ctx: *CodegenCtx, sub_e: *ExprNode) -> *u8 {
+    flow {
+        reg m_target: *MachineDef = null;
+    }
+    states {
+        Entry: {
             let sk = sub_e.kind;
             sk == 7 => EmitFieldAddr; // sub_e is FieldExpr (&obj.field)
 
@@ -3408,195 +2855,31 @@ machine emit_un_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
 
             _ => return cast_res;
         }
+    }
+}
+
+machine emit_un_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
+    flow {
+        wire op = expr.op;
+        wire sub_e = expr.left;
+    }
+    states {
+        Entry: {
+            op == 70 => EmitDeref; // '*' (token 70)
+            op == 62 => EmitAddr;  // '&' (token 62)
+            _        => ReturnSub;
+        }
+        EmitDeref: {
+            let res = call emit_deref_expr(ctx, sub_e);
+            _ => return res;
+        }
+        EmitAddr: {
+            let res = call emit_addr_expr(ctx, sub_e);
+            _ => return res;
+        }
         ReturnSub: {
             let res = call emit_expr(ctx, sub_e);
             _ => return res;
-        }
-    }
-}
-
-machine find_machine_in_prog(prog: *ProgramDef, name_p: *u8, name_l: u32) -> *MachineDef {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = prog.machine_count;
-        wire has_more = i < cnt;
-        wire fld_m = prog.machines;
-        wire m = fld_m + i;
-        wire is_match = call str_eq(m.name_ptr, m.name_len, name_p, name_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => Found;
-            _             => Loop [ i <= i + 1 ];
-        }
-        Found: {
-            _ => return m;
-        }
-        NotFound: {
-            _ => return null;
-        }
-    }
-}
-
-machine emit_machine_param_types(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = m.param_count;
-        wire has_more = i < cnt;
-        wire fld_p = m.params;
-        wire p = fld_p + i;
-        wire is_first = i == 0;
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more != 0 => EmitOne;
-            _             => Exit;
-        }
-        EmitOne: {
-            is_first == 0 => EmitComma;
-            _             => EmitType;
-        }
-        EmitComma: {
-            let _ = call emit_str(ctx, ", ", 2);
-            _ => EmitType;
-        }
-        EmitType: {
-            let mapped_p = call map_type_ptr(ctx, p.type_ptr, p.type_len);
-            let mapped_l = call map_type_len(ctx, p.type_ptr, p.type_len);
-            let _ = call emit_str(ctx, mapped_p, mapped_l);
-            _ => Loop [ i <= i + 1 ];
-        }
-        Exit: {
-            _ => return 0;
-        }
-    }
-}
-
-machine get_struct_field_idx(prog: *ProgramDef, sname_p: *u8, sname_l: u32, fname_p: *u8, fname_l: u32) -> i32 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = prog.type_count;
-        wire has_more = i < cnt;
-        wire fld_t = prog.types;
-        wire t = fld_t + i;
-        wire is_match = call str_eq(t.name_ptr, t.name_len, sname_p, sname_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => FoundType;
-            _             => Loop [ i <= i + 1 ];
-        }
-        FoundType: {
-            let res = call find_field_idx_in_type(t, fname_p, fname_l);
-            _ => return res;
-        }
-        NotFound: {
-            _ => return -1;
-        }
-    }
-}
-
-machine find_field_idx_in_type(t: *TypeDef, fname_p: *u8, fname_l: u32) -> i32 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = t.field_count;
-        wire has_more = i < cnt;
-        wire fld_f = t.fields;
-        wire f = fld_f + i;
-        wire is_match = call str_eq(f.name_ptr, f.name_len, fname_p, fname_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => Found;
-            _             => Loop [ i <= i + 1 ];
-        }
-        Found: {
-            _ => return i;
-        }
-        NotFound: {
-            _ => return -1;
-        }
-    }
-}
-
-machine get_struct_field_type_by_idx(prog: *ProgramDef, alloc: *BumpAlloc, sname_p: *u8, sname_l: u32, idx: u32) -> *u8 {
-    flow {
-        reg i: u32 = 0;
-        wire cnt = prog.type_count;
-        wire has_more = i < cnt;
-        wire fld_t = prog.types;
-        wire t = fld_t + i;
-        wire is_match = call str_eq(t.name_ptr, t.name_len, sname_p, sname_l);
-    }
-    states {
-        Entry: {
-            _ => Loop [ i <= 0 ];
-        }
-        Loop: {
-            has_more == 0 => NotFound;
-            is_match != 0 => FoundType;
-            _             => Loop [ i <= i + 1 ];
-        }
-        FoundType: {
-            let fc = t.field_count;
-            let has_fld = idx < fc;
-            has_fld != 0 => GetField;
-            _                   => NotFound;
-        }
-        GetField: {
-            let fld_f = t.fields;
-            let f = fld_f + idx;
-            let res = call make_cstr(alloc, f.type_ptr, f.type_len);
-            _ => return res;
-        }
-        NotFound: {
-            _ => return "i32";
-        }
-    }
-}
-
-machine resolve_var_struct_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
-    flow {
-        reg sname: *u8 = null;
-        wire alloc = ctx.alloc;
-    }
-    states {
-        Entry: {
-            let stype = call get_expr_type(ctx, expr);
-            let c0_is_ptr = *stype;
-            let is_ptr = c0_is_ptr == 42;
-            is_ptr != 0 => StripPtr [ sname <= stype + 1 ];
-            _           => DirectName [ sname <= stype ];
-        }
-        StripPtr: {
-            _ => BuildStructType;
-        }
-        DirectName: {
-            _ => BuildStructType;
-        }
-        BuildStructType: {
-            let b_s_start = alloc.base_ptr;
-            let off_s_start = alloc.offset;
-            let s_start = b_s_start + off_s_start;
-            let _ = call append_str_to_alloc(alloc, "%struct.", 8);
-            let _ = call append_str_to_alloc(alloc, sname, call strlen(sname));
-            let _ = call append_char_to_alloc(alloc, 0);
-            _ => return s_start;
         }
     }
 }
@@ -3993,33 +3276,213 @@ machine get_param_type_len(ctx: *CodegenCtx, params: *MachineParam, param_cnt: u
     }
 }
 
-// ----------------------------------------------------------------------------
-// 9. マシン生成 (codegen.py gen_machine)
-// ----------------------------------------------------------------------------
+machine coerce_store_val(ctx: *CodegenCtx, val_str: *u8, val_llvm_p: *u8, val_llvm_l: u32, dst_type_p: *u8, dst_type_l: u32) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            let is_null = call str_eq(val_str, call strlen(val_str), "null", 4);
+            is_null != 0 => ReturnDirect;
+            let is_same = call str_eq(dst_type_p, dst_type_l, val_llvm_p, val_llvm_l);
+            is_same != 0 => ReturnDirect;
+            let is_i8 = call str_eq(dst_type_p, dst_type_l, "i8", 2);
+            is_i8 != 0   => DoTrunc;
+            let is_i16 = call str_eq(dst_type_p, dst_type_l, "i16", 3);
+            is_i16 != 0  => DoTrunc;
 
-machine emit_all_machines(ctx: *CodegenCtx) -> u32 {
+            // ポインタ同士の型不一致か？
+            let dst_last_ptr = dst_type_p + (dst_type_l - 1);
+            let dst_last = *dst_last_ptr;
+            let val_last_ptr = val_llvm_p + (val_llvm_l - 1);
+            let val_last = *val_last_ptr;
+            let both_ptr = (dst_last == 42) && (val_last == 42);
+            both_ptr => DoBitcast;
+            _        => ReturnDirect;
+        }
+        ReturnDirect: {
+            _ => return val_str;
+        }
+        DoTrunc: {
+            let tr_val = call fresh_tmp_str(ctx, "trunc", 5);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, tr_val, call strlen(tr_val));
+            let _ = call emit_str(ctx, " = trunc ", 9);
+            let _ = call emit_str(ctx, val_llvm_p, val_llvm_l);
+            let _ = call emit_str(ctx, " ", 1);
+            let _ = call emit_str(ctx, val_str, call strlen(val_str));
+            let _ = call emit_str(ctx, " to ", 4);
+            let _ = call emit_str(ctx, dst_type_p, dst_type_l);
+            let _ = call emit_nl(ctx);
+            _ => return tr_val;
+        }
+        DoBitcast: {
+            let bc_val = call fresh_tmp_str(ctx, "bitcast", 7);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, bc_val, call strlen(bc_val));
+            let _ = call emit_str(ctx, " = bitcast ", 11);
+            let _ = call emit_str(ctx, val_llvm_p, val_llvm_l);
+            let _ = call emit_str(ctx, " ", 1);
+            let _ = call emit_str(ctx, val_str, call strlen(val_str));
+            let _ = call emit_str(ctx, " to ", 4);
+            let _ = call emit_str(ctx, dst_type_p, dst_type_l);
+            let _ = call emit_nl(ctx);
+            _ => return bc_val;
+        }
+    }
+}
+
+machine emit_store(ctx: *CodegenCtx, target: *ExprNode, expr: *ExprNode) -> u32 {
     flow {
-        reg m_idx: u32 = 0;
-        wire prog = ctx.prog;
-        wire cnt = prog.machine_count;
-        wire has_more = m_idx < cnt;
-        wire fld_m = prog.machines;
-        wire m = fld_m + m_idx;
+        reg val_str:    *u8 = null;
+        reg val_type:   *u8 = null;
+        reg val_llvm_p: *u8 = null;
+        reg val_llvm_l: u32 = 0;
+        reg dst_ptr:    *u8 = null;
+        reg dst_type_p: *u8 = null;
+        reg dst_type_l: u32 = 0;
+
+        reg sname:      *u8 = null;
     }
     states {
         Entry: {
-            _ => Loop [ m_idx <= 0 ];
+            target == null => Exit;
+            let v = call emit_expr(ctx, expr);
+            let vt = call get_expr_type(ctx, expr);
+            let vt_l = call strlen(vt);
+            let v_lp = call map_type_ptr(ctx, vt, vt_l);
+            let v_ll = call map_type_len(ctx, vt, vt_l);
+
+            let tk = target.kind;
+            tk == 7 => FieldStore [ val_str <= v, val_type <= vt, val_llvm_p <= v_lp, val_llvm_l <= v_ll ];
+            tk == 6 => CheckUnary [ val_str <= v, val_type <= vt, val_llvm_p <= v_lp, val_llvm_l <= v_ll ];
+            _       => Exit;
+        }
+
+        CheckUnary: {
+            let op = target.op;
+            op == 70 => UnaryStore; // '*' (TOK_STAR = 70)
+            _        => Exit;
+        }
+
+        FieldStore: {
+            let gep_val = call emit_field_ptr(ctx, target);
+            let base_e = target.left;
+            let bt = call get_expr_type(ctx, base_e);
+            let c0 = *bt;
+            c0 == 42 => ResolveFldType [ sname <= bt + 1, dst_ptr <= gep_val ];
+            _        => ResolveFldType [ sname <= bt,     dst_ptr <= gep_val ];
+        }
+
+        ResolveFldType: {
+            let raw_ftype = call find_struct_field_type(ctx.prog, ctx.alloc, sname, target.str_ptr, target.str_len);
+            let raw_flen = call strlen(raw_ftype);
+            let mapped_p = call map_type_ptr(ctx, raw_ftype, raw_flen);
+            let mapped_l = call map_type_len(ctx, raw_ftype, raw_flen);
+            _ => DoStoreCheck [ dst_type_p <= mapped_p, dst_type_l <= mapped_l ];
+        }
+
+        UnaryStore: {
+            let ptr_e = target.left;
+            let ptr_v = call emit_expr(ctx, ptr_e);
+            let ptr_t = call get_expr_type(ctx, ptr_e);
+            let elem_t = ptr_t + 1;
+            let elem_l = call strlen(elem_t);
+            let mapped_p = call map_type_ptr(ctx, elem_t, elem_l);
+            let mapped_l = call map_type_len(ctx, elem_t, elem_l);
+
+            _ => DoStoreCheck [ dst_ptr <= ptr_v, dst_type_p <= mapped_p, dst_type_l <= mapped_l ];
+        }
+
+        DoStoreCheck: {
+            let vt_len = call strlen(val_type);
+            let _ = call validate_type(ctx, 2, target.str_ptr, target.str_len, 0, dst_type_p, dst_type_l, val_type, vt_len, expr);
+            let fv = call coerce_store_val(ctx, val_str, val_llvm_p, val_llvm_l, dst_type_p, dst_type_l);
+
+            let _ = call emit_str(ctx, "  store ", 8);
+            let _ = call emit_str(ctx, dst_type_p, dst_type_l);
+            let _ = call emit_str(ctx, " ", 1);
+            let _ = call emit_str(ctx, fv, call strlen(fv));
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, dst_type_p, dst_type_l);
+            let _ = call emit_str(ctx, "* ", 2);
+            let _ = call emit_str(ctx, dst_ptr, call strlen(dst_ptr));
+            let _ = call emit_nl(ctx);
+            _ => Exit;
+        }
+
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
+// ============================================================================
+// StateSSA Compiler: FSM Topology & Phi Junction Engine (emit_fsm.ssa)
+// マシン・状態ノード・遷移エッジ・レジスタラッチ・Phi結合の調停
+// ============================================================================
+
+
+
+
+machine find_machine_in_prog(prog: *ProgramDef, name_p: *u8, name_l: u32) -> *MachineDef {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = prog.machine_count;
+        wire has_more = i < cnt;
+        wire fld_m = prog.machines;
+        wire m = fld_m + i;
+        wire is_match = call str_eq(m.name_ptr, m.name_len, name_p, name_l);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
         }
         Loop: {
-            has_more != 0 => ProcessOne;
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return m;
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine emit_machine_param_types(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = m.param_count;
+        wire has_more = i < cnt;
+        wire fld_p = m.params;
+        wire p = fld_p + i;
+        wire is_first = i == 0;
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => EmitOne;
             _             => Exit;
         }
-        ProcessOne: {
-            let _ = call emit_machine(ctx, m);
-            _ => Loop [ m_idx <= m_idx + 1 ];
+        EmitOne: {
+            is_first == 0 => EmitComma;
+            _             => EmitType;
+        }
+        EmitComma: {
+            let _ = call emit_str(ctx, ", ", 2);
+            _ => EmitType;
+        }
+        EmitType: {
+            let mapped_p = call map_type_ptr(ctx, p.type_ptr, p.type_len);
+            let mapped_l = call map_type_len(ctx, p.type_ptr, p.type_len);
+            let _ = call emit_str(ctx, mapped_p, mapped_l);
+            _ => Loop [ i <= i + 1 ];
         }
         Exit: {
-            _ => return ctx.out_pos;
+            _ => return 0;
         }
     }
 }
@@ -4173,154 +3636,6 @@ machine get_default_reg_val(type_p: *u8, type_l: u32) -> *u8 {
         }
         ReturnZero: {
             _ => return "0";
-        }
-    }
-}
-
-machine emit_store(ctx: *CodegenCtx, target: *ExprNode, expr: *ExprNode) -> u32 {
-    flow {
-        reg val_str:    *u8 = null;
-        reg val_type:   *u8 = null;
-        reg val_llvm_p: *u8 = null;
-        reg val_llvm_l: u32 = 0;
-        reg dst_ptr:    *u8 = null;
-        reg dst_type_p: *u8 = null;
-        reg dst_type_l: u32 = 0;
-        reg final_val:  *u8 = null;
-
-        reg sname:      *u8 = null;
-        reg sname_l:    u32 = 0;
-        reg base_val:   *u8 = null;
-    }
-    states {
-        Entry: {
-            target == null => Exit;
-            let v = call emit_expr(ctx, expr);
-            let vt = call get_expr_type(ctx, expr);
-            let vt_l = call strlen(vt);
-            let v_lp = call map_type_ptr(ctx, vt, vt_l);
-            let v_ll = call map_type_len(ctx, vt, vt_l);
-
-            let tk = target.kind;
-            tk == 7 => FieldStore [ val_str <= v, val_type <= vt, val_llvm_p <= v_lp, val_llvm_l <= v_ll, final_val <= v ];
-            tk == 6 => CheckUnary [ val_str <= v, val_type <= vt, val_llvm_p <= v_lp, val_llvm_l <= v_ll, final_val <= v ];
-            _       => Exit;
-        }
-
-        CheckUnary: {
-            let op = target.op;
-            op == 70 => UnaryStore; // '*' (TOK_STAR = 70)
-            _        => Exit;
-        }
-
-        FieldStore: {
-            let gep_val = call emit_field_ptr(ctx, target);
-            let base_e = target.left;
-            let bt = call get_expr_type(ctx, base_e);
-            let c0 = *bt;
-            c0 == 42 => ResolveFldType [ sname <= bt + 1, sname_l <= call strlen(bt + 1), dst_ptr <= gep_val ];
-            _        => ResolveFldType [ sname <= bt,     sname_l <= call strlen(bt),     dst_ptr <= gep_val ];
-        }
-
-        ResolveFldType: {
-            let raw_ftype = call find_struct_field_type(ctx.prog, ctx.alloc, sname, target.str_ptr, target.str_len);
-            let raw_flen = call strlen(raw_ftype);
-            let mapped_p = call map_type_ptr(ctx, raw_ftype, raw_flen);
-            let mapped_l = call map_type_len(ctx, raw_ftype, raw_flen);
-            _ => CheckTypeConv [ dst_type_p <= mapped_p, dst_type_l <= mapped_l ];
-        }
-
-        UnaryStore: {
-            let ptr_e = target.left;
-            let ptr_v = call emit_expr(ctx, ptr_e);
-            let ptr_t = call get_expr_type(ctx, ptr_e);
-            let elem_t = ptr_t + 1;
-            let elem_l = call strlen(elem_t);
-            let mapped_p = call map_type_ptr(ctx, elem_t, elem_l);
-            let mapped_l = call map_type_len(ctx, elem_t, elem_l);
-
-            _ => CheckTypeConv [ dst_ptr <= ptr_v, dst_type_p <= mapped_p, dst_type_l <= mapped_l ];
-        }
-
-        CheckTypeConv: {
-            let vt_len = call strlen(val_type);
-            let ok = call validate_type(ctx, 2, target.str_ptr, target.str_len, 0, dst_type_p, dst_type_l, val_type, vt_len, expr);
-            let is_null = call str_eq(val_str, call strlen(val_str), "null", 4);
-            is_null != 0 => DoStore;
-            let is_same = call str_eq(dst_type_p, dst_type_l, val_llvm_p, val_llvm_l);
-            is_same != 0 => DoStore;
-            let is_i8 = call str_eq(dst_type_p, dst_type_l, "i8", 2);
-            is_i8 != 0   => DoTrunc;
-            let is_i16 = call str_eq(dst_type_p, dst_type_l, "i16", 3);
-            is_i16 != 0  => DoTrunc;
-            _            => CheckDstPtr;
-        }
-
-        CheckDstPtr: {
-            let last_offset = dst_type_l - 1;
-            let last_ptr = dst_type_p + last_offset;
-            let dst_last = *last_ptr;
-            dst_last == 42 => CheckValPtr;
-            _              => DoStore;
-        }
-
-        CheckValPtr: {
-            let v_last_offset = val_llvm_l - 1;
-            let v_last_ptr = val_llvm_p + v_last_offset;
-            let val_last = *v_last_ptr;
-            val_last == 42 => CheckPtrTypeEq;
-            _              => DoStore;
-        }
-
-        CheckPtrTypeEq: {
-            let eq = call str_eq(dst_type_p, dst_type_l, val_llvm_p, val_llvm_l);
-            eq == 0 => DoBitcast;
-            _       => DoStore;
-        }
-
-        DoTrunc: {
-            let tr_val = call fresh_tmp_str(ctx, "trunc", 5);
-            let _ = call emit_str(ctx, "  ", 2);
-            let _ = call emit_str(ctx, tr_val, call strlen(tr_val));
-            let _ = call emit_str(ctx, " = trunc ", 9);
-            let _ = call emit_str(ctx, val_llvm_p, val_llvm_l);
-            let _ = call emit_str(ctx, " ", 1);
-            let _ = call emit_str(ctx, val_str, call strlen(val_str));
-            let _ = call emit_str(ctx, " to ", 4);
-            let _ = call emit_str(ctx, dst_type_p, dst_type_l);
-            let _ = call emit_nl(ctx);
-            _ => DoStore [ final_val <= tr_val ];
-        }
-
-        DoBitcast: {
-            let bc_val = call fresh_tmp_str(ctx, "bitcast", 7);
-            let _ = call emit_str(ctx, "  ", 2);
-            let _ = call emit_str(ctx, bc_val, call strlen(bc_val));
-            let _ = call emit_str(ctx, " = bitcast ", 11);
-            let _ = call emit_str(ctx, val_llvm_p, val_llvm_l);
-            let _ = call emit_str(ctx, " ", 1);
-            let _ = call emit_str(ctx, val_str, call strlen(val_str));
-            let _ = call emit_str(ctx, " to ", 4);
-            let _ = call emit_str(ctx, dst_type_p, dst_type_l);
-            let _ = call emit_nl(ctx);
-            _ => DoStore [ final_val <= bc_val ];
-        }
-
-        DoStore: {
-            let _ = call emit_str(ctx, "  store ", 8);
-            let _ = call emit_str(ctx, dst_type_p, dst_type_l);
-            let _ = call emit_str(ctx, " ", 1);
-            let _ = call emit_str(ctx, final_val, call strlen(final_val));
-            let _ = call emit_str(ctx, ", ", 2);
-            let _ = call emit_str(ctx, dst_type_p, dst_type_l);
-            let _ = call emit_str(ctx, "* ", 2);
-            let _ = call emit_str(ctx, dst_ptr, call strlen(dst_ptr));
-            let _ = call emit_nl(ctx);
-            _ => Exit;
-        }
-
-        Exit: {
-            _ => return 0;
         }
     }
 }
@@ -4915,9 +4230,309 @@ machine find_latch_expr(rule: *TransitionRule, name_p: *u8, name_l: u32) -> *Exp
     }
 }
 
-// ----------------------------------------------------------------------------
-// 10. コンパイラ統合エントリポイント (ssac_compile_source & ssac_codegen)
-// ----------------------------------------------------------------------------
+// ============================================================================
+// StateSSA Compiler: Top-Level Codegen & Compilation Driver (codegen.ssa)
+// ヘッダ・外部宣言・文字列定数プール・全体オーケストレーション
+// ============================================================================
+
+
+machine emit_header(ctx: *CodegenCtx) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            let _ = call emit_str(ctx, "; Generated by StateSSA Compiler (ssac)", 39);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "target datalayout = ", 20);
+            let _ = call emit_char(ctx, 34); // '"'
+            let _ = call emit_str(ctx, "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128", 79);
+            let _ = call emit_char(ctx, 34); // '"'
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "target triple = ", 16);
+            let _ = call emit_char(ctx, 34); // '"'
+            let _ = call emit_str(ctx, "x86_64-pc-linux-gnu", 19);
+            let _ = call emit_char(ctx, 34); // '"'
+            let _ = call emit_nl(ctx);
+            let _ = call emit_nl(ctx);
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine emit_all_types(ctx: *CodegenCtx) -> u32 {
+    flow {
+        reg t_idx: u32 = 0;
+        wire prog = ctx.prog;
+        wire cnt = prog.type_count;
+        wire has_more = t_idx < cnt;
+        wire fld_t_ptr = prog.types;
+        wire t_ptr = fld_t_ptr + t_idx;
+    }
+    states {
+        Entry: {
+            _ => Loop [ t_idx <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => ProcessOne;
+            _             => Done;
+        }
+        ProcessOne: {
+            // エイリアス型なら構造体定義はスキップ (codegen.py L29-36)
+            let f_cnt = t_ptr.field_count;
+            f_cnt == 1 => CheckAlias;
+            _          => EmitStruct;
+        }
+        CheckAlias: {
+            let f0 = t_ptr.fields;
+            let f0_nl = f0.name_len;
+            f0_nl == 0 => SkipAlias;
+            _          => EmitStruct;
+        }
+        SkipAlias: {
+            _ => NextIter;
+        }
+        EmitStruct: {
+            let _ = call emit_str(ctx, "%struct.", 8);
+            let _ = call emit_str(ctx, t_ptr.name_ptr, t_ptr.name_len);
+            let _ = call emit_str(ctx, " = type { ", 10);
+
+            let _ = call emit_struct_fields(ctx, t_ptr);
+            let _ = call emit_str(ctx, " }", 2);
+            let _ = call emit_nl(ctx);
+            _ => NextIter;
+        }
+        NextIter: {
+            _ => Loop [ t_idx <= t_idx + 1 ];
+        }
+        Done: {
+            cnt != 0 => EmitTrailNl;
+            _        => Exit;
+        }
+        EmitTrailNl: {
+            let _ = call emit_nl(ctx);
+            _ => Exit;
+        }
+        Exit: {
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine emit_struct_fields(ctx: *CodegenCtx, t: *TypeDef) -> u32 {
+    flow {
+        reg f_idx: u32 = 0;
+        wire cnt = t.field_count;
+        wire has_more = f_idx < cnt;
+        wire fld_f_ptr = t.fields;
+        wire f_ptr = fld_f_ptr + f_idx;
+        wire is_first = f_idx == 0;
+    }
+    states {
+        Entry: {
+            _ => Loop [ f_idx <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => EmitField;
+            _             => Exit;
+        }
+        EmitField: {
+            is_first == 0 => EmitComma;
+            _             => EmitType;
+        }
+        EmitComma: {
+            let _ = call emit_str(ctx, ", ", 2);
+            _ => EmitType;
+        }
+        EmitType: {
+            let mapped_p = call map_type_ptr(ctx, f_ptr.type_ptr, f_ptr.type_len);
+            let mapped_l = call map_type_len(ctx, f_ptr.type_ptr, f_ptr.type_len);
+            let _ = call emit_str(ctx, mapped_p, mapped_l);
+            _ => Loop [ f_idx <= f_idx + 1 ];
+        }
+        Exit: {
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine emit_all_externs(ctx: *CodegenCtx) -> u32 {
+    flow {
+        reg e_idx: u32 = 0;
+        wire prog = ctx.prog;
+        wire cnt = prog.extern_count;
+        wire has_more = e_idx < cnt;
+        wire fld_ext = prog.externs;
+        wire ext = fld_ext + e_idx;
+    }
+    states {
+        Entry: {
+            _ => Loop [ e_idx <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => EmitOne;
+            _             => Done;
+        }
+        EmitOne: {
+            let _ = call emit_str(ctx, "declare ", 8);
+            let ret_p = call map_type_ptr(ctx, ext.ret_type_ptr, ext.ret_type_len);
+            let ret_l = call map_type_len(ctx, ext.ret_type_ptr, ext.ret_type_len);
+            let _ = call emit_str(ctx, ret_p, ret_l);
+            let _ = call emit_str(ctx, " @", 2);
+            let _ = call emit_str(ctx, ext.name_ptr, ext.name_len);
+            let _ = call emit_char(ctx, 40); // '('
+
+            let _ = call emit_extern_params(ctx, ext);
+
+            let _ = call emit_char(ctx, 41); // ')'
+            let _ = call emit_nl(ctx);
+            _ => Loop [ e_idx <= e_idx + 1 ];
+        }
+        Done: {
+            cnt != 0 => EmitTrap;
+            _        => Exit;
+        }
+        EmitTrap: {
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "declare void @llvm.trap() cold noreturn nounwind", 48);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_nl(ctx);
+            _ => Exit;
+        }
+        Exit: {
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine emit_extern_params(ctx: *CodegenCtx, ext: *ExternFn) -> u32 {
+    flow {
+        reg p_idx: u32 = 0;
+        wire cnt = ext.param_count;
+        wire has_more = p_idx < cnt;
+        wire fld_p = ext.params;
+        wire p = fld_p + p_idx;
+        wire is_first = p_idx == 0;
+    }
+    states {
+        Entry: {
+            _ => Loop [ p_idx <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => EmitParam;
+            _             => Exit;
+        }
+        EmitParam: {
+            is_first == 0 => EmitComma;
+            _             => EmitType;
+        }
+        EmitComma: {
+            let _ = call emit_str(ctx, ", ", 2);
+            _ => EmitType;
+        }
+        EmitType: {
+            let mapped_p = call map_type_ptr(ctx, p.type_ptr, p.type_len);
+            let mapped_l = call map_type_len(ctx, p.type_ptr, p.type_len);
+            let _ = call emit_str(ctx, mapped_p, mapped_l);
+            _ => Loop [ p_idx <= p_idx + 1 ];
+        }
+        Exit: {
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine collect_string_const(ctx: *CodegenCtx, val_ptr: *u8, val_len: u32) -> u32 {
+    flow {
+        wire cnt = ctx.string_cnt;
+        wire fld_entry = ctx.strings;
+        wire entry = fld_entry + cnt;
+    }
+    states {
+        Entry: {
+            let res_id = ctx.str_id + 1;
+            ctx.str_id <- res_id;
+            entry.sym_id   <- res_id;
+            entry.val_ptr  <- val_ptr;
+            entry.val_len  <- val_len;
+            entry.byte_len <- val_len + 1; // null終端含む
+            ctx.string_cnt <- cnt + 1;
+            _ => return res_id;
+        }
+    }
+}
+
+machine emit_all_strings(ctx: *CodegenCtx) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = ctx.string_cnt;
+        wire has_more = i < cnt;
+        wire fld_entry = ctx.strings;
+        wire entry = fld_entry + i;
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => EmitOne;
+            _             => Done;
+        }
+        EmitOne: {
+            // @.str_X = private unnamed_addr constant [L x i8] c"STR\00", align 1
+            let _ = call emit_str(ctx, "@.str_", 6);
+            let _ = call emit_u32(ctx, entry.sym_id);
+            let _ = call emit_str(ctx, " = private unnamed_addr constant [", 34);
+            let _ = call emit_u32(ctx, entry.byte_len);
+            let _ = call emit_str(ctx, " x i8] c", 8);
+            let _ = call emit_char(ctx, 34); // '"'
+            let _ = call emit_str(ctx, entry.val_ptr, entry.val_len);
+            let _ = call emit_char(ctx, 92); // '\\'
+            let _ = call emit_char(ctx, 48); // '0'
+            let _ = call emit_char(ctx, 48); // '0'
+            let _ = call emit_char(ctx, 34); // '"'
+            let _ = call emit_str(ctx, ", align 1", 9);
+            let _ = call emit_nl(ctx);
+            _ => Loop [ i <= i + 1 ];
+        }
+        Done: {
+            cnt != 0 => EmitTrailNl;
+            _        => Exit;
+        }
+        EmitTrailNl: {
+            let _ = call emit_nl(ctx);
+            _ => Exit;
+        }
+        Exit: {
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine emit_all_machines(ctx: *CodegenCtx) -> u32 {
+    flow {
+        reg m_idx: u32 = 0;
+        wire prog = ctx.prog;
+        wire cnt = prog.machine_count;
+        wire has_more = m_idx < cnt;
+        wire fld_m = prog.machines;
+        wire m = fld_m + m_idx;
+    }
+    states {
+        Entry: {
+            _ => Loop [ m_idx <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => ProcessOne;
+            _             => Exit;
+        }
+        ProcessOne: {
+            let _ = call emit_machine(ctx, m);
+            _ => Loop [ m_idx <= m_idx + 1 ];
+        }
+        Exit: {
+            _ => return ctx.out_pos;
+        }
+    }
+}
 
 machine ssac_codegen(prog: *ProgramDef, alloc_obj: *BumpAlloc, out_buf: *u8, max_len: u32) -> i32 {
     flow {
@@ -5002,13 +4617,6 @@ machine alloc_codegen_context() -> *CodegenCtx {
     }
 }
 
-// ============================================================================
-// コンパイラ用動的メモリ所要量算定マシン (calc_compiler_required_memory)
-// コンパイラ固有ドメインロジック:
-// 入力ソース文字数 src_len から、固定テーブル枠(1MB) + スケーリング枠(src_len * 500)
-// を合算し、最小 2MB 保証の上で一括決定する
-// ============================================================================
-
 machine calc_compiler_required_memory(src_len: u32) -> u32 {
     flow {
         wire scaled    = src_len * 500;
@@ -5090,3 +4698,4 @@ machine ssac_compile_source(src_ptr: *u8, src_len: u32, out_buf: *u8, max_len: u
         }
     }
 }
+
