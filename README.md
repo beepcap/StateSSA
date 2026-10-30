@@ -1,4 +1,4 @@
-# StateSSA (v0.12.0)
+# StateSSA
 
 StateSSA は、有限状態機械（Finite State Machine; FSM）と静的単一代入（Static Single Assignment; SSA）データフローで直接記述するプログラミング言語です。
 
@@ -15,30 +15,31 @@ StateSSA/
 ├── configure           # POSIX 準拠の環境検証 ＆ Stage-3 自動ブートストラップスクリプト
 ├── LICENSE             # ライセンスファイル (BSD 3-Clause)
 ├── README.md           # 本ドキュメント
-├── RELEASE_NOTES.md    # リリースノート (v0.12.0)
+├── RELEASE_NOTES.md    # リリースノート
 │
 ├── bootstrap/          # Stage-0 Python ブートストラップコンパイラ
-│   ├── main.py         # Stage-0 CLI エントリーポイント
+│   ├── main.py         # Stage-0 CLI エントリーポイント (キューローダー内包)
 │   ├── lexer.py        # 字句解析器
 │   ├── parser.py       # 構文解析器
-│   └── codegen.py      # LLVM IR コード生成エンジン
+│   └── codegen.py      # LLVM IR コード生成エンジン (q64 / C-ABI 自動変換)
 │
 ├── source/             # StateSSA で記述されたセルフホストコンパイラソース
 │   ├── common.ssa      # 共通構造体型・メモリ確保・診断通知エンジン
 │   ├── lexer.ssa       # 字句解析 FSM
-│   ├── parser.ssa      # 構文解析 FSM
-│   ├── codegen.ssa     # LLVM IR コード生成 FSM (静的型バリデータ内包)
-│   └── driver.ssa      # CLI 引数解析・ファイル I/O を担うメインドライバ
+│   ├── parser.ssa      # 構文解析 FSM (extern マージ・include パス解決内包)
+│   ├── codegen.ssa     # LLVM IR コード生成 FSM (静的型バリデータ・q64/C-ABI自動変換)
+│   └── driver.ssa      # CLI 引数解析・ファイルキューローダー・動的メモリ算定
 │
 ├── doc/                # 言語仕様書
-│   └── SPECIFICATION.md# 言語仕様書 (静的型バリデータ & キャスト仕様を含む)
+│   └── SPECIFICATION.md# 言語仕様書
 │
 └── samples/            # StateSSA サンプル集 (C言語ファイルなし)
     ├── 01_hello_world/ # 最小構成の Hello World
     ├── 02_simple_loop/ # ループとレジスタラッチ更新
     ├── 03_parallel_sum/# POSIX pthread による並行タスクオーケストレーション
     ├── 04_xz/          # LZMA2 ＆ XZ コンテナの圧縮・解凍ラウンドトリップ
-    └── 05_web_server/  # Linux io_uring による非同期 Web サーバー
+    ├── 05_web_server/  # Linux io_uring による非同期 Web サーバー
+    └── 06_fixed_math/  # q64 固定小数点数による実数計算と C-ABI 境界自動変換
 ```
 
 ---
@@ -48,7 +49,7 @@ StateSSA/
 ### 前提要件
 * `clang` (LLVM C/IR コンパイラ)
 * `python3` (初回 Stage-0 ブートストラップ用)
-* `cmp`, `make`, `sed` (POSIX 標準ユーティリティ)
+* `cmp`, `make` (POSIX 標準ユーティリティ)
 
 ### ブートストラップ
 リポジトリのルートで `./configure` を実行します：
@@ -59,8 +60,8 @@ StateSSA/
 
 * **既存のコンパイラがある場合**: `bin/ssac` を検知して即座に完了します。
 * **初回実行時**:
-  1. `source/*.ssa` をマージして `bootstrap/`（Python Stage-0）でコンパイルし、Stage-1 IR を生成。
-  2. `clang` でビルドした Stage-1 コンパイラで自身をコンパイルし、Stage-2 IR を生成。
+  1. `bootstrap/`（Python Stage-0）で `source/driver.ssa` をコンパイルし、Stage-1 IR を生成。
+  2. `clang` でビルドした Stage-1 コンパイラで自身（`source/driver.ssa`）をコンパイルし、Stage-2 IR を生成。
   3. Stage-2 コンパイラで自身をコンパイルし、Stage-3 IR を生成。
   4. Stage-2 IR と Stage-3 IR の **固定点照合 (Fixed-Point Verification)** を実行（完全一致を確認）。
   5. Stage-3 バイナリを `bin/ssac` としてインストールし、ルート `Makefile` を自動生成します。
@@ -83,24 +84,35 @@ make test
 ============================================================
 Running All StateSSA Sample Verifications
 ============================================================
---- [Test 1/5] 01_hello_world ---
+--- [Test 1/6] 01_hello_world ---
 Hello, StateSSA World!
 
---- [Test 2/5] 02_simple_loop ---
+--- [Test 2/6] 02_simple_loop ---
 simple_loop(10) = 45: SUCCESS!
 
---- [Test 3/5] 03_parallel_sum ---
+--- [Test 3/6] 03_parallel_sum ---
 ParallelSum([1..8]) = 36: SUCCESS!
 
---- [Test 4/5] 04_xz ---
+--- [Test 4/6] 04_xz ---
 XZ Clone (Compress -> Decompress Roundtrip): 100% SUCCESS!
 
---- [Test 5/5] 05_web_server (Self-Test) ---
+--- [Test 5/6] 05_web_server (Self-Test) ---
 StateSSA io_uring Web Server listening on 0.0.0.0:18080...
 GET / -> 200 OK & Hello verified!
 GET /baseline11 -> 200 OK & Sum 100 verified!
 POST /echo -> 200 OK & Echo verified!
 web_server verification passed.
+
+--- [Test 6/6] 06_fixed_math ---
+=== StateSSA Sample 06: Deterministic Math (q64) ===
+a + b (expected 3.500000): 3.500000
+b - a (expected 0.500000): 0.500000
+a * b (expected 3.000000): 3.000000
+a / b (expected 0.750000): 0.750000
+altitude at t=1.0s (expected 15.100000): 15.100000
+sin(0.0) (expected 0.000000): 0.000000
+cos(0.0) (expected 1.000000): 1.000000
+sqrt(4.0) (expected 2.000000): 2.000000
 
 ============================================================
 >>> ALL SAMPLES PASSED 100% ON STAGE-3 BINARY COMPILER! <<<
@@ -186,6 +198,17 @@ curl -X POST -d "StateSSA Pure Web Server" http://127.0.0.1:18080/echo
 # レスポンス: StateSSA Pure Web Server
 ```
 
+#### 06. Fixed-Point Math (`samples/06_fixed_math/`)
+固定小数点数 `q64` (Q32.32) による実数計算と、外部 C 数学ライブラリ（`libm` の `sin`, `cos`, `sqrt`）との自動型変換境界のサンプルです。
+
+```sh
+# ビルド
+make 06_fixed_math
+
+# 実行
+./build/06/fixed_math
+```
+
 ---
 
 ## 4. コンパイラ `bin/ssac` の直接利用方法
@@ -193,8 +216,11 @@ curl -X POST -d "StateSSA Pure Web Server" http://127.0.0.1:18080/echo
 Stage-3 コンパイラバイナリ `bin/ssac` を直接使って StateSSA ソースコードをコンパイルできます：
 
 ```sh
-# 1. StateSSA ソースコードから LLVM IR (.ll) を生成
+# 1. 単一ファイルまたは include を含むソースコードから LLVM IR (.ll) を生成
 ./bin/ssac my_program.ssa -o my_program.ll
+
+# 複数ファイルをコマンドライン引数で直接指定して結合・コンパイルすることも可能です
+./bin/ssac src/types.ssa src/parser.ssa src/main.ssa -o compiler.ll
 
 # 2. Clang でネイティブバイナリへコンパイル
 clang -O2 my_program.ll -o my_program
