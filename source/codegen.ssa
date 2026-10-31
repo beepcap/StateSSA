@@ -971,6 +971,27 @@ machine is_type_q64(t: *u8) -> u32 {
     }
 }
 
+machine is_type_signed(t: *u8) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            t == null => RetZero;
+            let l = call strlen(t);
+            let is_i32 = call str_eq(t, l, "i32", 3);
+            is_i32 != 0 => RetOne;
+            let is_i64 = call str_eq(t, l, "i64", 3);
+            is_i64 != 0 => RetOne;
+            let is_i16 = call str_eq(t, l, "i16", 3);
+            is_i16 != 0 => RetOne;
+            let is_i8 = call str_eq(t, l, "i8", 2);
+            is_i8 != 0 => RetOne;
+            _ => RetZero;
+        }
+        RetOne:  { _ => return 1; }
+        RetZero: { _ => return 0; }
+    }
+}
+
 machine get_type_bit_width(t: *u8) -> u32 {
     flow {}
     states {
@@ -2224,6 +2245,8 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
         reg val_str:    *u8 = null;
         reg s_type:     *u8 = null;
         reg d_type:     *u8 = null;
+        reg ext_val:    *u8 = null;
+        reg shr_val:    *u8 = null;
 
         wire operand = expr.left;
         wire target_t_p = expr.str_ptr;
@@ -2246,11 +2269,65 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let is_same = call str_eq(s_type, s_l, d_type, d_l);
             is_same != 0 => ReturnNop;
 
+            let is_dst_q = call is_type_q64(d_type);
+            is_dst_q != 0 => CastToQ64;
+
+            let is_src_q = call is_type_q64(s_type);
+            is_src_q != 0 => CastFromQ64;
+
             src_is_ptr != 0 => SrcIsPtr;
             _               => SrcIsInt;
         }
         ReturnNop: {
             _ => return val_str;
+        }
+        CastToQ64: {
+            let s_bits = call get_type_bit_width(s_type);
+            s_bits < 64 => CastToQ64_Ext;
+            _           => CastToQ64_Shl [ ext_val <= val_str ];
+        }
+        CastToQ64_Ext: {
+            let is_signed = call is_type_signed(s_type);
+            is_signed != 0 => CastToQ64_Sext;
+            _              => CastToQ64_Zext;
+        }
+        CastToQ64_Sext: {
+            let ext = call emit_cast_op(ctx, "sext", 4, s_type, call strlen(s_type), "i64", 3, val_str);
+            _ => CastToQ64_Shl [ ext_val <= ext ];
+        }
+        CastToQ64_Zext: {
+            let ext = call emit_cast_op(ctx, "zext", 4, s_type, call strlen(s_type), "i64", 3, val_str);
+            _ => CastToQ64_Shl [ ext_val <= ext ];
+        }
+        CastToQ64_Shl: {
+            let res = call fresh_tmp_str(ctx, "shl_q", 5);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, res, call strlen(res));
+            let _ = call emit_str(ctx, " = shl i64 ", 11);
+            let _ = call emit_str(ctx, ext_val, call strlen(ext_val));
+            let _ = call emit_str(ctx, ", 32", 4);
+            let _ = call emit_nl(ctx);
+            _ => return res;
+        }
+        CastFromQ64: {
+            let shr = call fresh_tmp_str(ctx, "shr_q", 5);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, shr, call strlen(shr));
+            let _ = call emit_str(ctx, " = ashr i64 ", 12);
+            let _ = call emit_str(ctx, val_str, call strlen(val_str));
+            let _ = call emit_str(ctx, ", 32", 4);
+            let _ = call emit_nl(ctx);
+
+            let d_bits = call get_type_bit_width(d_type);
+            d_bits < 64 => CastFromQ64_Trunc [ shr_val <= shr ];
+            _           => ReturnShr [ shr_val <= shr ];
+        }
+        ReturnShr: {
+            _ => return shr_val;
+        }
+        CastFromQ64_Trunc: {
+            let res = call emit_cast_op(ctx, "trunc", 5, "i64", 3, d_type, call strlen(d_type), shr_val);
+            _ => return res;
         }
         SrcIsPtr: {
             dst_is_ptr != 0 => PtrToPtr;
@@ -2276,9 +2353,18 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let s_bits = call get_type_bit_width(s_type);
             let d_bits = call get_type_bit_width(d_type);
 
-            s_bits < d_bits => DoZext;
+            s_bits < d_bits => CheckIntSign;
             s_bits > d_bits => DoTrunc;
             _               => ReturnNop;
+        }
+        CheckIntSign: {
+            let is_signed = call is_type_signed(s_type);
+            is_signed != 0 => DoSext;
+            _              => DoZext;
+        }
+        DoSext: {
+            let res = call emit_cast_op(ctx, "sext", 4, s_type, call strlen(s_type), d_type, call strlen(d_type), val_str);
+            _ => return res;
         }
         DoZext: {
             let res = call emit_cast_op(ctx, "zext", 4, s_type, call strlen(s_type), d_type, call strlen(d_type), val_str);
