@@ -1,7 +1,7 @@
 from typing import Any
 from .token import TokenType, Token
 from .ast_nodes import Program, Machine, Flow, Reg, Wire, State, Rule, Action, TypeDef, ExternFn
-from .expr_nodes import BinaryExpr, UnaryExpr, CallExpr, FieldExpr, StructLit, VarExpr, IntLit, StringLit, NullLit, CastExpr, Q64Lit
+from .expr_nodes import BinaryExpr, UnaryExpr, CallExpr, FieldExpr, StructLit, VarExpr, IntLit, StringLit, NullLit, CastExpr, Q64Lit, FloatLit
 from .lexer import parse_q64_str
 
 class Parser:
@@ -308,6 +308,8 @@ class Parser:
                 return IntLit(-operand.val)
             if isinstance(operand, Q64Lit):
                 return Q64Lit(-operand.val)
+            if isinstance(operand, FloatLit):
+                return FloatLit(-operand.val, f"-{operand.raw_str}")
             return BinaryExpr("-", IntLit(0), operand)
         if self.match(TokenType.STAR):
             return UnaryExpr("*", self.parse_unary())
@@ -339,6 +341,9 @@ class Parser:
             tok = self.expect(TokenType.Q64_LIT)
             val = parse_q64_str(tok.value)
             return Q64Lit(val)
+        if self.peek().type == TokenType.FLOAT_LIT:
+            tok = self.expect(TokenType.FLOAT_LIT)
+            return FloatLit(float(tok.value), tok.value)
         if self.peek().type == TokenType.STRING_LIT:
             val = self.expect(TokenType.STRING_LIT).value
             return StringLit(val)

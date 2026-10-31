@@ -34,6 +34,17 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 echo "$PYTHON_BIN"
 
+echo -n "checking for llvm-config... "
+LLVM_CONFIG_BIN="$(command -v llvm-config || command -v llvm-config-19 || command -v llvm-config-18 || true)"
+if [ -z "$LLVM_CONFIG_BIN" ]; then
+    echo "no"
+    echo "Error: 'llvm-config' is required for LLVM C-API native backend. Please install llvm development packages." >&2
+    exit 1
+fi
+echo "$LLVM_CONFIG_BIN"
+LLVM_MAJOR="$("$LLVM_CONFIG_BIN" --version | cut -d. -f1)"
+LLVM_LDFLAGS="$("$LLVM_CONFIG_BIN" --ldflags) -lLLVM-${LLVM_MAJOR}"
+
 echo -n "checking for cmp... "
 CMP_BIN="$(command -v cmp || true)"
 if [ -z "$CMP_BIN" ]; then
@@ -65,7 +76,7 @@ else
 
     # Stage-1 ビルド
     echo "[Step 2] Building Stage-1 compiler binary via clang..."
-    "$CLANG_BIN" -O2 build/stage1.ll -o build/stage1_ssac
+    "$CLANG_BIN" -O2 build/stage1.ll $LLVM_LDFLAGS -o build/stage1_ssac
     echo "  -> build/stage1_ssac created"
 
     # Stage-1 実行 -> Stage-2 IR
@@ -75,7 +86,7 @@ else
 
     # Stage-2 ビルド
     echo "[Step 4] Building Stage-2 compiler binary via clang..."
-    "$CLANG_BIN" -O2 build/stage2.ll -o build/stage2_ssac
+    "$CLANG_BIN" -O2 build/stage2.ll $LLVM_LDFLAGS -o build/stage2_ssac
     echo "  -> build/stage2_ssac created"
 
     # Stage-2 実行 -> Stage-3 IR
@@ -95,7 +106,7 @@ else
 
     # Stage-3 インストール
     echo "[Step 7] Installing Stage-3 binary to bin/ssac..."
-    "$CLANG_BIN" -O2 build/stage3.ll -o bin/ssac
+    "$CLANG_BIN" -O2 build/stage3.ll $LLVM_LDFLAGS -o bin/ssac
     chmod +x bin/ssac
     echo "  -> bin/ssac successfully installed!"
     echo "------------------------------------------------------------"
@@ -113,9 +124,9 @@ SSAC ?= $(CURDIR)/bin/ssac
 CLANG ?= clang
 PYTHON ?= python3
 
-.PHONY: all test clean 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math
+.PHONY: all test clean 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math 07_simd_vivaldi_winter
 
-all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math
+all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math 07_simd_vivaldi_winter
 	@echo "All samples built successfully."
 
 01_hello_world:
@@ -148,24 +159,29 @@ all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_
 	$(SSAC) samples/06_fixed_math/fixed_math.ssa -o build/06/fixed_math.ll
 	$(CLANG) -O2 build/06/fixed_math.ll -lm -o build/06/fixed_math
 
+07_simd_vivaldi_winter:
+	@mkdir -p build/07
+	$(SSAC) samples/07_simd_vivaldi_winter/simd_vivaldi_winter.ssa -o build/07/simd_vivaldi_winter.o
+	$(CLANG) -no-pie build/07/simd_vivaldi_winter.o -lm -o build/07/simd_vivaldi_winter
+
 test: all
 	@echo ""
 	@echo "============================================================"
 	@echo "Running All StateSSA Sample Verifications"
 	@echo "============================================================"
-	@echo "--- [Test 1/6] 01_hello_world ---"
+	@echo "--- [Test 1/7] 01_hello_world ---"
 	@./build/01/hello
 	@echo ""
-	@echo "--- [Test 2/6] 02_simple_loop ---"
+	@echo "--- [Test 2/7] 02_simple_loop ---"
 	@./build/02/simple_loop
 	@echo ""
-	@echo "--- [Test 3/6] 03_parallel_sum ---"
+	@echo "--- [Test 3/7] 03_parallel_sum ---"
 	@./build/03/parallel_sum
 	@echo ""
-	@echo "--- [Test 4/6] 04_xz ---"
+	@echo "--- [Test 4/7] 04_xz ---"
 	@./build/04/xz_sample
 	@echo ""
-	@echo "--- [Test 5/6] 05_web_server (Self-Test) ---"
+	@echo "--- [Test 5/7] 05_web_server (Self-Test) ---"
 	@./build/05/web_server & \
 	PID=$$!; \
 	sleep 0.3; \
@@ -176,8 +192,12 @@ test: all
 	wait $$PID 2>/dev/null || true; \
 	echo "web_server verification passed."
 	@echo ""
-	@echo "--- [Test 6/6] 06_fixed_math ---"
+	@echo "--- [Test 6/7] 06_fixed_math ---"
 	@./build/06/fixed_math
+	@echo ""
+	@echo "--- [Test 7/7] 07_simd_vivaldi_winter ---"
+	@./build/07/simd_vivaldi_winter build/07/vivaldi_winter.wav
+	@test -s build/07/vivaldi_winter.wav && echo "WAV audio output generated successfully!"
 	@echo ""
 	@echo "============================================================"
 	@echo ">>> ALL SAMPLES PASSED 100% ON STAGE-3 BINARY COMPILER! <<<"

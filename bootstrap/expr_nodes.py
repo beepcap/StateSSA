@@ -44,6 +44,11 @@ class Q64Lit:
     val: int
 
 @dataclass
+class FloatLit:
+    val: float
+    raw_str: str = ""
+
+@dataclass
 class StringLit:
     val: str
 

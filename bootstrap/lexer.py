@@ -90,11 +90,11 @@ class Lexer:
                 self.pos = end
                 continue
 
-            # Decimal float literal (e.g. 1.5, 0.125) -> Q64_LIT
+            # Decimal float literal (e.g. 1.5, 0.125) -> FLOAT_LIT
             m = re.match(r'[0-9]+\.[0-9]+', self.text[self.pos:])
             if m:
                 num = m.group(0)
-                tokens.append(Token(TokenType.Q64_LIT, num, self.line, self.col))
+                tokens.append(Token(TokenType.FLOAT_LIT, num, self.line, self.col))
                 self.pos += len(num)
                 self.col += len(num)
                 continue

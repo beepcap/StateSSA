@@ -590,6 +590,121 @@ machine strlen(s: *u8) -> u32 {
     }
 }
 
+machine str_starts_with(s: *u8, s_len: u32, prefix: *u8, p_len: u32) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire has_space = s_len >= p_len;
+        wire has_more = i < p_len;
+        wire c1 = *(s + i);
+        wire c2 = *(prefix + i);
+        wire match_char = c1 == c2;
+    }
+    states {
+        Entry: {
+            has_space == 0 => NoMatch;
+            p_len == 0     => Match;
+            _              => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0    => Match;
+            match_char == 0  => NoMatch;
+            _                => Loop [ i <= i + 1 ];
+        }
+        Match:   { _ => return 1; }
+        NoMatch: { _ => return 0; }
+    }
+}
+
+machine str_contains(s: *u8, s_len: u32, sub: *u8, sub_len: u32) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire can_fit = (i + sub_len) <= s_len;
+    }
+    states {
+        Entry: {
+            sub_len == 0    => Match;
+            s_len < sub_len => NoMatch;
+            _ => CheckLoop [ i <= 0 ];
+        }
+        CheckLoop: {
+            can_fit == 0 => NoMatch;
+            let cur_p = s + i;
+            let m = call str_starts_with(cur_p, s_len - i, sub, sub_len);
+            m != 0 => Match;
+            _ => CheckLoop [ i <= i + 1 ];
+        }
+        Match:   { _ => return 1; }
+        NoMatch: { _ => return 0; }
+    }
+}
+
+machine get_type_align_str(type_p: *u8, type_l: u32) -> *u8 {
+    flow {
+        wire has_double = call str_contains(type_p, type_l, "double", 6);
+        wire has_i64    = call str_contains(type_p, type_l, "i64", 3);
+        wire is_8       = has_double | has_i64;
+
+        wire has_float  = call str_contains(type_p, type_l, "float", 5);
+        wire has_i32    = call str_contains(type_p, type_l, "i32", 3);
+        wire is_4       = has_float | has_i32;
+
+        wire has_i16    = call str_contains(type_p, type_l, "i16", 3);
+    }
+    states {
+        Entry: {
+            is_8 != 0 => Ret8;
+            is_4 != 0 => Ret4;
+            has_i16 != 0 => Ret2;
+            _ => Ret1;
+        }
+        Ret8: { _ => return "8"; }
+        Ret4: { _ => return "4"; }
+        Ret2: { _ => return "2"; }
+        Ret1: { _ => return "1"; }
+    }
+}
+
+machine is_type_float_or_vec(type_p: *u8, type_l: u32) -> u32 {
+    flow {
+        wire has_float = call str_contains(type_p, type_l, "float", 5);
+        wire has_double = call str_contains(type_p, type_l, "double", 6);
+        wire is_f32 = call str_eq(type_p, type_l, "f32", 3);
+        wire is_f64 = call str_eq(type_p, type_l, "f64", 3);
+        wire has_vec = call str_starts_with(type_p, type_l, "<", 1);
+        wire has_vec_f32 = call str_starts_with(type_p, type_l, "f32x", 4);
+        wire has_vec_f64 = call str_starts_with(type_p, type_l, "f64x", 4);
+        wire has_vec_i32 = call str_starts_with(type_p, type_l, "i32x", 4);
+        wire has_vec_u8  = call str_starts_with(type_p, type_l, "u8x", 3);
+        wire fp_1 = has_float | has_double;
+        wire fp_2 = is_f32 | is_f64;
+        wire is_fp = fp_1 | fp_2;
+
+        wire v_1 = has_vec | has_vec_f32;
+        wire v_2 = has_vec_f64 | has_vec_i32;
+        wire v_12 = v_1 | v_2;
+        wire is_vec = v_12 | has_vec_u8;
+        wire res = is_fp | is_vec;
+    }
+    states {
+        Entry: {
+            _ => return res;
+        }
+    }
+}
+
+machine is_type_vector_mask(type_p: *u8, type_l: u32) -> u32 {
+    flow {
+        wire starts_angle = call str_starts_with(type_p, type_l, "<", 1);
+        wire has_i1 = call str_contains(type_p, type_l, "x i1>", 5);
+        wire res = starts_angle & has_i1;
+    }
+    states {
+        Entry: {
+            _ => return res;
+        }
+    }
+}
+
 machine make_cstr(alloc: *BumpAlloc, ptr: *u8, len: u32) -> *u8 {
     flow {}
     states {
@@ -765,6 +880,8 @@ machine init_builtin_types(ctx: *CodegenCtx) -> u32 {
             let _ = call register_type_map(ctx, "*u64", 4, "i64*", 4);
             let _ = call register_type_map(ctx, "u16", 3, "i16", 3);
             let _ = call register_type_map(ctx, "*u16", 4, "i16*", 4);
+            let _ = call register_type_map(ctx, "i16", 3, "i16", 3);
+            let _ = call register_type_map(ctx, "*i16", 4, "i16*", 4);
             let _ = call register_type_map(ctx, "u8", 2, "i8", 2);
             let _ = call register_type_map(ctx, "*u8", 3, "i8*", 3);
             let _ = call register_type_map(ctx, "i8", 2, "i8", 2);
@@ -777,6 +894,30 @@ machine init_builtin_types(ctx: *CodegenCtx) -> u32 {
             let _ = call register_type_map(ctx, "*f32", 4, "float*", 6);
             let _ = call register_type_map(ctx, "f64", 3, "double", 6);
             let _ = call register_type_map(ctx, "*f64", 4, "double*", 7);
+            let _ = call register_type_map(ctx, "f32x4", 5, "<4 x float>", 12);
+            let _ = call register_type_map(ctx, "*f32x4", 6, "<4 x float>*", 13);
+            let _ = call register_type_map(ctx, "f32x8", 5, "<8 x float>", 12);
+            let _ = call register_type_map(ctx, "*f32x8", 6, "<8 x float>*", 13);
+            let _ = call register_type_map(ctx, "f32x16", 6, "<16 x float>", 13);
+            let _ = call register_type_map(ctx, "*f32x16", 7, "<16 x float>*", 14);
+            let _ = call register_type_map(ctx, "f64x2", 5, "<2 x double>", 13);
+            let _ = call register_type_map(ctx, "*f64x2", 6, "<2 x double>*", 14);
+            let _ = call register_type_map(ctx, "f64x4", 5, "<4 x double>", 13);
+            let _ = call register_type_map(ctx, "*f64x4", 6, "<4 x double>*", 14);
+            let _ = call register_type_map(ctx, "f64x8", 5, "<8 x double>", 13);
+            let _ = call register_type_map(ctx, "*f64x8", 6, "<8 x double>*", 14);
+            let _ = call register_type_map(ctx, "i32x4", 5, "<4 x i32>", 10);
+            let _ = call register_type_map(ctx, "*i32x4", 6, "<4 x i32>*", 11);
+            let _ = call register_type_map(ctx, "i32x8", 5, "<8 x i32>", 10);
+            let _ = call register_type_map(ctx, "*i32x8", 6, "<8 x i32>*", 11);
+            let _ = call register_type_map(ctx, "i32x16", 6, "<16 x i32>", 11);
+            let _ = call register_type_map(ctx, "*i32x16", 7, "<16 x i32>*", 12);
+            let _ = call register_type_map(ctx, "u8x16", 5, "<16 x i8>", 10);
+            let _ = call register_type_map(ctx, "*u8x16", 6, "<16 x i8>*", 11);
+            let _ = call register_type_map(ctx, "u8x32", 5, "<32 x i8>", 10);
+            let _ = call register_type_map(ctx, "*u8x32", 6, "<32 x i8>*", 11);
+            let _ = call register_type_map(ctx, "u8x64", 5, "<64 x i8>", 10);
+            let _ = call register_type_map(ctx, "*u8x64", 6, "<64 x i8>*", 11);
             _ => return 0;
         }
     }
@@ -1122,6 +1263,29 @@ machine diag_u32(val: u32) -> u32 {
             let len = 15 - idx;
             let _ = call write(2, start, len);
             let _ = call free(buf);
+            _ => Exit;
+        }
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
+machine diag_i32(val: i32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            val < 0 => Negative;
+            _       => Positive;
+        }
+        Negative: {
+            let _ = call diag_str("-");
+            let pos_val = 0 - val;
+            let _ = call diag_u32(cast(u32) pos_val);
+            _ => Exit;
+        }
+        Positive: {
+            let _ = call diag_u32(cast(u32) val);
             _ => Exit;
         }
         Exit: {
@@ -1573,22 +1737,50 @@ machine get_expr_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     }
 }
 
+machine find_state_def(m: *MachineDef, name_p: *u8, name_l: u32) -> *StateDef {
+    flow {
+        reg cur_s: *StateDef = null;
+        wire has_more = cur_s != null;
+        wire is_match = call str_eq(cur_s.name_ptr, cur_s.name_len, name_p, name_l);
+    }
+    states {
+        Entry: {
+            m == null => NotFound;
+            _ => Loop [ cur_s <= m.state_defs ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Next;
+        }
+        Found: {
+            _ => return cur_s;
+        }
+        Next: {
+            _ => Loop [ cur_s <= cur_s.next ];
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
 machine find_let_var_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
     flow {
-        reg cur_s:   *StateDef = null;
         reg cur_act: *ActionStmt = null;
     }
     states {
         Entry: {
             m == null => NotFound;
-            _ => StateLoop [ cur_s <= m.state_defs ];
-        }
-        StateLoop: {
-            cur_s == null => NotFound;
-            _             => ActionLoop [ cur_act <= cur_s.actions ];
+            ctx == null => NotFound;
+            ctx.cur_state_p == null => NotFound;
+
+            let s = call find_state_def(m, ctx.cur_state_p, ctx.cur_state_l);
+            s == null => NotFound;
+            _ => ActionLoop [ cur_act <= s.actions ];
         }
         ActionLoop: {
-            cur_act == null => NextState;
+            cur_act == null => NotFound;
             _               => CheckAction;
         }
         CheckAction: {
@@ -1608,9 +1800,6 @@ machine find_let_var_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l:
         NextAction: {
             _ => ActionLoop [ cur_act <= cur_act.next ];
         }
-        NextState: {
-            _ => StateLoop [ cur_s <= cur_s.next ];
-        }
         NotFound: {
             _ => return null;
         }
@@ -1619,11 +1808,11 @@ machine find_let_var_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l:
 
 machine get_var_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
     flow {
-        reg res_type: *u8 = "i32";
+        reg res_type: *u8 = null;
     }
     states {
         Entry: {
-            m == null => Exit;
+            m == null => CheckGlobalEntity;
             let pt = call find_param_type(ctx, m, name_p, name_l);
             pt != null => Exit [ res_type <= pt ];
             let rt = call find_reg_type(ctx, m, name_p, name_l);
@@ -1632,7 +1821,53 @@ machine get_var_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32)
             wt != null => Exit [ res_type <= wt ];
             let lt = call find_let_var_type(ctx, m, name_p, name_l);
             lt != null => Exit [ res_type <= lt ];
-            _          => Exit;
+            _          => CheckGlobalEntity;
+        }
+        CheckGlobalEntity: {
+            ctx == null => FailUndefined;
+            let prog = ctx.prog;
+            prog == null => FailUndefined;
+            let mach = call find_machine_in_prog(prog, name_p, name_l);
+            mach != null => Exit [ res_type <= "*void" ];
+            let ext = call find_extern_in_prog(prog, name_p, name_l);
+            ext != null => Exit [ res_type <= "*void" ];
+            _ => FailUndefined;
+        }
+        FailUndefined: {
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            let _ = call diag_str("COMPILATION ERROR: Undefined variable '");
+            let _ = call diag_write(name_p, name_l);
+            let _ = call diag_str("'");
+            m != null => PrintMachine;
+            _ => PrintState;
+        }
+        PrintMachine: {
+            let _ = call diag_str(" in machine '");
+            let _ = call diag_write(m.name_ptr, m.name_len);
+            let _ = call diag_str("'");
+            _ => PrintState;
+        }
+        PrintState: {
+            let sp = ctx.cur_state_p;
+            sp != null => PrintStateName;
+            _ => EndError;
+        }
+        PrintStateName: {
+            let _ = call diag_str(" state '");
+            let _ = call diag_write(ctx.cur_state_p, ctx.cur_state_l);
+            let _ = call diag_str("'");
+            _ => EndError;
+        }
+        EndError: {
+            let _ = call diag_nl();
+            let _ = call diag_str("Deterministic Definition Violation: Every variable must be strictly defined in scope.");
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            ctx.error_code <- -51;
+            _ => Exit [ res_type <= "i32" ];
         }
         Exit: {
             _ => return res_type;
@@ -1780,8 +2015,20 @@ machine get_binop_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             op == 48 => ReturnI1; // >=
             op == 50 => ReturnI1; // &&
             op == 49 => ReturnI1; // ||
+            op == 62 => CheckBitwiseI1; // &
+            op == 63 => CheckBitwiseI1; // |
+            op == 64 => CheckBitwiseI1; // ^
             op == 71 => CheckAdd; // +
             _        => CheckArith;
+        }
+        CheckBitwiseI1: {
+            let lt = call get_expr_type(ctx, expr.left);
+            let is_i1_l = call is_i1_type(lt);
+            let rt = call get_expr_type(ctx, expr.right);
+            let is_i1_r = call is_i1_type(rt);
+            let both_i1 = is_i1_l & is_i1_r;
+            both_i1 != 0 => ReturnI1;
+            _ => CheckArith;
         }
         ReturnI1: {
             _ => return "i1";
@@ -1795,9 +2042,15 @@ machine get_binop_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
         }
         CheckArith: {
             let lt = call get_expr_type(ctx, expr.left);
+            let is_lfv = call is_type_float_or_vec(lt, call strlen(lt));
+            is_lfv != 0 => ReturnLeft [ left_t <= lt ];
+
+            let rt = call get_expr_type(ctx, expr.right);
+            let is_rfv = call is_type_float_or_vec(rt, call strlen(rt));
+            is_rfv != 0 => ReturnLeft [ left_t <= rt ];
+
             let is_lq64 = call is_type_q64(lt);
             is_lq64 != 0 => ReturnQ64;
-            let rt = call get_expr_type(ctx, expr.right);
             let is_rq64 = call is_type_q64(rt);
             is_rq64 != 0 => ReturnQ64;
 
@@ -2254,6 +2507,25 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     }
     states {
         Entry: {
+            operand == null => FailOperand;
+            let op_k = operand.kind;
+            op_k == 11 => CheckFastReal;
+            _          => NormalEntry;
+        }
+        CheckFastReal: {
+            let is_f64 = call str_eq(target_t_p, target_t_l, "f64", 3);
+            let is_double = call str_eq(target_t_p, target_t_l, "double", 6);
+            let is_fp64 = is_f64 | is_double;
+            is_fp64 != 0 => FastRealLitF64;
+
+            let is_f32 = call str_eq(target_t_p, target_t_l, "f32", 3);
+            let is_float = call str_eq(target_t_p, target_t_l, "float", 5);
+            let is_fp32 = is_f32 | is_float;
+            is_fp32 != 0 => FastRealLitF32;
+
+            _          => NormalEntry;
+        }
+        NormalEntry: {
             let val = call emit_expr(ctx, operand);
             let st = call get_expr_type(ctx, operand);
             let dt = call make_cstr(ctx.alloc, target_t_p, target_t_l);
@@ -2262,6 +2534,28 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let d_ptr = call is_ptr_type(dt);
 
             _ => Classify [ val_str <= val, s_type <= st, d_type <= dt, src_is_ptr <= s_ptr, dst_is_ptr <= d_ptr ];
+        }
+        FastRealLitF64: {
+            let raw_cstr = call make_cstr(ctx.alloc, operand.str_ptr, operand.str_len);
+            _ => return raw_cstr;
+        }
+        FastRealLitF32: {
+            // Note: LLVM IR constraint.
+            // In LLVM IR text format (.ll), writing an inexact decimal literal directly for 'float'
+            // triggers 'error: floating point constant invalid for type' because LLVM disallows
+            // lossy decimal-to-float parsing. Therefore, we emit it as 'double' and convert via 'fptrunc'.
+            let raw_cstr = call make_cstr(ctx.alloc, operand.str_ptr, operand.str_len);
+            let tmp_f = call fresh_tmp_str(ctx, "lit_f32", 7);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, tmp_f, call strlen(tmp_f));
+            let _ = call emit_str(ctx, " = fptrunc double ", 18);
+            let _ = call emit_str(ctx, raw_cstr, call strlen(raw_cstr));
+            let _ = call emit_str(ctx, " to float", 9);
+            let _ = call emit_nl(ctx);
+            _ => return tmp_f;
+        }
+        FailOperand: {
+            _ => return "null";
         }
         Classify: {
             let s_l = call strlen(s_type);
@@ -2276,15 +2570,99 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             is_src_q != 0 => CastFromQ64;
 
             src_is_ptr != 0 => SrcIsPtr;
+            dst_is_ptr != 0 => SrcIsInt;
+
+            let is_src_fp = call is_type_float_or_vec(s_type, s_l);
+            let is_dst_fp = call is_type_float_or_vec(d_type, d_l);
+            is_src_fp != 0 => SrcIsFloat;
+            is_dst_fp != 0 => DstIsFloat;
+
             _               => SrcIsInt;
+        }
+        SrcIsFloat: {
+            let d_l = call strlen(d_type);
+            let is_dst_fp = call is_type_float_or_vec(d_type, d_l);
+            is_dst_fp != 0 => FpToFp;
+            _              => FpToInt;
+        }
+        DstIsFloat: {
+            _ => IntToFp;
+        }
+        FpToFp: {
+            let s_l = call strlen(s_type);
+            let is_f32 = call str_eq(s_type, s_l, "f32", 3);
+            is_f32 != 0 => DoFpExt;
+            _           => DoFpTrunc;
+        }
+        DoFpExt: {
+            let res = call emit_cast_op(ctx, "fpext", 5, s_type, call strlen(s_type), d_type, call strlen(d_type), val_str);
+            _ => return res;
+        }
+        DoFpTrunc: {
+            let res = call emit_cast_op(ctx, "fptrunc", 7, s_type, call strlen(s_type), d_type, call strlen(d_type), val_str);
+            _ => return res;
+        }
+        IntToFp: {
+            let is_signed = call is_type_signed(s_type);
+            is_signed != 0 => DoSitofp;
+            _              => DoUitofp;
+        }
+        DoSitofp: {
+            let res = call emit_cast_op(ctx, "sitofp", 6, s_type, call strlen(s_type), d_type, call strlen(d_type), val_str);
+            _ => return res;
+        }
+        DoUitofp: {
+            let res = call emit_cast_op(ctx, "uitofp", 6, s_type, call strlen(s_type), d_type, call strlen(d_type), val_str);
+            _ => return res;
+        }
+        FpToInt: {
+            let is_signed = call is_type_signed(d_type);
+            is_signed != 0 => DoFptosi;
+            _              => DoFptoui;
+        }
+        DoFptosi: {
+            let res = call emit_cast_op(ctx, "fptosi", 6, s_type, call strlen(s_type), d_type, call strlen(d_type), val_str);
+            _ => return res;
+        }
+        DoFptoui: {
+            let res = call emit_cast_op(ctx, "fptoui", 6, s_type, call strlen(s_type), d_type, call strlen(d_type), val_str);
+            _ => return res;
         }
         ReturnNop: {
             _ => return val_str;
         }
         CastToQ64: {
+            let s_l = call strlen(s_type);
+            let is_src_fp = call is_type_float_or_vec(s_type, s_l);
+            is_src_fp != 0 => CastToQ64_Fp;
+
             let s_bits = call get_type_bit_width(s_type);
             s_bits < 64 => CastToQ64_Ext;
             _           => CastToQ64_Shl [ ext_val <= val_str ];
+        }
+        CastToQ64_Fp: {
+            let s_l = call strlen(s_type);
+            let is_f32 = call str_eq(s_type, s_l, "f32", 3);
+            let is_float = call str_eq(s_type, s_l, "float", 5);
+            let is_fp32 = is_f32 | is_float;
+            is_fp32 != 0 => CastToQ64_Fpext;
+            _ => CastToQ64_Mul [ ext_val <= val_str ];
+        }
+        CastToQ64_Fpext: {
+            let ext = call emit_cast_op(ctx, "fpext", 5, s_type, call strlen(s_type), "double", 6, val_str);
+            _ => CastToQ64_Mul [ ext_val <= ext ];
+        }
+        CastToQ64_Mul: {
+            let tmp_mul = call fresh_tmp_str(ctx, "fmul_q", 6);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, tmp_mul, call strlen(tmp_mul));
+            let _ = call emit_str(ctx, " = fmul double ", 15);
+            let _ = call emit_str(ctx, ext_val, call strlen(ext_val));
+            let _ = call emit_str(ctx, ", 4294967296.0", 14);
+            let _ = call emit_nl(ctx);
+
+            let res = call emit_cast_op(ctx, "fptosi", 6, "double", 6, "i64", 3, tmp_mul);
+            _ => return res;
         }
         CastToQ64_Ext: {
             let is_signed = call is_type_signed(s_type);
@@ -2310,6 +2688,40 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             _ => return res;
         }
         CastFromQ64: {
+            let d_l = call strlen(d_type);
+            let is_dst_fp = call is_type_float_or_vec(d_type, d_l);
+            is_dst_fp != 0 => CastFromQ64_Fp;
+            _              => CastFromQ64_Int;
+        }
+        CastFromQ64_Fp: {
+            let tmp_sitofp = call fresh_tmp_str(ctx, "q2fp", 4);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, tmp_sitofp, call strlen(tmp_sitofp));
+            let _ = call emit_str(ctx, " = sitofp i64 ", 14);
+            let _ = call emit_str(ctx, val_str, call strlen(val_str));
+            let _ = call emit_str(ctx, " to double", 10);
+            let _ = call emit_nl(ctx);
+
+            let tmp_div = call fresh_tmp_str(ctx, "q_div", 5);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, tmp_div, call strlen(tmp_div));
+            let _ = call emit_str(ctx, " = fdiv double ", 15);
+            let _ = call emit_str(ctx, tmp_sitofp, call strlen(tmp_sitofp));
+            let _ = call emit_str(ctx, ", 4294967296.0", 14);
+            let _ = call emit_nl(ctx);
+
+            let d_l = call strlen(d_type);
+            let is_f32 = call str_eq(d_type, d_l, "f32", 3);
+            let is_float = call str_eq(d_type, d_l, "float", 5);
+            let is_either = is_f32 | is_float;
+            is_either != 0 => CastFromQ64_TruncFp [ shr_val <= tmp_div ];
+            _ => return tmp_div;
+        }
+        CastFromQ64_TruncFp: {
+            let res = call emit_cast_op(ctx, "fptrunc", 7, "double", 6, "float", 5, shr_val);
+            _ => return res;
+        }
+        CastFromQ64_Int: {
             let shr = call fresh_tmp_str(ctx, "shr_q", 5);
             let _ = call emit_str(ctx, "  ", 2);
             let _ = call emit_str(ctx, shr, call strlen(shr));
@@ -2468,14 +2880,43 @@ machine emit_var(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let wire_ptr = call find_wire(m, name_p, name_l);
             wire_ptr != null => ExpandWire;
 
-            // デフォルト: "%name"
-            let b_def_p = alloc.base_ptr;
-            let off_def_p = alloc.offset;
-            let def_p = b_def_p + off_def_p;
-            let _ = call append_char_to_alloc(alloc, 37); // '%'
-            let _ = call append_str_to_alloc(alloc, name_p, name_l);
-            let _ = call append_char_to_alloc(alloc, 0);
-            _ => return def_p;
+            _ => FailUndefined;
+        }
+        FailUndefined: {
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            let _ = call diag_str("COMPILATION ERROR: Undefined operand variable '");
+            let _ = call diag_write(name_p, name_l);
+            let _ = call diag_str("'");
+            m != null => PrintOperandMachine;
+            _ => PrintOperandState;
+        }
+        PrintOperandMachine: {
+            let _ = call diag_str(" in machine '");
+            let _ = call diag_write(m.name_ptr, m.name_len);
+            let _ = call diag_str("'");
+            _ => PrintOperandState;
+        }
+        PrintOperandState: {
+            let sp = ctx.cur_state_p;
+            sp != null => PrintOperandStateName;
+            _ => EndOperandError;
+        }
+        PrintOperandStateName: {
+            let _ = call diag_str(" state '");
+            let _ = call diag_write(ctx.cur_state_p, ctx.cur_state_l);
+            let _ = call diag_str("'");
+            _ => EndOperandError;
+        }
+        EndOperandError: {
+            let _ = call diag_nl();
+            let _ = call diag_str("Deterministic Definition Violation: Operand variable must be strictly defined in scope.");
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            ctx.error_code <- -51;
+            _ => ReturnNull;
         }
         ReturnNull: {
             _ => return "null";
@@ -2851,6 +3292,114 @@ machine emit_q64_div(ctx: *CodegenCtx, left_val: *u8, right_val: *u8) -> *u8 {
     }
 }
 
+machine emit_float_bin_op(ctx: *CodegenCtx, op: u32, lt_p: *u8, rt_p: *u8, lv: *u8, rv: *u8) -> *u8 {
+    flow {
+        reg target_p: *u8 = null;
+        reg mapped_p: *u8 = null;
+        reg mapped_l: u32 = 0;
+        reg op_cmd_p: *u8 = "fadd ";
+        reg op_cmd_l: u32 = 5;
+
+        wire lt_l = call strlen(lt_p);
+        wire is_lt_fp_vec = call is_type_float_or_vec(lt_p, lt_l);
+    }
+    states {
+        Entry: {
+            is_lt_fp_vec != 0 => UseLeftType;
+            _                 => UseRightType;
+        }
+        UseLeftType: {
+            _ => CheckElem [ target_p <= lt_p ];
+        }
+        UseRightType: {
+            _ => CheckElem [ target_p <= rt_p ];
+        }
+        CheckElem: {
+            let tl = call strlen(target_p);
+            let mp = call map_type_ptr(ctx, target_p, tl);
+            let ml = call map_type_len(ctx, target_p, tl);
+            let has_float = call str_contains(mp, ml, "float", 5);
+            let has_double = call str_contains(mp, ml, "double", 6);
+            let is_fp = has_float | has_double;
+            is_fp != 0 => SelectFpOp    [ mapped_p <= mp, mapped_l <= ml ];
+            _          => SelectIntVecOp [ mapped_p <= mp, mapped_l <= ml ];
+        }
+
+        SelectFpOp: {
+            op == 71 => SetFAdd;
+            op == 72 => SetFSub;
+            op == 70 => SetFMul;
+            op == 73 => SetFDiv;
+            op == 46 => SetFCmpEq;
+            op == 47 => SetFCmpNe;
+            op == 60 => SetFCmpLt;
+            op == 44 => SetFCmpLe;
+            op == 61 => SetFCmpGt;
+            op == 48 => SetFCmpGe;
+            _        => SetFAdd;
+        }
+        SetFAdd: { _ => DoEmit [ op_cmd_p <= "fadd ", op_cmd_l <= 5 ]; }
+        SetFSub: { _ => DoEmit [ op_cmd_p <= "fsub ", op_cmd_l <= 5 ]; }
+        SetFMul: { _ => DoEmit [ op_cmd_p <= "fmul ", op_cmd_l <= 5 ]; }
+        SetFDiv: { _ => DoEmit [ op_cmd_p <= "fdiv ", op_cmd_l <= 5 ]; }
+        SetFCmpEq: { _ => DoEmit [ op_cmd_p <= "fcmp oeq ", op_cmd_l <= 9 ]; }
+        SetFCmpNe: { _ => DoEmit [ op_cmd_p <= "fcmp one ", op_cmd_l <= 9 ]; }
+        SetFCmpLt: { _ => DoEmit [ op_cmd_p <= "fcmp olt ", op_cmd_l <= 9 ]; }
+        SetFCmpLe: { _ => DoEmit [ op_cmd_p <= "fcmp ole ", op_cmd_l <= 9 ]; }
+        SetFCmpGt: { _ => DoEmit [ op_cmd_p <= "fcmp ogt ", op_cmd_l <= 9 ]; }
+        SetFCmpGe: { _ => DoEmit [ op_cmd_p <= "fcmp oge ", op_cmd_l <= 9 ]; }
+
+        SelectIntVecOp: {
+            op == 71 => SetAdd;
+            op == 72 => SetSub;
+            op == 70 => SetMul;
+            op == 73 => SetSDiv;
+            op == 46 => SetICmpEq;
+            op == 47 => SetICmpNe;
+            op == 60 => SetICmpLt;
+            op == 44 => SetICmpLe;
+            op == 61 => SetICmpGt;
+            op == 48 => SetICmpGe;
+            op == 40 => SetShl;
+            op == 41 => SetAshr;
+            op == 62 => SetAnd;
+            op == 63 => SetOr;
+            op == 64 => SetXor;
+            _        => SetAdd;
+        }
+        SetAdd:  { _ => DoEmit [ op_cmd_p <= "add ", op_cmd_l <= 4 ]; }
+        SetSub:  { _ => DoEmit [ op_cmd_p <= "sub ", op_cmd_l <= 4 ]; }
+        SetMul:  { _ => DoEmit [ op_cmd_p <= "mul ", op_cmd_l <= 4 ]; }
+        SetSDiv: { _ => DoEmit [ op_cmd_p <= "sdiv ", op_cmd_l <= 5 ]; }
+        SetICmpEq: { _ => DoEmit [ op_cmd_p <= "icmp eq ", op_cmd_l <= 8 ]; }
+        SetICmpNe: { _ => DoEmit [ op_cmd_p <= "icmp ne ", op_cmd_l <= 8 ]; }
+        SetICmpLt: { _ => DoEmit [ op_cmd_p <= "icmp slt ", op_cmd_l <= 9 ]; }
+        SetICmpLe: { _ => DoEmit [ op_cmd_p <= "icmp sle ", op_cmd_l <= 9 ]; }
+        SetICmpGt: { _ => DoEmit [ op_cmd_p <= "icmp sgt ", op_cmd_l <= 9 ]; }
+        SetICmpGe: { _ => DoEmit [ op_cmd_p <= "icmp sge ", op_cmd_l <= 9 ]; }
+        SetShl:  { _ => DoEmit [ op_cmd_p <= "shl ", op_cmd_l <= 4 ]; }
+        SetAshr: { _ => DoEmit [ op_cmd_p <= "ashr ", op_cmd_l <= 5 ]; }
+        SetAnd:  { _ => DoEmit [ op_cmd_p <= "and ", op_cmd_l <= 4 ]; }
+        SetOr:   { _ => DoEmit [ op_cmd_p <= "or ", op_cmd_l <= 3 ]; }
+        SetXor:  { _ => DoEmit [ op_cmd_p <= "xor ", op_cmd_l <= 4 ]; }
+
+        DoEmit: {
+            let res_var = call fresh_tmp_str(ctx, "vop", 3);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, res_var, call strlen(res_var));
+            let _ = call emit_str(ctx, " = ", 3);
+            let _ = call emit_str(ctx, op_cmd_p, op_cmd_l);
+            let _ = call emit_str(ctx, mapped_p, mapped_l);
+            let _ = call emit_str(ctx, " ", 1);
+            let _ = call emit_str(ctx, lv, call strlen(lv));
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, rv, call strlen(rv));
+            let _ = call emit_nl(ctx);
+            _ => return res_var;
+        }
+    }
+}
+
 machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     flow {
         reg left_val:     *u8 = null;
@@ -2919,6 +3468,13 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             _ => return res;
         }
         EmitNormal: {
+            let is_fl = call is_type_float_or_vec(left_type_p, call strlen(left_type_p));
+            let is_fr = call is_type_float_or_vec(right_type_p, call strlen(right_type_p));
+            let is_f_or_v = is_fl | is_fr;
+            is_f_or_v != 0 => EmitFloatOp;
+            _              => EmitIntBinOp;
+        }
+        EmitIntBinOp: {
             let plv = call promote_bin_operand(ctx, left_e, left_type_p, left_val, op_mode_reg);
             let prv = call promote_bin_operand(ctx, right_e, right_type_p, right_val, op_mode_reg);
 
@@ -2927,6 +3483,10 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let is_q = is_ql | is_qr;
             is_q != 0 => CheckQ64Op [ plv_r <= plv, prv_r <= prv ];
             _         => EmitStandard [ plv_r <= plv, prv_r <= prv ];
+        }
+        EmitFloatOp: {
+            let res = call emit_float_bin_op(ctx, op, left_type_p, right_type_p, left_val, right_val);
+            _ => return res;
         }
         CheckQ64Op: {
             op == 70 => EmitQ64Mul; // *
@@ -3069,6 +3629,9 @@ machine emit_deref_expr(ctx: *CodegenCtx, sub_e: *ExprNode) -> *u8 {
             let _ = call emit_str(ctx, mapped_type_p, mapped_type_l);
             let _ = call emit_str(ctx, "* ", 2);
             let _ = call emit_str(ctx, deref_val, call strlen(deref_val));
+            let align_str = call get_type_align_str(mapped_type_p, mapped_type_l);
+            let _ = call emit_str(ctx, ", align ", 8);
+            let _ = call emit_str(ctx, align_str, call strlen(align_str));
             let _ = call emit_nl(ctx);
             _ => return res_var;
         }
@@ -3853,6 +4416,9 @@ machine emit_store(ctx: *CodegenCtx, target: *ExprNode, expr: *ExprNode) -> u32 
             let _ = call emit_str(ctx, dst_type_p, dst_type_l);
             let _ = call emit_str(ctx, "* ", 2);
             let _ = call emit_str(ctx, dst_ptr, call strlen(dst_ptr));
+            let align_str = call get_type_align_str(dst_type_p, dst_type_l);
+            let _ = call emit_str(ctx, ", align ", 8);
+            let _ = call emit_str(ctx, align_str, call strlen(align_str));
             let _ = call emit_nl(ctx);
             _ => Exit;
         }
@@ -4070,6 +4636,31 @@ machine emit_entry_block(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
     }
 }
 
+machine has_char_x(s: *u8, l: u32) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire has_more = i < l;
+        wire p = s + i;
+        wire c = *p;
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            c == 120 => Found; // 'x'
+            _ => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return 1;
+        }
+        NotFound: {
+            _ => return 0;
+        }
+    }
+}
+
 machine get_default_reg_val(type_p: *u8, type_l: u32) -> *u8 {
     flow {
         wire c0 = *type_p;
@@ -4077,10 +4668,28 @@ machine get_default_reg_val(type_p: *u8, type_l: u32) -> *u8 {
     states {
         Entry: {
             c0 == 42 => ReturnNull; // '*'
-            _        => ReturnZero;
+            c0 == 102 => CheckFloat; // 'f'
+            let is_v = call has_char_x(type_p, type_l);
+            is_v != 0 => ReturnZeroInit;
+            _ => ReturnZero;
+        }
+        CheckFloat: {
+            let is_f32 = call str_eq(type_p, type_l, "f32", 3);
+            is_f32 != 0 => ReturnFloatZero;
+            let is_f64 = call str_eq(type_p, type_l, "f64", 3);
+            is_f64 != 0 => ReturnFloatZero;
+            let is_v = call has_char_x(type_p, type_l);
+            is_v != 0 => ReturnZeroInit;
+            _ => ReturnZero;
         }
         ReturnNull: {
             _ => return "null";
+        }
+        ReturnFloatZero: {
+            _ => return "0.0";
+        }
+        ReturnZeroInit: {
+            _ => return "zeroinitializer";
         }
         ReturnZero: {
             _ => return "0";
@@ -4430,6 +5039,11 @@ machine emit_state_rules(ctx: *CodegenCtx, m: *MachineDef, s: *StateDef, s_idx: 
             _                  => UnconditionalBranch;
         }
         GuardedBranch: {
+            let gt_p = call get_expr_type(ctx, rule_guard);
+            let gt_l = call strlen(gt_p);
+            let is_vec_mask = call is_type_vector_mask(gt_p, gt_l);
+            is_vec_mask != 0 => VectorGuardError;
+
             let cond_val = call emit_expr(ctx, rule_guard);
 
             // then_bb: "{cur_bb}_then_{r_idx}"
@@ -4484,6 +5098,10 @@ machine emit_state_rules(ctx: *CodegenCtx, m: *MachineDef, s: *StateDef, s_idx: 
             let _ = call emit_str(ctx, rule.target_ptr, rule.target_len);
             let _ = call emit_nl(ctx);
             _ => FinishStateBlock;
+        }
+        VectorGuardError: {
+            let _ = call write(2, "error: Vector comparison (<N x i1>) cannot be used directly as a state transition guard (SPEC_V0_14)\n", 104);
+            _ => panic(1);
         }
         FinishStateBlock: {
             let _ = call finish_cur_bb(ctx, cur_bb);

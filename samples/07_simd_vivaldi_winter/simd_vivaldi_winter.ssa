@@ -1,0 +1,778 @@
+// ============================================================================
+// StateSSA f32x4 SIMD 4-Voice Polyphonic FM Synthesizer
+// Antonio Vivaldi: "Winter" (L'Inverno), Op. 8 No. 4, RV 297, 1st Movement
+// Pure SIMD Dataflow, Zero External Dependencies, 44.1kHz 16-bit Mono WAV
+// Exact Zero-Crossing 7th-Order Minimax Polynomial Oscillator + Boundary Window
+// ============================================================================
+
+extern "C" {
+    fn malloc(sz: u32) -> *u8;
+    fn free(p: *u8) -> void;
+    fn memset(s: *u8, c: i32, n: u32) -> *u8;
+    fn fopen(path: *u8, mode: *u8) -> *void;
+    fn fwrite(ptr: *u8, size: u32, nmemb: u32, stream: *void) -> u32;
+    fn fclose(stream: *void) -> i32;
+    fn puts(s: *u8) -> i32;
+    fn printf(fmt: *u8, s1: *u8, s2: *u8) -> i32;
+}
+
+// ----------------------------------------------------------------------------
+// Machine: simd_vivaldi_winter
+// ----------------------------------------------------------------------------
+machine simd_vivaldi_winter(out_wav_path: *u8) -> i32 {
+    flow {
+        reg hex_dphi: *u8 = "0000000017F54D3949345A39E92D67390DED7439BABE8139C675893945A29139304B9A39EE77A3395730AD39B77CB739DB65C23917F5CD394934DA39E92DE7390DEDF439BABE013AC675093A45A2113A304B1A3AEE77233A57302D3AB77C373ADB65423A17F54D3A49345A3AE92D673A0DED743ABABE813AC675893A45A2913A304B9A3AEE77A33A5730AD3AB77CB73ADB65C23A17F5CD3A4934DA3AE92DE73A0DEDF43ABABE013BC675093B45A2113B304B1A3BEE77233B57302D3BB77C373BDB65423B17F54D3B49345A3BE92D673B0DED743BBABE813BC675893B45A2913B304B9A3BEE77A33B5730AD3BB77CB73BDB65C23B17F5CD3B4934DA3BE92DE73B0DEDF43BBABE013CC675093C45A2113C304B1A3CEE77233C57302D3CB77C373CDB65423C17F54D3C49345A3CE92D673C0DED743CBABE813CC675893C45A2913C304B9A3CEE77A33C5730AD3CB77CB73CDB65C23C17F5CD3C4934DA3CE92DE73C0DEDF43CBABE013DC675093D45A2113D304B1A3DEE77233D57302D3DB77C373DDB65423D17F54D3D49345A3DE92D673D0DED743DBABE813DC675893D45A2913D304B9A3DEE77A33D5730AD3DB77CB73DDB65C23D17F5CD3D4934DA3DE92DE73D0DEDF43DBABE013EC675093E45A2113E304B1A3EEE77233E57302D3EB77C373EDB65423E17F54D3E49345A3EE92D673E0DED743EBABE813EC675893E45A2913E";
+        reg hex_score: *u8 = "0000000000000000000000B5000000B5000000B500000035000000B5000000B5000000B500000035000000B5000000B5000000B500000035000000B5000000B5000000B500000035000000B5000000B5000000B500000035000000B5000000B5000000B500000035000000B5000000B5000000B500000035000000B5000000B5000000B5000000350000C3B50000C3B50000C3B5000043350000C3B50000C3B50000C3B5000043350000C3B50000C3B50000C3B5000043350000C3B50000C3B50000C3B5000043350000C3B50000C3B50000C3B5000043350000C3B50000C3B50000C3B5000043350000C3B50000C3B50000C3B5000043350000C3B50000C3B50000C3B50000433500C9C3B500C9C3B500C9C3B50049433500C9C3B500C9C3B500C9C3B50049433500C9C3B500C9C3B500C9C3B50049433500C9C3B500C9C3B500C9C3B50049433500C9C3B500C9C3B500C9C3B50049433500C9C3B500C9C3B500C9C3B50049433500C9C3B500C9C3B500C9C3B50049433500C9C3B500C9C3B500C9C3B500494335D2C9C3B5D2C9C335D2C9C30052494300D2C9C3B5D2C9C335D2C9C30052494300D2C9C3B5D2C9C335D2C9C30052494300D2C9C3B5D2C9C335D2C9C30052494300D2C9C3B5D2C9C335D2C9C30052494300D2C9C3B5D2C9C335D2C9C30052494300D2C9C3B5D2C9C335D2C9C30052494300D2C9C3B5D2C9C335D2C9C30052494300D2C9C3B4D2C9C334D2C9C30052494300D2C9C3B4D2C9C334D2C9C30052494300D2C9C3B4D2C9C334D2C9C30052494300D2C9C3B4D2C9C334D2C9C30052494300D2C9C3B4D2C9C334D2C9C30052494300D2C9C3B4D2C9C334D2C9C30052494300D2C9C3B4D2C9C334D2C9C30052494300D2C9C3B4D2C9C334D2C9C30052494300D0C8C4B5D0C8C435D0C8C40050484400D0C8C4B5D0C8C435D0C8C40050484400D0C8C4B5D0C8C435D0C8C40050484400D0C8C4B5D0C8C435D0C8C40050484400D0C8C1B5D0C8C135D0C8C10050484100D0C8C1B5D0C8C135D0C8C10050484100D0C8C1B5D0C8C135D0C8C10050484100D0C8C1B5D0C8C135D0C8C10050484100C9C6C1B5C9C6C135C9C6C10049464100C9C6C1B5C9C6C135C9C6C10049464100C9C6C1B5C9C6C135C9C6C10049464100C9C6C1B5C9C6C135C9C6C10049464100C9C6C1B5C9C6C135C9C6C10049464100C9C6C1B5C9C6C135C9C6C10049464100C9C6C1B5C9C6C135C9C6C10049464100C9C6C1B5C9C6C135C9C6C10049464100CBC8C5B5CBC8C535CBC8C5004B484500CBC8C5B5CBC8C535CBC8C5004B484500CBC8C5B5CBC8C535CBC8C5004B484500CBC8C5B5CBC8C535CBC8C5004B484500CBC8C5B5CBC8C535CBC8C5004B484500CBC8C5B5CBC8C535CBC8C5004B484500CBC8C5B5CBC8C535CBC8C5004B484500CBC8C5B5CBC8C535CBC8C5004B484500CAC7C3B5CAC7C335CAC7C3004A474300CAC7C3B5CAC7C335CAC7C3004A474300CAC7C3B5CAC7C335CAC7C3004A474300CAC7C3B5CAC7C335CAC7C3004A474300CAC7C3B5CAC7C335CAC7C3004A474300CAC7C3B5CAC7C335CAC7C3004A474300CAC7C3B5CAC7C335CAC7C3004A474300CAC7C3B5CAC7C335CAC7C3004A474300CBC8C5B6CBC8C536CBC8C5004B484500CBC8C5B6CBC8C536CBC8C5004B484500CBC8C5B6CBC8C536CBC8C5004B484500CBC8C5B6CBC8C536CBC8C5004B484500CBC8C5B6CBC8C536CBC8C5004B484500CBC8C5B6CBC8C536CBC8C5004B484500CBC8C5B6CBC8C536CBC8C5004B484500CBC8C5B6CBC8C536CBC8C5004B484500CAC8C3B7CAC8C337CAC8C3004A484300CAC8C3B7CAC8C337CAC8C3004A484300CAC8C3B7CAC8C337CAC8C3004A484300CAC8C3B7CAC8C337CAC8C3004A484300CAC7C3ABCAC7C32BCAC7C3004A474300CAC7C3ABCAC7C32BCAC7C3004A474300CAC7C3ABCAC7C32BCAC7C3004A474300CAC7C3ABCAC7C32BCAC7C3004A474300C8BFC3B0D43F4330D43F4330CF3F4330CF3F4330CB3F4330CB3F4330C8000000C8000000D4000000D4000000CF000000CF000000CB000000CB000000C8000000C8000000D4000000D2000000D0000000CF000000CD000000CB000000CA000000C8000000D4000000D2000000D0000000CF000000CD000000CB000000CA000000C8000000C3000000C8000000CB000000C8000000C3000000C8000000CB000000C8000000C3000000C8000000CB000000C8000000C3000000C8000000CB000000BDBFBCB0BCBFBC30BDBFBC00BC3F3C00BCBFBCB0BDBFBC30BDBFBC00BC3F3C00BDBFBCB0BCBFBC30BCBFBC00BD3F3C00BDBFBCB0BCBFBC30BDBFBC00BC3F3C00C3BFBCB0C3BFBC30C3BFBC00433F3C00C3BFBCB0C3BFBC30C3BFBC00433F3C00C3BFBCB0C3BFBC30C3BFBC00433F3C00C3BFBCB0C3BFBC30C3BFBC00433F3C00CBBFBCB0D73F3C30D73F3C30D43F3C30D43F3C30CF3F3C30CF3F3C30CB000000CB000000D7000000D7000000D4000000D4000000CF000000CF000000CB000000CB000000D7000000D6000000D4000000D3000000D1000000CF000000CD000000CB000000D7000000D6000000D4000000D3000000D1000000CF000000CD000000CB000000C8000000CB000000CF000000CB000000C8000000CB000000CF000000CB000000C8000000CB000000CF000000CB000000C8000000CB000000CF000000C1BFBCB0BFBFBC30BFBFBC00C13F3C00C1BFBCB0BFBFBC30C1BFBC00BF3F3C00C1BFBCB0BFBFBC30BFBFBC00C13F3C00C1BFBCB0BFBFBC30C1BFBC00BF3F3C00C3BFBCB0C3BFBC30C3BFBC00433F3C00C3BFBCB0C3BFBC30C3BFBC00433F3C00C3BFBCB0C3BFBC30C3BFBC00433F3C00C3BFBCB0C3BFBC30C3BFBC00433F3C00CFBFBCB0DB3F3C30DB3F3C30D73F3C30D73F3C30D43F3C30D43F3C30CF000000CF000000DB000000DB000000D7000000D7000000D4000000D4000000CF000000CF000000DB000000D9000000D7000000D6000000D4000000D3000000D1000000CF000000DB000000D9000000D7000000D6000000D4000000D3000000D1000000CF000000CB000000CF000000D4000000CF000000CB000000CF000000D4000000CF000000CB000000CF000000D4000000CF000000CB000000CF000000D4000000C9C80000C8C80000C8C80000C9480000C9C80000C8C80000C9C80000C8480000C9C80000C8C80000C8C80000C9480000C9C80000C8C80000C9C80000C8480000C9C80000C9C80000C9C8000049480000C9C80000C9C80000C9C8000049480000C9C80000C9C80000C9C8000049480000C9C80000C9C80000C9C8000049480000CCC60000CCC60000CCC600004C460000CCC60000CCC60000CCC600004C460000CCC60000CCC60000CCC600004C460000CCC60000CCC60000CCC600004C460000CDC400B54DC40035C1C4000041440000C1C400B541C40035C1C4000041440000C1C400B541C40035C1C4000041440000C1C400B541C40035C1C4000041440000C1C6C2B541C6C235C1C6C20041464200C1C6C2B541C6C235C1C6C20041464200C1C6C2B541C6C235C1C6C20041464200C1C6C2B541C6C235C1C6C20041464200C1C8C5B341C8C533C1C8C50041484500C1C8C5B341C8C533C1C8C50041484500C1C8C5B341C8C533C1C8C50041484500C1C8C5B341C8C533C1C8C50041484500C1C9C6B141C9C631C1C9C60041494600C1C9C6B141C9C631C1C9C60041494600C1C9C6B141C9C631C1C9C60041494600C1C9C6B141C9C631C1C9C60041494600C1C9C7B141C9C731C1C9C70041494700C1C9C7B141C9C731C1C9C70041494700C1C9C7B141C9C731C1C9C70041494700C1C9C7B141C9C731C1C9C70041494700C0BCC8B0403C4830CFCC4830CFCC4830CFCC4830CFCC4830CFCC4830CFCC0000CFCC00004F4C0000CFCC00004F4C0000CFCC00004F4C0000";
+
+        reg dphi_table: *f32 = null; // 128 floats = 512 bytes
+        reg score_buf: *u8 = null;   // 704 * 4 bytes = 2816 bytes
+        reg wav_buf: *i16 = null;    // 3146880 samples * 2 bytes = 6293760 bytes
+
+        // Constant SIMD Buffers (16 bytes each)
+        reg c_half_buf: *u8 = null;
+        reg c_c1_buf: *u8 = null;
+        reg c_c3_buf: *u8 = null;
+        reg c_c5_buf: *u8 = null;
+        reg c_c7_buf: *u8 = null;
+
+        // Dynamic State SIMD Buffers (16 bytes each, 4 voices: Solo, Vn2, Vla, Bass)
+        reg phase_m_buf: *u8 = null;
+        reg phase_c_buf: *u8 = null;
+        reg dphi_m_buf: *u8 = null;
+        reg dphi_c_buf: *u8 = null;
+        reg env_a_buf: *u8 = null;
+        reg env_i_buf: *u8 = null;
+        reg pmod_buf: *u8 = null;
+        reg sin_m_buf: *u8 = null;
+        reg car_out_buf: *u8 = null;
+
+        // Configuration Tables
+        reg cm_ratio_buf: *f32 = null; // 4 floats: [1.0, 2.0, 1.0, 0.5]
+        reg base_mod_buf: *f32 = null; // 4 floats: [1.5, 1.0, 1.2, 2.0]
+
+        // Loop Registers
+        reg hex_idx: i32 = 0;
+        reg byte_idx: i32 = 0;
+        reg cur_step: i32 = 0;
+        reg cur_sample: i32 = 0;
+        reg total_sample_idx: i32 = 0;
+
+        reg wav_file: *void = null;
+        reg riff_hdr: *u8 = null;
+
+        // Temp variables for decoding & step setup
+        reg dec_c0: i32 = 0;
+        reg dec_c1: i32 = 0;
+        reg dec_v0: i32 = 0;
+        reg dec_v1: i32 = 0;
+
+        reg v_idx: i32 = 0;
+        reg cur_note: i32 = 0;
+        reg cur_is_attack: i1;
+        reg cur_dval: f32;
+        reg cur_cm: f32;
+        reg cur_bmod: f32;
+
+        // Render phase scalars
+        reg r_pm0: f32; reg r_pm1: f32;
+        reg r_pm2: f32; reg r_pm3: f32;
+        reg r_pc0: f32; reg r_pc1: f32;
+        reg r_pc2: f32; reg r_pc3: f32;
+        reg r_mod0: f32; reg r_mod1: f32;
+        reg r_mod2: f32; reg r_mod3: f32;
+        reg r_mix: f32;
+        reg r_pcm_i: i32 = 0;
+    }
+    states {
+        Entry: {
+            let _ = call puts("StateSSA SIMD 4-Voice FM Synthesizer: Vivaldi Winter RV297");
+
+            // Allocate tables and buffers
+            let p_dphi = call malloc(512);
+            let p_score = call malloc(2816);
+            let p_wav = call malloc(6293760);
+
+            let p_half = call malloc(16);
+            let p_c1 = call malloc(16);
+            let p_c3 = call malloc(16);
+            let p_c5 = call malloc(16);
+            let p_c7 = call malloc(16);
+
+            let p_pm = call malloc(16);
+            let p_pc = call malloc(16);
+            let p_dm = call malloc(16);
+            let p_dc = call malloc(16);
+            let p_ea = call malloc(16);
+            let p_ei = call malloc(16);
+            let p_pmod = call malloc(16);
+            let p_sm = call malloc(16);
+            let p_co = call malloc(16);
+            let p_hdr = call malloc(44);
+
+            let p_cm = call malloc(16);
+            let p_bmod = call malloc(16);
+
+            let _ = call memset(p_pm, 0, 16);
+            let _ = call memset(p_pc, 0, 16);
+            let _ = call memset(p_dm, 0, 16);
+            let _ = call memset(p_dc, 0, 16);
+            let _ = call memset(p_ea, 0, 16);
+            let _ = call memset(p_ei, 0, 16);
+
+            _ => InitConstants [
+                dphi_table <= cast(*f32) p_dphi,
+                score_buf <= p_score,
+                wav_buf <= cast(*i16) p_wav,
+                c_half_buf <= p_half,
+                c_c1_buf <= p_c1,
+                c_c3_buf <= p_c3,
+                c_c5_buf <= p_c5,
+                c_c7_buf <= p_c7,
+                phase_m_buf <= p_pm,
+                phase_c_buf <= p_pc,
+                dphi_m_buf <= p_dm,
+                dphi_c_buf <= p_dc,
+                env_a_buf <= p_ea,
+                env_i_buf <= p_ei,
+                pmod_buf <= p_pmod,
+                sin_m_buf <= p_sm,
+                car_out_buf <= p_co,
+                riff_hdr <= p_hdr,
+                cm_ratio_buf <= cast(*f32) p_cm,
+                base_mod_buf <= cast(*f32) p_bmod
+            ];
+        }
+
+        InitConstants: {
+            // Store 0.5 into c_half_buf
+            let pf_half = cast(*f32) c_half_buf;
+            *pf_half <- cast(f32) 0.5; *(pf_half + 1) <- cast(f32) 0.5;
+            *(pf_half + 2) <- cast(f32) 0.5; *(pf_half + 3) <- cast(f32) 0.5;
+
+            // Store Exact Zero-Crossing 7th-order Minimax Coefficients:
+            // c1 = -6.2790035, c3 = 41.104262, c5 = -77.99433, c7 = 56.16535
+            let pf_c1 = cast(*f32) c_c1_buf;
+            *pf_c1 <- cast(f32) -6.2790035; *(pf_c1 + 1) <- cast(f32) -6.2790035;
+            *(pf_c1 + 2) <- cast(f32) -6.2790035; *(pf_c1 + 3) <- cast(f32) -6.2790035;
+
+            let pf_c3 = cast(*f32) c_c3_buf;
+            *pf_c3 <- cast(f32) 41.104262; *(pf_c3 + 1) <- cast(f32) 41.104262;
+            *(pf_c3 + 2) <- cast(f32) 41.104262; *(pf_c3 + 3) <- cast(f32) 41.104262;
+
+            let pf_c5 = cast(*f32) c_c5_buf;
+            *pf_c5 <- cast(f32) -77.99433; *(pf_c5 + 1) <- cast(f32) -77.99433;
+            *(pf_c5 + 2) <- cast(f32) -77.99433; *(pf_c5 + 3) <- cast(f32) -77.99433;
+
+            let pf_c7 = cast(*f32) c_c7_buf;
+            *pf_c7 <- cast(f32) 56.16535; *(pf_c7 + 1) <- cast(f32) 56.16535;
+            *(pf_c7 + 2) <- cast(f32) 56.16535; *(pf_c7 + 3) <- cast(f32) 56.16535;
+
+            // Store cm_ratio: Solo=1.0, Vn2=2.0, Vla=1.0, Bass=0.5
+            let pf_cm = cm_ratio_buf;
+            *pf_cm <- cast(f32) 1.0; *(pf_cm + 1) <- cast(f32) 2.0;
+            *(pf_cm + 2) <- cast(f32) 1.0; *(pf_cm + 3) <- cast(f32) 0.5;
+
+            // Store base_mod: Solo=1.5, Vn2=1.0, Vla=1.2, Bass=2.0
+            let pf_bm = base_mod_buf;
+            *pf_bm <- cast(f32) 1.5; *(pf_bm + 1) <- cast(f32) 1.0;
+            *(pf_bm + 2) <- cast(f32) 1.2; *(pf_bm + 3) <- cast(f32) 2.0;
+
+            _ => DecodeDphiLoop [ hex_idx <= 0, byte_idx <= 0 ];
+        }
+
+        // --------------------------------------------------------------------
+        // Decode dphi_table from hex (1024 hex chars -> 512 bytes = 128 floats)
+        // --------------------------------------------------------------------
+        DecodeDphiLoop: {
+            byte_idx >= 512 => StartDecodeScore;
+            _ => DecodeDphiGetC0;
+        }
+
+        DecodeDphiGetC0: {
+            let h_ptr = hex_dphi + hex_idx;
+            let c0 = cast(i32) *h_ptr;
+            let c1 = cast(i32) *(h_ptr + 1);
+            c0 <= 57 => DphiC0Num [ dec_c0 <= c0, dec_c1 <= c1 ];
+            _        => DphiC0Alpha [ dec_c0 <= c0, dec_c1 <= c1 ];
+        }
+
+        DphiC0Num: {
+            let v0 = dec_c0 - 48;
+            dec_c1 <= 57 => DphiC1Num [ dec_v0 <= v0 ];
+            _            => DphiC1Alpha [ dec_v0 <= v0 ];
+        }
+
+        DphiC0Alpha: {
+            let v0 = dec_c0 - 55;
+            dec_c1 <= 57 => DphiC1Num [ dec_v0 <= v0 ];
+            _            => DphiC1Alpha [ dec_v0 <= v0 ];
+        }
+
+        DphiC1Num: {
+            let v1 = dec_c1 - 48;
+            _ => DphiWriteByte [ dec_v1 <= v1 ];
+        }
+
+        DphiC1Alpha: {
+            let v1 = dec_c1 - 55;
+            _ => DphiWriteByte [ dec_v1 <= v1 ];
+        }
+
+        DphiWriteByte: {
+            let b_hi = dec_v0 << 4;
+            let byte_val = b_hi | dec_v1;
+            let p_dest = cast(*u8) dphi_table + byte_idx;
+            *p_dest <- cast(u8) byte_val;
+            _ => DecodeDphiLoop [ hex_idx <= hex_idx + 2, byte_idx <= byte_idx + 1 ];
+        }
+
+        // --------------------------------------------------------------------
+        // Decode score_buf from hex (5632 hex chars -> 2816 bytes = 704 steps * 4)
+        // --------------------------------------------------------------------
+        StartDecodeScore: {
+            _ => DecodeScoreLoop [ hex_idx <= 0, byte_idx <= 0 ];
+        }
+
+        DecodeScoreLoop: {
+            byte_idx >= 2816 => StartPlayback;
+            _ => DecodeScoreGetC0;
+        }
+
+        DecodeScoreGetC0: {
+            let h_ptr = hex_score + hex_idx;
+            let c0 = cast(i32) *h_ptr;
+            let c1 = cast(i32) *(h_ptr + 1);
+            c0 <= 57 => ScoreC0Num [ dec_c0 <= c0, dec_c1 <= c1 ];
+            _        => ScoreC0Alpha [ dec_c0 <= c0, dec_c1 <= c1 ];
+        }
+
+        ScoreC0Num: {
+            let v0 = dec_c0 - 48;
+            dec_c1 <= 57 => ScoreC1Num [ dec_v0 <= v0 ];
+            _            => ScoreC1Alpha [ dec_v0 <= v0 ];
+        }
+
+        ScoreC0Alpha: {
+            let v0 = dec_c0 - 55;
+            dec_c1 <= 57 => ScoreC1Num [ dec_v0 <= v0 ];
+            _            => ScoreC1Alpha [ dec_v0 <= v0 ];
+        }
+
+        ScoreC1Num: {
+            let v1 = dec_c1 - 48;
+            _ => ScoreWriteByte [ dec_v1 <= v1 ];
+        }
+
+        ScoreC1Alpha: {
+            let v1 = dec_c1 - 55;
+            _ => ScoreWriteByte [ dec_v1 <= v1 ];
+        }
+
+        ScoreWriteByte: {
+            let b_hi = dec_v0 << 4;
+            let byte_val = b_hi | dec_v1;
+            let p_dest = score_buf + byte_idx;
+            *p_dest <- cast(u8) byte_val;
+            _ => DecodeScoreLoop [ hex_idx <= hex_idx + 2, byte_idx <= byte_idx + 1 ];
+        }
+
+        // --------------------------------------------------------------------
+        // Step Rendering Loop (704 steps)
+        // --------------------------------------------------------------------
+        StartPlayback: {
+            let _ = call puts("Rendering 704 measures/steps (~71.4s) using f32x4 SIMD...");
+            _ => StepLoop [ cur_step <= 0, total_sample_idx <= 0 ];
+        }
+
+        StepLoop: {
+            cur_step >= 704 => WriteWavFile;
+            _ => SetupStepVoices [ v_idx <= 0 ];
+        }
+
+        SetupStepVoices: {
+            v_idx >= 4 => SetupStepDone;
+            _ => SetupOneVoice;
+        }
+
+        SetupOneVoice: {
+            let step_off = cur_step * 4;
+            let byte_off = step_off + v_idx;
+            let raw_byte = cast(i32) *(score_buf + byte_off);
+            let note = raw_byte & 127;
+            let attack_flag = raw_byte & 128;
+            let is_attack = attack_flag != 0;
+
+            let cm = *(cm_ratio_buf + v_idx);
+            let bmod = *(base_mod_buf + v_idx);
+
+            note > 0 => VoiceHasNote [
+                cur_note <= note,
+                cur_is_attack <= is_attack,
+                cur_cm <= cm,
+                cur_bmod <= bmod
+            ];
+            _ => VoiceSilent;
+        }
+
+        VoiceHasNote: {
+            let p_dc = cast(*f32) dphi_c_buf + v_idx;
+            let p_dm = cast(*f32) dphi_m_buf + v_idx;
+            let d_val = *(dphi_table + cur_note);
+            *p_dc <- d_val;
+            let d_m = d_val * cur_cm;
+            *p_dm <- d_m;
+
+            cur_is_attack => VoiceTriggerAttack;
+            _ => NextVoice;
+        }
+
+        VoiceTriggerAttack: {
+            let p_ea = cast(*f32) env_a_buf + v_idx;
+            let p_ei = cast(*f32) env_i_buf + v_idx;
+            *p_ea <- cast(f32) 1.0;
+            *p_ei <- cur_bmod;
+            _ => NextVoice;
+        }
+
+        VoiceSilent: {
+            let p_dc = cast(*f32) dphi_c_buf + v_idx;
+            let p_dm = cast(*f32) dphi_m_buf + v_idx;
+            let p_ea = cast(*f32) env_a_buf + v_idx;
+            let p_ei = cast(*f32) env_i_buf + v_idx;
+            *p_dc <- cast(f32) 0.0;
+            *p_dm <- cast(f32) 0.0;
+            *p_ea <- cast(f32) 0.0;
+            *p_ei <- cast(f32) 0.0;
+            _ => NextVoice;
+        }
+
+        NextVoice: {
+            _ => SetupStepVoices [ v_idx <= v_idx + 1 ];
+        }
+
+        SetupStepDone: {
+            _ => SampleLoop [ cur_sample <= 0 ];
+        }
+
+        // --------------------------------------------------------------------
+        // Inner Sample Loop (4470 samples per step @ 44.1kHz)
+        // --------------------------------------------------------------------
+        SampleLoop: {
+            cur_sample >= 4470 => StepLoop [ cur_step <= cur_step + 1 ];
+            _ => RenderSIMDPhaseM;
+        }
+
+        RenderSIMDPhaseM: {
+            // 1. Modulator phase update with wrap-around
+            let p_pm = cast(*f32) phase_m_buf;
+            let p_dm = cast(*f32) dphi_m_buf;
+
+            let pm0 = *p_pm + *p_dm;
+            let pm1 = *(p_pm + 1) + *(p_dm + 1);
+            let pm2 = *(p_pm + 2) + *(p_dm + 2);
+            let pm3 = *(p_pm + 3) + *(p_dm + 3);
+
+            _ => WrapPM0 [ r_pm0 <= pm0, r_pm1 <= pm1, r_pm2 <= pm2, r_pm3 <= pm3 ];
+        }
+
+        WrapPM0: {
+            r_pm0 >= cast(f32) 1.0 => WrapPM0Sub;
+            _ => WrapPM1;
+        }
+        WrapPM0Sub: {
+            let v = r_pm0 - cast(f32) 1.0;
+            _ => WrapPM1 [ r_pm0 <= v ];
+        }
+
+        WrapPM1: {
+            r_pm1 >= cast(f32) 1.0 => WrapPM1Sub;
+            _ => WrapPM2;
+        }
+        WrapPM1Sub: {
+            let v = r_pm1 - cast(f32) 1.0;
+            _ => WrapPM2 [ r_pm1 <= v ];
+        }
+
+        WrapPM2: {
+            r_pm2 >= cast(f32) 1.0 => WrapPM2Sub;
+            _ => WrapPM3;
+        }
+        WrapPM2Sub: {
+            let v = r_pm2 - cast(f32) 1.0;
+            _ => WrapPM3 [ r_pm2 <= v ];
+        }
+
+        WrapPM3: {
+            r_pm3 >= cast(f32) 1.0 => WrapPM3Sub;
+            _ => StoreWrappedPM;
+        }
+        WrapPM3Sub: {
+            let v = r_pm3 - cast(f32) 1.0;
+            _ => StoreWrappedPM [ r_pm3 <= v ];
+        }
+
+        StoreWrappedPM: {
+            let p_pm = cast(*f32) phase_m_buf;
+            *p_pm <- r_pm0; *(p_pm + 1) <- r_pm1;
+            *(p_pm + 2) <- r_pm2; *(p_pm + 3) <- r_pm3;
+
+            // 2. SIMD 7th-Order Exact Zero-Crossing Minimax Polynomial Sine for Modulator
+            let v_half = *cast(*f32x4) c_half_buf;
+            let v_c1 = *cast(*f32x4) c_c1_buf;
+            let v_c3 = *cast(*f32x4) c_c3_buf;
+            let v_c5 = *cast(*f32x4) c_c5_buf;
+            let v_c7 = *cast(*f32x4) c_c7_buf;
+
+            let v_pm = *cast(*f32x4) phase_m_buf;
+            let v_xm = v_pm - v_half;
+            let v_xm2 = v_xm * v_xm;
+
+            let v_t7m = v_c7 * v_xm2;
+            let v_t57m = v_c5 + v_t7m;
+            let v_t5m = v_t57m * v_xm2;
+            let v_t35m = v_c3 + v_t5m;
+            let v_t3m = v_t35m * v_xm2;
+            let v_t1m = v_c1 + v_t3m;
+            let v_sin_m = v_xm * v_t1m;
+
+            let v_ei = *cast(*f32x4) env_i_buf;
+            let v_m = v_sin_m * v_ei;
+            *cast(*f32x4) sin_m_buf <- v_m;
+
+            _ => UpdatePhaseC;
+        }
+
+        UpdatePhaseC: {
+            // 3. Carrier Phase Update & Modulation Phase Wrap
+            let p_pc = cast(*f32) phase_c_buf;
+            let p_dc = cast(*f32) dphi_c_buf;
+
+            let pc0 = *p_pc + *p_dc;
+            let pc1 = *(p_pc + 1) + *(p_dc + 1);
+            let pc2 = *(p_pc + 2) + *(p_dc + 2);
+            let pc3 = *(p_pc + 3) + *(p_dc + 3);
+
+            _ => WrapPC0 [ r_pc0 <= pc0, r_pc1 <= pc1, r_pc2 <= pc2, r_pc3 <= pc3 ];
+        }
+
+        WrapPC0: {
+            r_pc0 >= cast(f32) 1.0 => WrapPC0Sub;
+            _ => WrapPC1;
+        }
+        WrapPC0Sub: {
+            let v = r_pc0 - cast(f32) 1.0;
+            _ => WrapPC1 [ r_pc0 <= v ];
+        }
+
+        WrapPC1: {
+            r_pc1 >= cast(f32) 1.0 => WrapPC1Sub;
+            _ => WrapPC2;
+        }
+        WrapPC1Sub: {
+            let v = r_pc1 - cast(f32) 1.0;
+            _ => WrapPC2 [ r_pc1 <= v ];
+        }
+
+        WrapPC2: {
+            r_pc2 >= cast(f32) 1.0 => WrapPC2Sub;
+            _ => WrapPC3;
+        }
+        WrapPC2Sub: {
+            let v = r_pc2 - cast(f32) 1.0;
+            _ => WrapPC3 [ r_pc2 <= v ];
+        }
+
+        WrapPC3: {
+            r_pc3 >= cast(f32) 1.0 => WrapPC3Sub;
+            _ => StoreWrappedPC;
+        }
+        WrapPC3Sub: {
+            let v = r_pc3 - cast(f32) 1.0;
+            _ => StoreWrappedPC [ r_pc3 <= v ];
+        }
+
+        StoreWrappedPC: {
+            let p_pc = cast(*f32) phase_c_buf;
+            *p_pc <- r_pc0; *(p_pc + 1) <- r_pc1;
+            *(p_pc + 2) <- r_pc2; *(p_pc + 3) <- r_pc3;
+
+            let p_sm = cast(*f32) sin_m_buf;
+            let m_scale = cast(f32) 0.15;
+            let sm0 = *p_sm;
+            let sm1 = *(p_sm + 1);
+            let sm2 = *(p_sm + 2);
+            let sm3 = *(p_sm + 3);
+
+            let m0 = sm0 * m_scale;
+            let m1 = sm1 * m_scale;
+            let m2 = sm2 * m_scale;
+            let m3 = sm3 * m_scale;
+
+            let raw_mod0 = r_pc0 + m0;
+            let raw_mod1 = r_pc1 + m1;
+            let raw_mod2 = r_pc2 + m2;
+            let raw_mod3 = r_pc3 + m3;
+
+            _ => WrapPMod0 [ r_mod0 <= raw_mod0, r_mod1 <= raw_mod1, r_mod2 <= raw_mod2, r_mod3 <= raw_mod3 ];
+        }
+
+        WrapPMod0: {
+            r_mod0 >= cast(f32) 1.0 => WrapPMod0Sub;
+            r_mod0 < cast(f32) 0.0  => WrapPMod0Add;
+            _ => WrapPMod1;
+        }
+        WrapPMod0Sub: {
+            let v = r_mod0 - cast(f32) 1.0;
+            _ => WrapPMod1 [ r_mod0 <= v ];
+        }
+        WrapPMod0Add: {
+            let v = r_mod0 + cast(f32) 1.0;
+            _ => WrapPMod1 [ r_mod0 <= v ];
+        }
+
+        WrapPMod1: {
+            r_mod1 >= cast(f32) 1.0 => WrapPMod1Sub;
+            r_mod1 < cast(f32) 0.0  => WrapPMod1Add;
+            _ => WrapPMod2;
+        }
+        WrapPMod1Sub: {
+            let v = r_mod1 - cast(f32) 1.0;
+            _ => WrapPMod2 [ r_mod1 <= v ];
+        }
+        WrapPMod1Add: {
+            let v = r_mod1 + cast(f32) 1.0;
+            _ => WrapPMod2 [ r_mod1 <= v ];
+        }
+
+        WrapPMod2: {
+            r_mod2 >= cast(f32) 1.0 => WrapPMod2Sub;
+            r_mod2 < cast(f32) 0.0  => WrapPMod2Add;
+            _ => WrapPMod3;
+        }
+        WrapPMod2Sub: {
+            let v = r_mod2 - cast(f32) 1.0;
+            _ => WrapPMod3 [ r_mod2 <= v ];
+        }
+        WrapPMod2Add: {
+            let v = r_mod2 + cast(f32) 1.0;
+            _ => WrapPMod3 [ r_mod2 <= v ];
+        }
+
+        WrapPMod3: {
+            r_mod3 >= cast(f32) 1.0 => WrapPMod3Sub;
+            r_mod3 < cast(f32) 0.0  => WrapPMod3Add;
+            _ => StoreWrappedPMod;
+        }
+        WrapPMod3Sub: {
+            let v = r_mod3 - cast(f32) 1.0;
+            _ => StoreWrappedPMod [ r_mod3 <= v ];
+        }
+        WrapPMod3Add: {
+            let v = r_mod3 + cast(f32) 1.0;
+            _ => StoreWrappedPMod [ r_mod3 <= v ];
+        }
+
+        StoreWrappedPMod: {
+            let p_pmod = cast(*f32) pmod_buf;
+            *p_pmod <- r_mod0; *(p_pmod + 1) <- r_mod1;
+            *(p_pmod + 2) <- r_mod2; *(p_pmod + 3) <- r_mod3;
+
+            _ => RenderSIMDCarrier;
+        }
+
+        RenderSIMDCarrier: {
+            // 4. SIMD 7th-Order Exact Zero-Crossing Minimax Polynomial Sine for Carrier
+            let v_half = *cast(*f32x4) c_half_buf;
+            let v_c1 = *cast(*f32x4) c_c1_buf;
+            let v_c3 = *cast(*f32x4) c_c3_buf;
+            let v_c5 = *cast(*f32x4) c_c5_buf;
+            let v_c7 = *cast(*f32x4) c_c7_buf;
+
+            let v_pmod = *cast(*f32x4) pmod_buf;
+            let v_xc = v_pmod - v_half;
+            let v_xc2 = v_xc * v_xc;
+
+            let v_t7c = v_c7 * v_xc2;
+            let v_t57c = v_c5 + v_t7c;
+            let v_t5c = v_t57c * v_xc2;
+            let v_t35c = v_c3 + v_t5c;
+            let v_t3c = v_t35c * v_xc2;
+            let v_t1c = v_c1 + v_t3c;
+            let v_sin_c = v_xc * v_t1c;
+
+            let v_ea = *cast(*f32x4) env_a_buf;
+            let v_car = v_sin_c * v_ea;
+            *cast(*f32x4) car_out_buf <- v_car;
+
+            // 5. Horizontal Sum & Output Mixing
+            let p_co = cast(*f32) car_out_buf;
+            let s0 = *p_co;
+            let s1 = *(p_co + 1);
+            let s2 = *(p_co + 2);
+            let s3 = *(p_co + 3);
+            let mix01 = s0 + s1;
+            let mix23 = s2 + s3;
+            let raw_mix = mix01 + mix23;
+
+            cur_sample < 30    => ApplyAttackWindow [ r_mix <= raw_mix ];
+            cur_sample >= 4440 => ApplyDecayWindow  [ r_mix <= raw_mix ];
+            _                  => ScaleAndClampPCM  [ r_mix <= raw_mix ];
+        }
+
+        ApplyAttackWindow: {
+            let ramp = cast(f32) cur_sample / cast(f32) 30.0;
+            let w_mix = r_mix * ramp;
+            _ => ScaleAndClampPCM [ r_mix <= w_mix ];
+        }
+
+        ApplyDecayWindow: {
+            let rem = 4470 - cur_sample;
+            let ramp = cast(f32) rem / cast(f32) 30.0;
+            let w_mix = r_mix * ramp;
+            _ => ScaleAndClampPCM [ r_mix <= w_mix ];
+        }
+
+        ScaleAndClampPCM: {
+            let pcm_f = r_mix * cast(f32) 5000.0;
+            let pcm_i = cast(i32) pcm_f;
+
+            pcm_i > 32767 => StoreClampHigh;
+            pcm_i < -32768 => StoreClampLow;
+            _ => StoreNormalPCM [ r_pcm_i <= pcm_i ];
+        }
+
+        StoreClampHigh: {
+            *(wav_buf + total_sample_idx) <- cast(i16) 32767;
+            _ => ApplyEnvelopes;
+        }
+
+        StoreClampLow: {
+            *(wav_buf + total_sample_idx) <- cast(i16) -32767;
+            _ => ApplyEnvelopes;
+        }
+
+        StoreNormalPCM: {
+            *(wav_buf + total_sample_idx) <- cast(i16) r_pcm_i;
+            _ => ApplyEnvelopes;
+        }
+
+        ApplyEnvelopes: {
+            // Exponential decays: A *= 0.99988, I *= 0.99980
+            let p_ea = cast(*f32) env_a_buf;
+            let p_ei = cast(*f32) env_i_buf;
+
+            let d_a = cast(f32) 0.99988;
+            let d_i = cast(f32) 0.99980;
+
+            let ea0 = *p_ea * d_a; let ea1 = *(p_ea + 1) * d_a;
+            let ea2 = *(p_ea + 2) * d_a; let ea3 = *(p_ea + 3) * d_a;
+
+            let ei0 = *p_ei * d_i; let ei1 = *(p_ei + 1) * d_i;
+            let ei2 = *(p_ei + 2) * d_i; let ei3 = *(p_ei + 3) * d_i;
+
+            *p_ea <- ea0; *(p_ea + 1) <- ea1;
+            *(p_ea + 2) <- ea2; *(p_ea + 3) <- ea3;
+
+            *p_ei <- ei0; *(p_ei + 1) <- ei1;
+            *(p_ei + 2) <- ei2; *(p_ei + 3) <- ei3;
+
+            _ => SampleLoop [
+                cur_sample <= cur_sample + 1,
+                total_sample_idx <= total_sample_idx + 1
+            ];
+        }
+
+        // --------------------------------------------------------------------
+        // Finalize: Write Standard 44.1kHz 16-bit Mono WAV File
+        // --------------------------------------------------------------------
+        WriteWavFile: {
+            let mode = "wb";
+            let f = call fopen(out_wav_path, mode);
+            let is_null = f == null;
+            is_null != 0 => FileOpenError;
+            _ => BuildHeader [ wav_file <= f ];
+        }
+
+        BuildHeader: {
+            let h = riff_hdr;
+            let total_data_bytes = total_sample_idx * 2;
+            let riff_size = cast(i32) total_data_bytes + 36;
+
+            // 'RIFF'
+            *h <- 82; *(h + 1) <- 73; *(h + 2) <- 70; *(h + 3) <- 70;
+            // File size - 8
+            let p_sz = cast(*i32)(h + 4);
+            *p_sz <- riff_size;
+            // 'WAVE'
+            *(h + 8) <- 87; *(h + 9) <- 65; *(h + 10) <- 86; *(h + 11) <- 69;
+            // 'fmt '
+            *(h + 12) <- 102; *(h + 13) <- 109; *(h + 14) <- 116; *(h + 15) <- 32;
+            // Subchunk1Size = 16
+            let p_sc1 = cast(*i32)(h + 16); *p_sc1 <- 16;
+            // AudioFormat = 1 (PCM), NumChannels = 1
+            let p_fmt = cast(*i16)(h + 20); *p_fmt <- 1;
+            let p_ch = cast(*i16)(h + 22); *p_ch <- 1;
+            // SampleRate = 44100
+            let p_sr = cast(*i32)(h + 24); *p_sr <- 44100;
+            // ByteRate = 44100 * 2 = 88200
+            let p_br = cast(*i32)(h + 28); *p_br <- 88200;
+            // BlockAlign = 2, BitsPerSample = 16
+            let p_ba = cast(*i16)(h + 32); *p_ba <- 2;
+            let p_bps = cast(*i16)(h + 34); *p_bps <- 16;
+            // 'data'
+            *(h + 36) <- 100; *(h + 37) <- 97; *(h + 38) <- 116; *(h + 39) <- 97;
+            // Subchunk2Size = total_data_bytes
+            let p_ds = cast(*i32)(h + 40);
+            *p_ds <- cast(i32) total_data_bytes;
+
+            _ => FlushWav;
+        }
+
+        FlushWav: {
+            let total_data_bytes = total_sample_idx * 2;
+            let bytes_u32 = cast(u32) total_data_bytes;
+            let _ = call fwrite(riff_hdr, 1, 44, wav_file);
+            let _ = call fwrite(cast(*u8) wav_buf, 1, bytes_u32, wav_file);
+            let _ = call fclose(wav_file);
+
+            let _ = call puts("Vivaldi Winter rendered successfully to WAV file.");
+            _ => return 0;
+        }
+
+        FileOpenError: {
+            let _ = call puts("Error: Failed to open output WAV file for writing.");
+            _ => return 1;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// CLI Entry Point
+// ----------------------------------------------------------------------------
+machine main(argc: i32, argv: *u64) -> i32 {
+    flow {
+        reg out_path: *u8 = null;
+    }
+    states {
+        Entry: {
+            argc < 2 => DefaultPath;
+            _ => CustomPath;
+        }
+
+        CustomPath: {
+            let t_u64 = *(argv + 1);
+            let p = cast(*u8) t_u64;
+            _ => RunSynth [ out_path <= p ];
+        }
+
+        DefaultPath: {
+            let p = "vivaldi_winter.wav";
+            _ => RunSynth [ out_path <= p ];
+        }
+
+        RunSynth: {
+            let res = call simd_vivaldi_winter(out_path);
+            _ => return res;
+        }
+    }
+}

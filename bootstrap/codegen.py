@@ -1,6 +1,6 @@
 import codecs
 from .ast_nodes import Program, Machine, State, Rule, Action, TypeDef, ExternFn
-from .expr_nodes import BinaryExpr, UnaryExpr, CallExpr, FieldExpr, StructLit, VarExpr, IntLit, StringLit, NullLit, CastExpr, Q64Lit
+from .expr_nodes import BinaryExpr, UnaryExpr, CallExpr, FieldExpr, StructLit, VarExpr, IntLit, StringLit, NullLit, CastExpr, Q64Lit, FloatLit
 
 class CodeGen:
     def __init__(self, prog: Program):
@@ -33,6 +33,31 @@ class CodeGen:
             "*f32": "float*",
             "f64": "double",
             "*f64": "double*",
+            # SIMD Vector Types
+            "f32x4": "<4 x float>",
+            "*f32x4": "<4 x float>*",
+            "f32x8": "<8 x float>",
+            "*f32x8": "<8 x float>*",
+            "f32x16": "<16 x float>",
+            "*f32x16": "<16 x float>*",
+            "f64x2": "<2 x double>",
+            "*f64x2": "<2 x double>*",
+            "f64x4": "<4 x double>",
+            "*f64x4": "<4 x double>*",
+            "f64x8": "<8 x double>",
+            "*f64x8": "<8 x double>*",
+            "i32x4": "<4 x i32>",
+            "*i32x4": "<4 x i32>*",
+            "i32x8": "<8 x i32>",
+            "*i32x8": "<8 x i32>*",
+            "i32x16": "<16 x i32>",
+            "*i32x16": "<16 x i32>*",
+            "u8x16": "<16 x i8>",
+            "*u8x16": "<16 x i8>*",
+            "u8x32": "<32 x i8>",
+            "*u8x32": "<32 x i8>*",
+            "u8x64": "<64 x i8>",
+            "*u8x64": "<64 x i8>*",
         }
         self.struct_def: dict[str, list[tuple[str, str]]] = {}
         for t in prog.types:
@@ -50,6 +75,18 @@ class CodeGen:
 
     def map_type(self, t: str) -> str:
         return self.type_map.get(t, t)
+
+    def get_type_align(self, t: str) -> int:
+        mapped = self.map_type(t)
+        if "double" in mapped or "f64" in t or "i64" in t or "u64" in t:
+            return 8
+        elif "float" in mapped or "f32" in t or "i32" in t or "u32" in t:
+            return 4
+        elif "i16" in t or "u16" in t:
+            return 2
+        elif "i8" in t or "u8" in t:
+            return 1
+        return 4
 
     def generate(self) -> str:
         # First generate machines so string constants and types are collected
@@ -130,9 +167,12 @@ class CodeGen:
 
         for reg in m.flow.regs:
             if reg.init_expr is not None:
-                val = self.emit_expr(reg.init_expr, m, bb_env[entry_bb], bb_insts[entry_bb])
+                if reg.type_str == "q64" and isinstance(reg.init_expr, FloatLit):
+                    val = str(int(reg.init_expr.val * 4294967296))
+                else:
+                    val = self.emit_expr(reg.init_expr, m, bb_env[entry_bb], bb_insts[entry_bb])
             else:
-                val = "null" if reg.type_str.startswith("*") else "0"
+                val = "null" if reg.type_str.startswith("*") else ("0.0" if reg.type_str in ("f32", "f64") else "0")
             bb_env[entry_bb][reg.name] = val
 
         for s in m.states[1:]:
@@ -193,6 +233,9 @@ class CodeGen:
 
                 target_bb = r.target.lower()
                 if r.guard is not None:
+                    guard_type = self.get_expr_type(r.guard, m)
+                    if guard_type.startswith("<") and "x i1>" in guard_type:
+                        raise TypeError(f"Vector comparison ({guard_type}) cannot be used directly as a state transition guard (SPEC_V0_14)")
                     cond_val = self.emit_expr(r.guard, m, bb_env[curr_bb], bb_insts[curr_bb])
                     then_bb = f"{curr_bb}_then_{r_idx}"
                     else_bb = f"{curr_bb}_else_{r_idx}"
@@ -238,7 +281,14 @@ class CodeGen:
 
         latch_map = {rname: lexpr for rname, lexpr in r.latches}
         for reg in m.flow.regs:
-            default_val = "null" if reg.type_str.startswith("*") else "0"
+            if reg.type_str.startswith("*"):
+                default_val = "null"
+            elif reg.type_str in ("f32", "f64"):
+                default_val = "0.0"
+            elif "x" in reg.type_str:
+                default_val = "zeroinitializer"
+            else:
+                default_val = "0"
             if reg.name in latch_map:
                 lexpr = latch_map[reg.name]
                 val = self.emit_expr(lexpr, m, bb_env[from_bb], bb_insts[from_bb])
@@ -265,6 +315,11 @@ class CodeGen:
         if type_str in ("u8", "u16", "u32", "u64") or type_str.startswith("*"):
             return True
         return False
+
+    def is_vector_type(self, type_str: str) -> bool:
+        import re
+        t = type_str[1:] if type_str.startswith("*") else type_str
+        return bool(re.match(r'^(f32|f64|i32|i64|u8|u16|u32|u64)x\d+$', t))
 
     def emit_store(self, target, expr, m: Machine, env: dict[str, str], insts: list[str]):
         val = self.emit_expr(expr, m, env, insts)
@@ -296,7 +351,8 @@ class CodeGen:
                     insts.append(f"{bc_val} = bitcast {val_llvm} {val} to {mapped_elem}")
                     final_val = bc_val
 
-            insts.append(f"store {mapped_elem} {final_val}, {mapped_elem}* {ptr}")
+            align = self.get_type_align(elem_type)
+            insts.append(f"store {mapped_elem} {final_val}, {mapped_elem}* {ptr}, align {align}")
         elif isinstance(target, FieldExpr):
             fld_ptr, fld_ssa, fld_llvm = self.resolve_field_ptr(target, m, env, insts)
 
@@ -352,6 +408,8 @@ class CodeGen:
 
     def get_expr_type(self, expr, m: Machine) -> str:
         if isinstance(expr, VarExpr):
+            if expr.name == "null":
+                return "*void"
             if hasattr(self, 'local_types') and expr.name in self.local_types:
                 return self.local_types[expr.name]
             for pn, pt in m.params:
@@ -360,6 +418,11 @@ class CodeGen:
                 if r.name == expr.name: return r.type_str
             for w in m.flow.wires:
                 if w.name == expr.name: return self.get_expr_type(w.expr, m)
+            for tm in self.prog.machines:
+                if tm.name == expr.name: return "*void"
+            for ext in self.prog.externs:
+                if ext.name == expr.name: return "*void"
+            raise RuntimeError(f"Undefined variable '{expr.name}' in machine '{m.name}'")
         if isinstance(expr, CallExpr):
             for target_m in self.prog.machines:
                 if target_m.name == expr.func:
@@ -390,6 +453,8 @@ class CodeGen:
             return expr.target_type
         if isinstance(expr, Q64Lit):
             return "q64"
+        if isinstance(expr, FloatLit):
+            return "f32"
         if isinstance(expr, IntLit):
             if expr.val > 4294967295 or expr.val < -2147483648:
                 return "i64"
@@ -399,13 +464,21 @@ class CodeGen:
         if isinstance(expr, NullLit):
             return "*void"
         if isinstance(expr, BinaryExpr):
-            if expr.op in ("==", "!=", "<", "<=", ">", ">=", "&&", "||"):
-                return "i1"
-            if expr.op == "+":
-                lt = self.get_expr_type(expr.left, m)
-                if lt.startswith("*"): return lt
             lt = self.get_expr_type(expr.left, m)
             rt = self.get_expr_type(expr.right, m)
+            if expr.op in ("==", "!=", "<", "<=", ">", ">=", "&&", "||"):
+                if self.is_vector_type(lt):
+                    num = lt.split('x')[1]
+                    return f"<{num} x i1>"
+                return "i1"
+            if expr.op in ("&", "|", "^") and lt == "i1" and rt == "i1":
+                return "i1"
+            if expr.op == "+":
+                if lt.startswith("*"): return lt
+            if self.is_vector_type(lt): return lt
+            if self.is_vector_type(rt): return rt
+            if lt == "f64" or rt == "f64": return "f64"
+            if lt == "f32" or rt == "f32": return "f32"
             if lt == "q64" or rt == "q64":
                 return "q64"
             if lt in ("i64", "u64") or rt in ("i64", "u64"):
@@ -428,7 +501,13 @@ class CodeGen:
                     res = self.emit_expr(w.expr, m, env, insts)
                     env[w.name] = res
                     return res
-            return f"%{expr.name}"
+            for tm in self.prog.machines:
+                if tm.name == expr.name:
+                    return f"@{expr.name}"
+            for ext in self.prog.externs:
+                if ext.name == expr.name:
+                    return f"@{expr.name}"
+            raise RuntimeError(f"Undefined operand variable '{expr.name}' in machine '{m.name}'")
 
         if isinstance(expr, NullLit):
             return "null"
@@ -438,6 +517,12 @@ class CodeGen:
 
         if isinstance(expr, Q64Lit):
             return str(expr.val)
+
+        if isinstance(expr, FloatLit):
+            val_str = str(expr.val)
+            if "." not in val_str and "e" not in val_str:
+                val_str += ".0"
+            return val_str
 
         if isinstance(expr, StringLit):
             self.str_id += 1
@@ -475,8 +560,48 @@ class CodeGen:
                 insts.append(f"{res} = icmp {cmp_op} ptr {left}, {right}")
                 return res
 
+            # Floating-point and SIMD vector operations
+            is_fp = left_type in ("f32", "f64") or right_type in ("f32", "f64")
+            is_vec = self.is_vector_type(left_type) or self.is_vector_type(right_type)
+            if is_fp or is_vec:
+                target_type = left_type if (self.is_vector_type(left_type) or left_type in ("f32", "f64")) else right_type
+                llvm_t = self.map_type(target_type)
+                res = self.fresh_tmp("fop" if is_fp else "vop")
+                is_fp_elem = "float" in llvm_t or "double" in llvm_t
+                if is_fp_elem:
+                    fp_op_map = {
+                        "+": f"fadd {llvm_t}", "-": f"fsub {llvm_t}",
+                        "*": f"fmul {llvm_t}", "/": f"fdiv {llvm_t}",
+                        "==": f"fcmp oeq {llvm_t}", "!=": f"fcmp one {llvm_t}",
+                        "<": f"fcmp olt {llvm_t}", "<=": f"fcmp ole {llvm_t}",
+                        ">": f"fcmp ogt {llvm_t}", ">=": f"fcmp oge {llvm_t}",
+                    }
+                    instr = fp_op_map.get(expr.op)
+                    if instr:
+                        insts.append(f"{res} = {instr} {left}, {right}")
+                        return res
+                else:
+                    int_vec_map = {
+                        "+": f"add {llvm_t}", "-": f"sub {llvm_t}",
+                        "*": f"mul {llvm_t}", "/": f"sdiv {llvm_t}",
+                        "&": f"and {llvm_t}", "|": f"or {llvm_t}", "^": f"xor {llvm_t}",
+                        "<<": f"shl {llvm_t}", ">>": f"ashr {llvm_t}",
+                        "==": f"icmp eq {llvm_t}", "!=": f"icmp ne {llvm_t}",
+                        "<": f"icmp slt {llvm_t}", "<=": f"icmp sle {llvm_t}",
+                        ">": f"icmp sgt {llvm_t}", ">=": f"icmp sge {llvm_t}",
+                    }
+                    instr = int_vec_map.get(expr.op)
+                    if instr:
+                        insts.append(f"{res} = {instr} {left}, {right}")
+                        return res
+
             if left_type in ("i64", "u64", "q64") or right_type in ("i64", "u64", "q64"):
                 bin_type = "i64"
+                if left_type == "q64" or right_type == "q64":
+                    if isinstance(expr.left, FloatLit):
+                        left = str(int(expr.left.val * 4294967296))
+                    if isinstance(expr.right, FloatLit):
+                        right = str(int(expr.right.val * 4294967296))
             elif left_type == "i1" or right_type == "i1":
                 bin_type = "i1"
             else:
@@ -555,7 +680,8 @@ class CodeGen:
                 mapped_elem = self.map_type(elem_type)
                 
                 raw_load = self.fresh_tmp("load")
-                insts.append(f"{raw_load} = load {mapped_elem}, {mapped_elem}* {sub}")
+                align = self.get_type_align(elem_type)
+                insts.append(f"{raw_load} = load {mapped_elem}, {mapped_elem}* {sub}, align {align}")
                 return raw_load
             elif expr.op == "&":
                 if isinstance(expr.operand, FieldExpr):
@@ -689,6 +815,20 @@ class CodeGen:
                 return res
 
         if isinstance(expr, CastExpr):
+            # 定数リテラルのゼロコスト文脈直接展開
+            if isinstance(expr.expr, FloatLit):
+                if expr.target_type == "f64":
+                    return str(expr.expr.val)
+                elif expr.target_type == "f32":
+                    # LLVM IR 制約: LLVM IR テキスト形式では float への非正確 10進小数の直接記述が
+                    # 'floating point constant invalid for type' でエラーになるため、
+                    # double 経由で fptrunc 命令を発行してレジスタとして渡す。
+                    tmp_f = self.fresh_tmp("lit_f32")
+                    insts.append(f"{tmp_f} = fptrunc double {expr.expr.val} to float")
+                    return tmp_f
+                elif expr.target_type == "q64":
+                    return str(int(expr.expr.val * 4294967296))
+
             val = self.emit_expr(expr.expr, m, env, insts)
             from_type = self.get_expr_type(expr.expr, m)
             to_type = expr.target_type
@@ -701,6 +841,17 @@ class CodeGen:
                 return val
 
             if to_type == "q64":
+                if from_type in ("f32", "f64"):
+                    fval = val
+                    if from_type == "f32":
+                        fpext = self.fresh_tmp("fpext")
+                        insts.append(f"{fpext} = fpext float {val} to double")
+                        fval = fpext
+                    fmul = self.fresh_tmp("fmul_q")
+                    insts.append(f"{fmul} = fmul double {fval}, 4294967296.0")
+                    q_res = self.fresh_tmp("fptosi_q")
+                    insts.append(f"{q_res} = fptosi double {fmul} to i64")
+                    return q_res
                 if from_llvm != "i64":
                     ext = self.fresh_tmp("ext_q")
                     op = "sext" if from_type in ("i8", "i16", "i32") else "zext"
@@ -711,6 +862,16 @@ class CodeGen:
                 return res
 
             if from_type == "q64":
+                if to_type in ("f32", "f64"):
+                    sitofp = self.fresh_tmp("q2fp")
+                    insts.append(f"{sitofp} = sitofp i64 {val} to double")
+                    q_div = self.fresh_tmp("q_div")
+                    insts.append(f"{q_div} = fdiv double {sitofp}, 4294967296.0")
+                    if to_type == "f32":
+                        res = self.fresh_tmp("fptrunc")
+                        insts.append(f"{res} = fptrunc double {q_div} to float")
+                        return res
+                    return q_div
                 shr = self.fresh_tmp("shr_q")
                 insts.append(f"{shr} = ashr i64 {val}, 32")
                 if to_llvm != "i64":
@@ -721,6 +882,31 @@ class CodeGen:
 
             is_from_ptr = from_type.startswith("*")
             is_to_ptr = to_type.startswith("*")
+
+            # Float <-> Float
+            if from_type in ("f32", "f64") and to_type in ("f32", "f64"):
+                if from_type == "f32" and to_type == "f64":
+                    res = self.fresh_tmp("fpext")
+                    insts.append(f"{res} = fpext float {val} to double")
+                    return res
+                elif from_type == "f64" and to_type == "f32":
+                    res = self.fresh_tmp("fptrunc")
+                    insts.append(f"{res} = fptrunc double {val} to float")
+                    return res
+
+            # Int -> Float
+            if from_type not in ("f32", "f64") and to_type in ("f32", "f64"):
+                op = "uitofp" if self.is_unsigned_type(from_type) else "sitofp"
+                res = self.fresh_tmp(op)
+                insts.append(f"{res} = {op} {from_llvm} {val} to {to_llvm}")
+                return res
+
+            # Float -> Int
+            if from_type in ("f32", "f64") and to_type not in ("f32", "f64") and not is_to_ptr:
+                op = "fptoui" if self.is_unsigned_type(to_type) else "fptosi"
+                res = self.fresh_tmp(op)
+                insts.append(f"{res} = {op} {from_llvm} {val} to {to_llvm}")
+                return res
 
             if is_from_ptr and is_to_ptr:
                 res = self.fresh_tmp("bitcast")

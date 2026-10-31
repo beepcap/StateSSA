@@ -178,7 +178,10 @@ type ParseContext = {
     inc_tail_ptr: *u32,
     inc_max:      u32,
     parent_dir_p: *u8,
-    parent_dir_l: u32
+    parent_dir_l: u32,
+    max_regs:     u32,
+    max_wires:    u32,
+    max_fields:   u32
 };
 
 // ============================================================================
@@ -468,12 +471,14 @@ machine make_int_node(alloc: *BumpAlloc, val: i64) -> *ExprNode {
     }
 }
 
-machine make_q64_node(alloc: *BumpAlloc, val: i64) -> *ExprNode {
+machine make_q64_node(alloc: *BumpAlloc, val: i64, str_p: *u8, str_l: u32) -> *ExprNode {
     flow {}
     states {
         Entry: {
             let n = call make_expr_node(alloc, 11); // 11: Q64_LIT
             n.int_val <- val;
+            n.str_ptr <- str_p;
+            n.str_len <- str_l;
             _ => return n;
         }
     }
@@ -766,7 +771,7 @@ machine parse_atom(ctx: *ParseContext) -> *ExprNode {
             let t_ptr = t.val_ptr;
             let t_len = t.val_len;
             let val = call parse_q64_val(t_ptr, t_len);
-            let node = call make_q64_node(alloc, val);
+            let node = call make_q64_node(alloc, val, t_ptr, t_len);
             _ => return node;
         }
 
@@ -876,6 +881,19 @@ machine parse_atom(ctx: *ParseContext) -> *ExprNode {
         NegQ64: {
             let cur_v = left_node.int_val;
             left_node.int_val <- 0 - cur_v;
+
+            let old_p = left_node.str_ptr;
+            let old_l = left_node.str_len;
+            let new_l = old_l + 1;
+            let new_p = call bump_alloc(alloc, new_l + 1, 1);
+            *new_p <- 45; // '-'
+            let dst_p = new_p + 1;
+            let _ = call copy_bytes(dst_p, old_p, old_l);
+            let end_p = new_p + new_l;
+            *end_p <- 0;
+            left_node.str_ptr <- new_p;
+            left_node.str_len <- new_l;
+
             _ => return left_node;
         }
 
@@ -1107,8 +1125,16 @@ machine parse_flow(ctx: *ParseContext, m: *MachineDef) -> i32 {
             let ok_lbrace = call ctx_match(ctx, 76); // '{'
             ok_lbrace == 0 => ErrorFlow;
 
-            let regs_mem = call bump_alloc(alloc, 1024, 8);
-            let wires_mem = call bump_alloc(alloc, 1024, 8);
+            let cur_mr = ctx.max_regs;
+            let r_alloc_cnt = cur_mr + 64;
+            let r_alloc_bytes = r_alloc_cnt * 32;
+
+            let cur_mw = ctx.max_wires;
+            let w_alloc_cnt = cur_mw + 64;
+            let w_alloc_bytes = w_alloc_cnt * 24;
+
+            let regs_mem = call bump_alloc(alloc, r_alloc_bytes, 8);
+            let wires_mem = call bump_alloc(alloc, w_alloc_bytes, 8);
             m.regs <- regs_mem;
             m.wires <- wires_mem;
 
@@ -1729,7 +1755,11 @@ machine parse_type(ctx: *ParseContext, out_t: *TypeDef) -> i32 {
             let ok_eq = call ctx_match(ctx, 69); // '='
             ok_eq == 0 => ErrorType;
 
-            let fields_mem = call bump_alloc(alloc, 1024, 8);
+            let cur_mf = ctx.max_fields;
+            let f_alloc_cnt = cur_mf + 64;
+            let f_alloc_bytes = f_alloc_cnt * 32;
+
+            let fields_mem = call bump_alloc(alloc, f_alloc_bytes, 8);
             out_t.fields <- fields_mem;
 
             // Check if alias pointer type: type Name = *Target;
@@ -1861,7 +1891,7 @@ machine parse_extern(ctx: *ParseContext, out_externs: *ExternFn, base_idx: u32) 
             let ok_lparen = call ctx_match(ctx, 74); // '('
             ok_lparen == 0 => ErrorExtern;
 
-            let params_mem = call bump_alloc(alloc, 512, 8);
+            let params_mem = call bump_alloc(alloc, 1024, 8);
             let fn_idx = base_idx + fn_cnt;
             let cur_fn = out_externs + fn_idx;
             cur_fn.params <- params_mem;
@@ -1992,7 +2022,7 @@ machine parse_machine(ctx: *ParseContext, out_m: *MachineDef) -> i32 {
             let ok_lparen = call ctx_match(ctx, 74); // '('
             ok_lparen == 0 => ErrorMachine;
 
-            let params_mem = call bump_alloc(alloc, 512, 8);
+            let params_mem = call bump_alloc(alloc, 1024, 8);
             out_m.params <- params_mem;
 
             _ => ParamLoop [ param_cnt <= 0 ];
@@ -2597,7 +2627,7 @@ machine alloc_parse_context(alloc: *BumpAlloc) -> *ParseContext {
     flow {}
     states {
         Entry: {
-            let mem = call bump_alloc(alloc, 96, 8);
+            let mem = call bump_alloc(alloc, 128, 8);
             _ => return mem;
         }
     }
@@ -2618,6 +2648,9 @@ machine init_parse_context(ctx: *ParseContext, tokens: *Token, tok_cnt: u32, all
             ctx.inc_max <- 0;
             ctx.parent_dir_p <- null;
             ctx.parent_dir_l <- 0;
+            ctx.max_regs <- 64;
+            ctx.max_wires <- 64;
+            ctx.max_fields <- 64;
             _ => return ctx;
         }
     }

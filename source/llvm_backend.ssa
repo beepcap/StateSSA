@@ -1,0 +1,286 @@
+// ============================================================================
+// StateSSA Compiler: In-Process LLVM C API Native Backend (llvm_backend.ssa)
+// libLLVM C API を直接呼び出し、インメモリで IR パース、PassBuilder 最適化、
+// TargetMachine による ELF オブジェクト (.o) 出力を外部プロセスなしで実行する。
+// ============================================================================
+
+extern "C" {
+    fn puts(str: *u8) -> i32;
+    fn malloc(size: u32) -> *u8;
+    fn free(ptr: *u8) -> void;
+
+    // --- LLVM Target Initializations ---
+    fn LLVMInitializeX86TargetInfo() -> void;
+    fn LLVMInitializeX86Target() -> void;
+    fn LLVMInitializeX86TargetMC() -> void;
+    fn LLVMInitializeX86AsmPrinter() -> void;
+    fn LLVMInitializeX86AsmParser() -> void;
+
+    fn LLVMInitializeAArch64TargetInfo() -> void;
+    fn LLVMInitializeAArch64Target() -> void;
+    fn LLVMInitializeAArch64TargetMC() -> void;
+    fn LLVMInitializeAArch64AsmPrinter() -> void;
+    fn LLVMInitializeAArch64AsmParser() -> void;
+
+    // --- Core Context, Buffer, Module ---
+    fn LLVMContextCreate() -> *void;
+    fn LLVMContextDispose(ctx: *void) -> void;
+    fn LLVMCreateMemoryBufferWithMemoryRangeCopy(data: *u8, len: u64, name: *u8) -> *void;
+    fn LLVMParseIRInContext(ctx: *void, buf: *void, out_mod: *u64, out_msg: *u64) -> u32;
+    fn LLVMDisposeModule(m: *void) -> void;
+    fn LLVMDisposeMessage(msg: *u8) -> void;
+
+    // --- Target & TargetMachine ---
+    fn LLVMGetDefaultTargetTriple() -> *u8;
+    fn LLVMGetTargetFromTriple(triple: *u8, out_target: *u64, out_msg: *u64) -> u32;
+    fn LLVMCreateTargetMachine(
+        target: *void, triple: *u8, cpu: *u8, features: *u8,
+        opt_level: u32, reloc: u32, model: u32
+    ) -> *void;
+    fn LLVMDisposeTargetMachine(tm: *void) -> void;
+    fn LLVMTargetMachineEmitToFile(
+        tm: *void, m: *void, filename: *u8,
+        codegen_type: u32, out_msg: *u64
+    ) -> u32;
+
+    // --- Modern New Pass Manager ---
+    fn LLVMCreatePassBuilderOptions() -> *void;
+    fn LLVMDisposePassBuilderOptions(opts: *void) -> void;
+    fn LLVMRunPasses(m: *void, passes: *u8, tm: *void, opts: *void) -> *void;
+    fn LLVMGetErrorMessage(err: *void) -> *u8;
+    fn LLVMDisposeErrorMessage(msg: *u8) -> void;
+}
+
+// ============================================================================
+// llvm_emit_object_from_memory: メモリ上 IR から .o ファイルを直接出力する
+// ============================================================================
+machine llvm_emit_object_from_memory(
+    ir_ptr: *u8,
+    ir_len: u32,
+    out_obj_path: *u8,
+    opt_level: u32
+) -> i32 {
+    flow {
+        reg res:         i32 = 0;
+        reg ctx:         *void = null;
+        reg triple:      *u8 = null;
+        reg box_mod:     *u64 = null;
+        reg box_err:     *u64 = null;
+        reg box_tgt:     *u64 = null;
+        reg mod_ptr:     *void = null;
+        reg tgt_ptr:     *void = null;
+        reg tm_ptr:      *void = null;
+        reg pass_pipeline: *u8 = "default<O3>";
+    }
+
+    states {
+        Entry: {
+            // 1. サポートターゲットの初期化 (X86 + AArch64)
+            let _ = call LLVMInitializeX86TargetInfo();
+            let _ = call LLVMInitializeX86Target();
+            let _ = call LLVMInitializeX86TargetMC();
+            let _ = call LLVMInitializeX86AsmPrinter();
+            let _ = call LLVMInitializeX86AsmParser();
+
+            let _ = call LLVMInitializeAArch64TargetInfo();
+            let _ = call LLVMInitializeAArch64Target();
+            let _ = call LLVMInitializeAArch64TargetMC();
+            let _ = call LLVMInitializeAArch64AsmPrinter();
+            let _ = call LLVMInitializeAArch64AsmParser();
+
+            // 2. ホストトリプルの取得
+            let def_triple = call LLVMGetDefaultTargetTriple();
+
+            // 3. コンテキストと出力用ポインタボックスの確保
+            let new_ctx = call LLVMContextCreate();
+            let b_mod = cast(*u64) call malloc(8);
+            let b_err = cast(*u64) call malloc(8);
+            let b_tgt = cast(*u64) call malloc(8);
+
+            *b_mod <- 0;
+            *b_err <- 0;
+            *b_tgt <- 0;
+
+            _ => SelectPasses [
+                ctx <= new_ctx, triple <= def_triple,
+                box_mod <= b_mod, box_err <= b_err, box_tgt <= b_tgt
+            ];
+        }
+
+        SelectPasses: {
+            opt_level == 0 => SetO0;
+            opt_level == 1 => SetO1;
+            opt_level == 2 => SetO2;
+            _              => ParseIR [ pass_pipeline <= "default<O3>" ];
+        }
+
+        SetO0: { _ => ParseIR [ pass_pipeline <= "default<O0>" ]; }
+        SetO1: { _ => ParseIR [ pass_pipeline <= "default<O1>" ]; }
+        SetO2: { _ => ParseIR [ pass_pipeline <= "default<O2>" ]; }
+
+        ParseIR: {
+            let ir_len64 = cast(u64) ir_len;
+            let buf_ref = call LLVMCreateMemoryBufferWithMemoryRangeCopy(ir_ptr, ir_len64, "statessa_module.ll");
+            let parse_err = call LLVMParseIRInContext(ctx, buf_ref, box_mod, box_err);
+            parse_err != 0 => ErrParse;
+
+            let m_u64 = *box_mod;
+            let m = cast(*void) m_u64;
+            _ => GetTarget [ mod_ptr <= m ];
+        }
+
+        GetTarget: {
+            let tgt_err = call LLVMGetTargetFromTriple(triple, box_tgt, box_err);
+            tgt_err != 0 => ErrTarget;
+
+            let t_u64 = *box_tgt;
+            let t = cast(*void) t_u64;
+            _ => CreateTM [ tgt_ptr <= t ];
+        }
+
+        CreateTM: {
+            // CodeGenOptLevel: opt_level (0..3)
+            // RelocMode: 2 (LLVMRelocPIC) - PIE 互換
+            // CodeModel: 0 (LLVMCodeModelDefault)
+            let tm = call LLVMCreateTargetMachine(tgt_ptr, triple, "generic", "", opt_level, 2, 0);
+            tm == null => ErrCreateTM;
+            _ => RunPasses [ tm_ptr <= tm ];
+        }
+
+        RunPasses: {
+            let opts = call LLVMCreatePassBuilderOptions();
+            let pass_err = call LLVMRunPasses(mod_ptr, pass_pipeline, tm_ptr, opts);
+            let _ = call LLVMDisposePassBuilderOptions(opts);
+
+            pass_err != null => ErrPasses;
+            _ => Emit;
+        }
+
+        Emit: {
+            // codegen_type = 1 (LLVMObjectFile)
+            let emit_err = call LLVMTargetMachineEmitToFile(tm_ptr, mod_ptr, out_obj_path, 1, box_err);
+            emit_err != 0 => ErrEmit;
+            _ => Success;
+        }
+
+        Success: {
+            _ => CleanUp [ res <= 0 ];
+        }
+
+        ErrParse: {
+            let _ = call puts("Error: LLVMParseIRInContext failed to parse StateSSA IR.");
+            let err_u64 = *box_err;
+            let err_p = cast(*u8) err_u64;
+            err_p != null => PrintErrParse;
+            _ => CleanUp [ res <= 1 ];
+        }
+
+        PrintErrParse: {
+            let err_u64 = *box_err;
+            let err_p = cast(*u8) err_u64;
+            let _ = call puts(err_p);
+            let _ = call LLVMDisposeMessage(err_p);
+            _ => CleanUp [ res <= 1 ];
+        }
+
+        ErrTarget: {
+            let _ = call puts("Error: LLVMGetTargetFromTriple failed.");
+            let err_u64 = *box_err;
+            let err_p = cast(*u8) err_u64;
+            err_p != null => PrintErrTarget;
+            _ => CleanUp [ res <= 2 ];
+        }
+
+        PrintErrTarget: {
+            let err_u64 = *box_err;
+            let err_p = cast(*u8) err_u64;
+            let _ = call puts(err_p);
+            let _ = call LLVMDisposeMessage(err_p);
+            _ => CleanUp [ res <= 2 ];
+        }
+
+        ErrCreateTM: {
+            let _ = call puts("Error: LLVMCreateTargetMachine returned null.");
+            _ => CleanUp [ res <= 3 ];
+        }
+
+        ErrPasses: {
+            let _ = call puts("Error: LLVMRunPasses failed during IR optimization.");
+            _ => CleanUp [ res <= 4 ];
+        }
+
+        ErrEmit: {
+            let _ = call puts("Error: LLVMTargetMachineEmitToFile failed to emit object file.");
+            let err_u64 = *box_err;
+            let err_p = cast(*u8) err_u64;
+            err_p != null => PrintErrEmit;
+            _ => CleanUp [ res <= 5 ];
+        }
+
+        PrintErrEmit: {
+            let err_u64 = *box_err;
+            let err_p = cast(*u8) err_u64;
+            let _ = call puts(err_p);
+            let _ = call LLVMDisposeMessage(err_p);
+            _ => CleanUp [ res <= 5 ];
+        }
+
+        CleanUp: {
+            let p_tm = tm_ptr;
+            p_tm != null => DisposeTM;
+            _ => CleanUpTriple;
+        }
+
+        DisposeTM: {
+            let _ = call LLVMDisposeTargetMachine(tm_ptr);
+            _ => CleanUpTriple;
+        }
+
+        CleanUpTriple: {
+            let p_tr = triple;
+            p_tr != null => DisposeTriple;
+            _ => CleanUpMod;
+        }
+
+        DisposeTriple: {
+            let _ = call LLVMDisposeMessage(triple);
+            _ => CleanUpMod;
+        }
+
+        CleanUpMod: {
+            let p_m = mod_ptr;
+            p_m != null => DisposeMod;
+            _ => CleanUpCtx;
+        }
+
+        DisposeMod: {
+            let _ = call LLVMDisposeModule(mod_ptr);
+            _ => CleanUpCtx;
+        }
+
+        CleanUpCtx: {
+            let p_c = ctx;
+            p_c != null => DisposeCtx;
+            _ => FreeBoxes;
+        }
+
+        DisposeCtx: {
+            let _ = call LLVMContextDispose(ctx);
+            _ => FreeBoxes;
+        }
+
+        FreeBoxes: {
+            let b_m = cast(*u8) box_mod;
+            let b_e = cast(*u8) box_err;
+            let b_t = cast(*u8) box_tgt;
+            let _ = call free(b_m);
+            let _ = call free(b_e);
+            let _ = call free(b_t);
+            _ => Exit;
+        }
+
+        Exit: {
+            _ => return res;
+        }
+    }
+}

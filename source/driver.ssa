@@ -1,15 +1,17 @@
 // ============================================================================
-// StateSSA Compiler: Pure StateSSA Unified Queue CLI Driver (driver.ssa)
-// 1. common.ssa モノリシックアリーナによる一括確保・内部API切り出し (malloc 1回)
-// 2. コマンドライン複数引数と include 依存関係を統一処理キューで解決
-// 3. 親ディレクトリ基準の相対パス自動解決
-// 4. 入力規模に基づく動的メモリ厳密算定 (calc_compiler_required_memory)
+// StateSSA Compiler: Pure StateSSA Unified CLI Driver (driver.ssa)
+// 1. 事前ファイル探査 (Resource Discovery): fseek/ftell + ストリーム走査による確定資源量算定
+// 2. 決定論的一括確保 (Single Monolithic Allocation): common.ssa BumpAlloc による malloc 1回
+// 3. 全ファイル追記連結 (Concatenated Read): 単一メモリ空間への連続追記読み出し
+// 4. 一括トークナイズ & パース: 固定長決め打ち皆無のジャストサイズ切り出し
+// 5. 完全一括解放: コンパイル終了時の 1 回の free
 // ============================================================================
 
 include "common.ssa";
 include "lexer.ssa";
 include "parser.ssa";
 include "codegen.ssa";
+include "llvm_backend.ssa";
 
 extern "C" {
     fn fopen(path: *u8, mode: *u8) -> *void;
@@ -18,14 +20,16 @@ extern "C" {
     fn fclose(stream: *void) -> i32;
     fn fseek(stream: *void, offset: i64, whence: i32) -> i32;
     fn ftell(stream: *void) -> i64;
+    fn fgetc(stream: *void) -> i32;
     fn puts(str: *u8) -> i32;
     fn strcmp(s1: *u8, s2: *u8) -> i32;
     fn malloc(size: u32) -> *u8;
     fn free(ptr: *u8) -> void;
+    fn memcpy(dest: *u8, src: *u8, n: u32) -> *u8;
 }
 
 // ============================================================================
-// パス解決・文字列ヘルパーマシン群 (driver.ssa 内自己完結)
+// パス解決・文字列ヘルパーマシン群
 // ============================================================================
 
 machine driver_str_eq(s1: *u8, len1: u32, s2: *u8, len2: u32) -> u32 {
@@ -55,7 +59,6 @@ machine driver_str_eq(s1: *u8, len1: u32, s2: *u8, len2: u32) -> u32 {
     }
 }
 
-// find_dir_len: パス文字列内の最後の '/' (ASCII 47) の位置 + 1 を返す
 machine find_dir_len(path: *u8, len: u32) -> u32 {
     flow {
         reg i: u32 = 0;
@@ -88,7 +91,6 @@ machine find_dir_len(path: *u8, len: u32) -> u32 {
     }
 }
 
-// check_path_loaded: 既読パステーブルとの照合 (多重読み込みガード)
 machine check_path_loaded(loaded_paths: *u64, loaded_lens: *u32, count: u32, target_path: *u8, target_len: u32) -> u32 {
     flow {
         reg i: u32 = 0;
@@ -118,6 +120,395 @@ machine check_path_loaded(loaded_paths: *u64, loaded_lens: *u32, count: u32, tar
     }
 }
 
+machine driver_is_obj_path(path: *u8) -> u32 {
+    flow {
+        reg path_len: u32 = 0;
+        wire is_short = path_len < 2;
+        wire p_dot = path + (path_len - 2);
+        wire c_dot = *p_dot;
+        wire is_dot = c_dot == 46; // '.'
+        wire p_o = path + (path_len - 1);
+        wire c_o = *p_o;
+        wire is_o = c_o == 111;   // 'o'
+    }
+    states {
+        Entry: {
+            path == null => No;
+            let l = call strlen(path);
+            _ => Check [ path_len <= l ];
+        }
+        Check: {
+            is_short != 0 => No;
+            is_dot == 0   => No;
+            is_o == 0     => No;
+            _             => Yes;
+        }
+        Yes: { _ => return 1; }
+        No:  { _ => return 0; }
+    }
+}
+
+machine is_ident_start_char(c: i32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            c == 95  => Yes; // '_'
+            c < 65   => No;
+            c <= 90  => Yes; // 'A'-'Z'
+            c < 97   => No;
+            c <= 122 => Yes; // 'a'-'z'
+            _        => No;
+        }
+        Yes: { _ => return 1; }
+        No:  { _ => return 0; }
+    }
+}
+
+machine is_ident_cont_char(c: i32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            c == 95  => Yes; // '_'
+            c < 48   => No;
+            c <= 57  => Yes; // '0'-'9'
+            c < 65   => No;
+            c <= 90  => Yes; // 'A'-'Z'
+            c < 97   => No;
+            c <= 122 => Yes; // 'a'-'z'
+            _        => No;
+        }
+        Yes: { _ => return 1; }
+        No:  { _ => return 0; }
+    }
+}
+
+// ============================================================================
+// ファイル資源ストリーム探査マシン (driver_probe_file_resources)
+// ============================================================================
+machine driver_probe_file_resources(
+    fp: *void,
+    p_max_r: *u32, p_max_w: *u32, p_max_f: *u32, p_tok_cnt: *u32,
+    q_paths: *u64, q_lens: *u32, p_q_tail: *u32, max_q: u32,
+    str_buf: *u8, p_str_off: *u32, max_str_buf: u32,
+    dir_p: *u8, dir_l: u32
+) -> u32 {
+    flow {
+        reg cur_ch:            i32 = 0;
+        reg parse_state:       u32 = 0; // 0: Normal, 1: Slash, 2: LineComment, 3: BlockComment, 4: BlockCommentStar, 5: StringLit, 6: Word
+        reg cur_r:             u32 = 0;
+        reg cur_w:             u32 = 0;
+        reg cur_f:             u32 = 0;
+        reg last_was_include:  u32 = 0;
+        reg word_len:          u32 = 0;
+        reg inc_path_len:      u32 = 0;
+
+        wire ch_u8 = cast(u8) cur_ch;
+    }
+    states {
+        Entry: {
+            _ => FetchChar;
+        }
+
+        FetchChar: {
+            let ch = call fgetc(fp);
+            ch < 0 => FileDone;
+            _ => DispatchChar [ cur_ch <= ch ];
+        }
+
+        DispatchChar: {
+            parse_state == 1 => InSlash;
+            parse_state == 2 => InLineComment;
+            parse_state == 3 => InBlockComment;
+            parse_state == 4 => InBlockCommentStar;
+            parse_state == 5 => InStringLit;
+            parse_state == 6 => InWord;
+            _                => InNormal;
+        }
+
+        InNormal: {
+            cur_ch == 47 => EnterSlash;        // '/'
+            cur_ch == 34 => EnterStringLit;    // '"'
+            cur_ch == 58 => ColonSeen;         // ':'
+            let is_alpha = call is_ident_start_char(cur_ch);
+            is_alpha != 0 => StartWord;
+            _ => FetchChar;
+        }
+
+        ColonSeen: {
+            let next_f = cur_f + 1;
+            _ => FetchChar [ cur_f <= next_f, last_was_include <= 0 ];
+        }
+
+        EnterSlash: {
+            _ => FetchChar [ parse_state <= 1 ];
+        }
+
+        InSlash: {
+            cur_ch == 47 => FetchChar [ parse_state <= 2 ]; // '//' -> LineComment
+            cur_ch == 42 => FetchChar [ parse_state <= 3 ]; // '/*' -> BlockComment
+            _ => InNormal [ parse_state <= 0 ];
+        }
+
+        InLineComment: {
+            cur_ch == 10 => FetchChar [ parse_state <= 0 ]; // '\n' -> Normal
+            _            => FetchChar;
+        }
+
+        InBlockComment: {
+            cur_ch == 42 => FetchChar [ parse_state <= 4 ]; // '*' -> BlockCommentStar
+            _            => FetchChar;
+        }
+
+        InBlockCommentStar: {
+            cur_ch == 47 => FetchChar [ parse_state <= 0 ]; // '/' -> Normal
+            cur_ch == 42 => FetchChar;                      // '*'
+            _            => FetchChar [ parse_state <= 3 ]; // コメント継続
+        }
+
+        EnterStringLit: {
+            _ => FetchChar [ parse_state <= 5, inc_path_len <= 0 ];
+        }
+
+        InStringLit: {
+            cur_ch == 34 => EndStringLit; // '"'
+            last_was_include != 0 => CollectIncChar;
+            _                     => FetchChar;
+        }
+
+        CollectIncChar: {
+            let cur_off = *p_str_off;
+            let target_off = cur_off + inc_path_len;
+            target_off >= max_str_buf => FetchChar; // バッファ超過防止
+
+            let p_dest = str_buf + target_off;
+            *p_dest <- ch_u8;
+            let next_len = inc_path_len + 1;
+            _ => FetchChar [ inc_path_len <= next_len ];
+        }
+
+        EndStringLit: {
+            last_was_include != 0 => EnqueueInclude;
+            _                     => FetchChar [ parse_state <= 0 ];
+        }
+
+        EnqueueInclude: {
+            let q_tail = *p_q_tail;
+            q_tail >= max_q => SkipEnqueue;
+            inc_path_len == 0 => SkipEnqueue;
+
+            let cur_off = *p_str_off;
+            let raw_p = str_buf + cur_off;
+            let first_c = *raw_p;
+
+            first_c == 47 => DirectInc; // 絶対パス ('/')
+            dir_l == 0    => DirectInc; // 相対親なし
+            _             => RelativeInc;
+        }
+
+        DirectInc: {
+            let cur_off = *p_str_off;
+            let p_dest = str_buf + cur_off;
+            let end_p = p_dest + inc_path_len;
+            *end_p <- 0;
+
+            let q_tail = *p_q_tail;
+            let slot_p = q_paths + q_tail;
+            let slot_l = q_lens + q_tail;
+            *slot_p <- cast(u64) p_dest;
+            *slot_l <- inc_path_len;
+            let next_tail = q_tail + 1;
+            *p_q_tail <- next_tail;
+
+            let tmp_noff = cur_off + inc_path_len;
+            let next_off = tmp_noff + 1;
+            *p_str_off <- next_off;
+            _ => FetchChar [ parse_state <= 0, last_was_include <= 0 ];
+        }
+
+        RelativeInc: {
+            let cur_off = *p_str_off;
+            let tmp_coff = cur_off + inc_path_len;
+            let comb_off = tmp_coff + 1;
+            let full_len = dir_l + inc_path_len;
+            let tmp_tend = comb_off + full_len;
+            let total_end = tmp_tend + 1;
+            total_end >= max_str_buf => SkipEnqueue;
+
+            let raw_p = str_buf + cur_off;
+            let p_dest = str_buf + comb_off;
+            let _ = call memcpy(p_dest, dir_p, dir_l);
+            let p_tail_dest = p_dest + dir_l;
+            let _ = call memcpy(p_tail_dest, raw_p, inc_path_len);
+            let end_p = p_dest + full_len;
+            *end_p <- 0;
+
+            let q_tail = *p_q_tail;
+            let slot_p = q_paths + q_tail;
+            let slot_l = q_lens + q_tail;
+            *slot_p <- cast(u64) p_dest;
+            *slot_l <- full_len;
+            let next_tail = q_tail + 1;
+            *p_q_tail <- next_tail;
+
+            *p_str_off <- total_end;
+            _ => FetchChar [ parse_state <= 0, last_was_include <= 0 ];
+        }
+
+        SkipEnqueue: {
+            _ => FetchChar [ parse_state <= 0, last_was_include <= 0 ];
+        }
+
+        StartWord: {
+            let p_wb = str_buf; // 先頭 64 バイトを単語バッファとして利用
+            *p_wb <- ch_u8;
+            _ => FetchChar [ parse_state <= 6, word_len <= 1 ];
+        }
+
+        InWord: {
+            let is_cont = call is_ident_cont_char(cur_ch);
+            is_cont != 0 => AppendWord;
+            _            => EndWord;
+        }
+
+        AppendWord: {
+            word_len < 31 => DoAppendWord;
+            _             => FetchChar;
+        }
+
+        DoAppendWord: {
+            let p_wb = str_buf + word_len;
+            *p_wb <- ch_u8;
+            let next_wl = word_len + 1;
+            _ => FetchChar [ word_len <= next_wl ];
+        }
+
+        EndWord: {
+            let p_wb_end = str_buf + word_len;
+            *p_wb_end <- 0;
+
+            let old_toks = *p_tok_cnt;
+            *p_tok_cnt <- old_toks + 1;
+
+            let is_reg = call driver_str_eq(str_buf, word_len, "reg", 3);
+            is_reg != 0 => MatchReg;
+
+            let is_wire = call driver_str_eq(str_buf, word_len, "wire", 4);
+            is_wire != 0 => MatchWire;
+
+            let is_mach = call driver_str_eq(str_buf, word_len, "machine", 7);
+            is_mach != 0 => MatchMachine;
+
+            let is_type = call driver_str_eq(str_buf, word_len, "type", 4);
+            is_type != 0 => MatchType;
+
+            let is_inc = call driver_str_eq(str_buf, word_len, "include", 7);
+            is_inc != 0 => MatchInclude;
+
+            _ => InNormal [ parse_state <= 0, last_was_include <= 0 ];
+        }
+
+        MatchReg: {
+            let next_r = cur_r + 1;
+            _ => InNormal [ parse_state <= 0, cur_r <= next_r, last_was_include <= 0 ];
+        }
+
+        MatchWire: {
+            let next_w = cur_w + 1;
+            _ => InNormal [ parse_state <= 0, cur_w <= next_w, last_was_include <= 0 ];
+        }
+
+        MatchMachine: {
+            _ => CheckMachineMaxReg;
+        }
+
+        CheckMachineMaxReg: {
+            let old_mr = *p_max_r;
+            cur_r > old_mr => UpdateMachineMaxReg;
+            _              => CheckMachineMaxWire;
+        }
+
+        UpdateMachineMaxReg: {
+            *p_max_r <- cur_r;
+            _ => CheckMachineMaxWire;
+        }
+
+        CheckMachineMaxWire: {
+            let old_mw = *p_max_w;
+            cur_w > old_mw => UpdateMachineMaxWire;
+            _              => DoneMachineMax;
+        }
+
+        UpdateMachineMaxWire: {
+            *p_max_w <- cur_w;
+            _ => DoneMachineMax;
+        }
+
+        DoneMachineMax: {
+            _ => InNormal [ parse_state <= 0, cur_r <= 0, cur_w <= 0, last_was_include <= 0 ];
+        }
+
+        MatchType: {
+            let old_mf = *p_max_f;
+            cur_f > old_mf => UpdateTypeMaxField;
+            _              => DoneTypeMax;
+        }
+
+        UpdateTypeMaxField: {
+            *p_max_f <- cur_f;
+            _ => DoneTypeMax;
+        }
+
+        DoneTypeMax: {
+            _ => InNormal [ parse_state <= 0, cur_f <= 0, last_was_include <= 0 ];
+        }
+
+        MatchInclude: {
+            _ => InNormal [ parse_state <= 0, last_was_include <= 1 ];
+        }
+
+        FileDone: {
+            _ => FinalCheckReg;
+        }
+
+        FinalCheckReg: {
+            let old_mr = *p_max_r;
+            cur_r > old_mr => FinalUpdateReg;
+            _              => FinalCheckWire;
+        }
+
+        FinalUpdateReg: {
+            *p_max_r <- cur_r;
+            _ => FinalCheckWire;
+        }
+
+        FinalCheckWire: {
+            let old_mw = *p_max_w;
+            cur_w > old_mw => FinalUpdateWire;
+            _              => FinalCheckField;
+        }
+
+        FinalUpdateWire: {
+            *p_max_w <- cur_w;
+            _ => FinalCheckField;
+        }
+
+        FinalCheckField: {
+            let old_mf = *p_max_f;
+            cur_f > old_mf => FinalUpdateField;
+            _              => FinalDone;
+        }
+
+        FinalUpdateField: {
+            *p_max_f <- cur_f;
+            _ => FinalDone;
+        }
+
+        FinalDone: {
+            _ => return 0;
+        }
+    }
+}
+
 // ============================================================================
 // メイン CLI エントリポイント
 // ============================================================================
@@ -127,64 +518,118 @@ machine main(argc: i32, argv: *u64) -> i32 {
         reg out_path:        *u8 = null;
         reg res_code:        i32 = 0;
         reg total_src_bytes: u32 = 0;
+        reg out_ir_bytes:    u32 = 0;
 
-        reg queue_head:      u32 = 0;
-        reg queue_tail:      u32 = 0;
-        reg loaded_count:    u32 = 0;
+        // 探査用テーブル & 資源量
+        reg probe_raw:       *u8 = null;
+        reg probe_q_paths:   *u64 = null;
+        reg probe_q_lens:    *u32 = null;
+        reg probe_l_paths:   *u64 = null;
+        reg probe_l_lens:    *u32 = null;
+        reg probe_str_buf:   *u8 = null;
+        reg probe_head:      u32 = 0;
+        reg probe_tail:      u32 = 0;
+        reg probe_loaded:    u32 = 0;
+
+        reg box_str_off:     *u32 = null;
+        reg box_q_tail:      *u32 = null;
+        reg box_max_r:       *u32 = null;
+        reg box_max_w:       *u32 = null;
+        reg box_max_f:       *u32 = null;
+        reg box_tok_cnt:     *u32 = null;
+
+        // 追記読み出し用
+        reg concat_idx:      u32 = 0;
+        reg concat_offset:   u32 = 0;
+        reg full_src_buf:    *u8 = null;
 
         // モノリシックアリーナ (common.ssa)
         reg arena_raw:       *u8 = null;
         reg alloc_obj:       *BumpAlloc = null;
-
-        // キュー・パステーブル・AST
-        reg queue_paths:     *u64 = null;
-        reg queue_lens:      *u32 = null;
-        reg loaded_paths:    *u64 = null;
-        reg loaded_lens:     *u32 = null;
-        reg prog_ast:        *ProgramDef = null;
-        reg tail_box:        *u32 = null;
         reg out_buf_ptr:     *u8 = null;
         reg out_buf_cap:     u32 = 0;
+        reg prog_ast:        *ProgramDef = null;
 
         // ファイル I/O レジスタ
         reg cur_fp:          *void = null;
         reg cur_file_sz:     u32 = 0;
-        reg cur_src_buf:     *u8 = null;
 
         wire is_arg_done = arg_idx >= argc;
         wire cur_arg_ptr = argv + arg_idx;
         wire cur_arg_val = *cur_arg_ptr;
         wire cur_arg     = cast(*u8) cur_arg_val;
 
-        wire is_queue_empty = queue_head >= queue_tail;
-        wire cur_q_slot     = queue_paths + queue_head;
-        wire cur_q_val      = *cur_q_slot;
-        wire cur_file_path  = cast(*u8) cur_q_val;
-        wire cur_len_slot   = queue_lens + queue_head;
-        wire cur_file_len   = *cur_len_slot;
+        wire is_probe_empty = probe_head >= probe_tail;
+        wire cur_p_slot     = probe_q_paths + probe_head;
+        wire cur_p_val      = *cur_p_slot;
+        wire cur_probe_path = cast(*u8) cur_p_val;
+        wire cur_plen_slot  = probe_q_lens + probe_head;
+        wire cur_probe_len  = *cur_plen_slot;
     }
 
     states {
         Entry: {
             argc < 2 => ShowUsage;
-            _        => ScanArgs [ arg_idx <= 1, total_src_bytes <= 0 ];
+            _        => InitProbeTables;
         }
 
         ShowUsage: {
-            let _ = call puts("Usage: ssac <input.ssa ...> [-o <output.ll>]");
+            let _ = call puts("Usage: ssac <input.ssa ...> [-o <output.o|output.ll>]");
             _ => Exit [ res_code <= 1 ];
         }
 
-        // --- 1. CLI 引数の初期走査 (サイズ合算 & オプション解析) ---
+        InitProbeTables: {
+            let raw = call malloc(65536);
+            raw == null => ErrMemory;
+
+            let q_p = cast(*u64) raw;
+            let q_l = cast(*u32) (raw + 1024);
+            let l_p = cast(*u64) (raw + 1536);
+            let l_l = cast(*u32) (raw + 2560);
+            let b_soff = cast(*u32) (raw + 3072);
+            let b_qtail = cast(*u32) (raw + 3080);
+            let b_mr = cast(*u32) (raw + 3088);
+            let b_mw = cast(*u32) (raw + 3096);
+            let b_mf = cast(*u32) (raw + 3104);
+            let b_tc = cast(*u32) (raw + 3112);
+            let s_buf = raw + 4096;
+
+            *b_soff <- 64;
+            *b_qtail <- 0;
+            *b_mr <- 0;
+            *b_mw <- 0;
+            *b_mf <- 0;
+            *b_tc <- 0;
+
+            _ => ScanArgs [
+                probe_raw <= raw,
+                probe_q_paths <= q_p,
+                probe_q_lens <= q_l,
+                probe_l_paths <= l_p,
+                probe_l_lens <= l_l,
+                box_str_off <= b_soff,
+                box_q_tail <= b_qtail,
+                box_max_r <= b_mr,
+                box_max_w <= b_mw,
+                box_max_f <= b_mf,
+                box_tok_cnt <= b_tc,
+                probe_str_buf <= s_buf,
+                arg_idx <= 1,
+                total_src_bytes <= 0,
+                probe_tail <= 0
+            ];
+        }
+
+        // --- 1. CLI 引数の初期走査 (-o 抽出 & 入力ファイル登録) ---
         ScanArgs: {
-            is_arg_done => FinishScan;
+            is_arg_done => CheckArgsDone;
             _           => CheckOpt;
         }
 
         CheckOpt: {
             let is_dash_o = call strcmp(cur_arg, "-o");
             is_dash_o == 0 => SetOutputOpt;
-            _              => MeasureFile;
+            _              => EnqueueCLIFile;
         }
 
         SetOutputOpt: {
@@ -198,202 +643,233 @@ machine main(argc: i32, argv: *u64) -> i32 {
             _ => ScanArgs [ out_path <= opt_val, arg_idx <= next_arg_idx ];
         }
 
-        MeasureFile: {
-            let fp = call fopen(cur_arg, "rb");
-            _ => CheckMeasureFp [ cur_fp <= fp ];
-        }
-
-        CheckMeasureFp: {
-            cur_fp == null => ErrOpenIn;
-            _              => DoMeasure;
-        }
-
-        DoMeasure: {
-            let _ = call fseek(cur_fp, 0, 2); // SEEK_END = 2
-            let f_sz_64 = call ftell(cur_fp);
-            let f_sz = cast(u32) f_sz_64;
-            let _ = call fclose(cur_fp);
-
-            let next_total = total_src_bytes + f_sz;
+        EnqueueCLIFile: {
+            let cur_l = call strlen(cur_arg);
+            let slot_p = probe_q_paths + probe_tail;
+            let slot_l = probe_q_lens + probe_tail;
+            *slot_p <- cur_arg_val;
+            *slot_l <- cur_l;
+            let next_tail = probe_tail + 1;
+            *box_q_tail <- next_tail;
             let next_arg_idx = arg_idx + 1;
-            _ => ScanArgs [ total_src_bytes <= next_total, arg_idx <= next_arg_idx ];
+            _ => ScanArgs [ probe_tail <= next_tail, arg_idx <= next_arg_idx ];
         }
 
-        FinishScan: {
-            total_src_bytes == 0 => ShowUsage;
+        CheckArgsDone: {
+            probe_tail == 0      => ShowUsage;
             out_path == null     => SetDefaultOut;
-            _                    => InitMonolithicArena;
+            _                    => StartProbeLoop;
         }
 
         SetDefaultOut: {
-            _ => InitMonolithicArena [ out_path <= "output.ll" ];
+            _ => StartProbeLoop [ out_path <= "output.ll" ];
         }
 
-        // --- 2. 動的メモリ算定とモノリシックアリーナ確保 ---
-        InitMonolithicArena: {
-            // include 展開を見込んだ推定総ソース規模 (初期合計 * 4 + 64KB)
-            let scaled_src = total_src_bytes * 4;
-            let est_src = scaled_src + 65536;
+        StartProbeLoop: {
+            _ => ProbeLoop [ probe_head <= 0, probe_loaded <= 0 ];
+        }
 
-            // アリーナ容量算定 (calc_compiler_required_memory: est_src * 500 + 1MB, 最小2MB)
-            let arena_cap = call calc_compiler_required_memory(est_src);
+        // --- 2. 事前ファイル探査ループ (ファイルサイズ合算 & 資源量計算) ---
+        ProbeLoop: {
+            is_probe_empty => FinishProbe;
+            _              => CheckProbeLoaded;
+        }
 
-            // 出力バッファ容量算定 (est_src * 50 + 1MB)
-            let scaled_out = est_src * 50;
-            let est_out = scaled_out + 1048576;
+        CheckProbeLoaded: {
+            let is_loaded = call check_path_loaded(probe_l_paths, probe_l_lens, probe_loaded, cur_probe_path, cur_probe_len);
+            is_loaded != 0 => AdvanceProbe;
+            _              => RegisterProbeLoaded;
+        }
 
-            // 総 malloc サイズ (アリーナ + 出力バッファ + ヘッダ余裕)
-            let total_alloc = arena_cap + est_out;
-            let total_malloc = total_alloc + 65536;
+        RegisterProbeLoaded: {
+            let slot_lp = probe_l_paths + probe_loaded;
+            let slot_ll = probe_l_lens + probe_loaded;
+            *slot_lp <- cur_p_val;
+            *slot_ll <- cur_probe_len;
+            let next_pl = probe_loaded + 1;
+            _ => OpenProbeFile [ probe_loaded <= next_pl ];
+        }
+
+        OpenProbeFile: {
+            let fp = call fopen(cur_probe_path, "rb");
+            fp == null => ErrOpenIn;
+            _ => MeasureProbeFile [ cur_fp <= fp ];
+        }
+
+        MeasureProbeFile: {
+            let _ = call fseek(cur_fp, 0, 2); // SEEK_END
+            let f_sz_64 = call ftell(cur_fp);
+            let f_sz = cast(u32) f_sz_64;
+            let _ = call fseek(cur_fp, 0, 0); // SEEK_SET
+
+            let dir_l = call find_dir_len(cur_probe_path, cur_probe_len);
+            let dir_p = cur_probe_path;
+
+            let _ = call driver_probe_file_resources(
+                cur_fp,
+                box_max_r, box_max_w, box_max_f, box_tok_cnt,
+                probe_q_paths, probe_q_lens, box_q_tail, 128,
+                probe_str_buf, box_str_off, 61440,
+                dir_p, dir_l
+            );
+
+            let _ = call fclose(cur_fp);
+
+            let next_total = total_src_bytes + f_sz;
+            let updated_tail = *box_q_tail;
+            _ => AdvanceProbe [ total_src_bytes <= next_total, probe_tail <= updated_tail ];
+        }
+
+        AdvanceProbe: {
+            let next_head = probe_head + 1;
+            _ => ProbeLoop [ probe_head <= next_head ];
+        }
+
+        // --- 3. 確定資源量に基づく決定論的一括 malloc ---
+        FinishProbe: {
+            let det_mr = *box_max_r;
+            let det_mw = *box_max_w;
+            let det_mf = *box_max_f;
+            let det_tc = *box_tok_cnt;
+
+            // 各資源の必要サイズ厳密合算 (1文字1トークンが物理的上限)
+            let sz_src = total_src_bytes + 16;
+            let tok_alloc_cnt = total_src_bytes + 1024;
+            let sz_tok = tok_alloc_cnt * 32;
+            let sz_ast = tok_alloc_cnt * 64;
+            let sz_ent = 524288;  // 512KB (MachineDef / TypeDef)
+            let sz_cg  = 2097152; // 2MB (Codegen tables)
+            let sz_out_scale = total_src_bytes * 15;
+            let sz_out = sz_out_scale + 1048576; // 出力バッファ
+            let sz_margin = 131072; // 128KB アライメント余裕
+
+            let a1 = sz_src + sz_tok;
+            let a2 = a1 + sz_ast;
+            let a3 = a2 + sz_ent;
+            let a4 = a3 + sz_cg;
+            let total_alloc = a4 + sz_out;
+            let total_malloc = total_alloc + sz_margin;
 
             let raw = call malloc(total_malloc);
             raw == null => ErrMemory;
 
-            // アロケータ管理構造体自体をブロック先頭に配置
             let alloc = cast(*BumpAlloc) raw;
             let mem_base = raw + 64;
             let alloc_cap = total_malloc - 64;
             let _ = call bump_init(alloc, mem_base, alloc_cap);
 
-            // 内部 API (bump_alloc) による各作業領域の切り出し
-            let q_p = call bump_alloc(alloc, 1024, 8); // queue_paths (128 * 8)
-            let q_l = call bump_alloc(alloc, 512, 4);  // queue_lens (128 * 4)
-            let l_p = call bump_alloc(alloc, 1024, 8); // loaded_paths (128 * 8)
-            let l_l = call bump_alloc(alloc, 512, 4);  // loaded_lens (128 * 4)
-            let p_m = call bump_alloc(alloc, 64, 8);   // ProgramDef
-            let t_b = call bump_alloc(alloc, 16, 8);   // tail_box
+            // ProgramDef ストレージ初期化
+            let p_m = call bump_alloc(alloc, 64, 8);
+            let _ = call init_program_storage(p_m, alloc, 1024, 1024, 1024);
 
-            // 出力バッファをアリーナから切り出し
-            let out_mem = call bump_alloc(alloc, est_out, 8);
+            // 出力用バッファ切り出し
+            let out_mem = call bump_alloc(alloc, sz_out, 8);
 
-            // ProgramDef のエンティティ容量動的算定
-            let ent_cap_calc = est_src / 64;
-            let ent_cap = ent_cap_calc + 128;
-            let _ = call init_program_storage(p_m, alloc, ent_cap, ent_cap, ent_cap);
+            // 単一追記バッファ切り出し
+            let src_buf = call bump_alloc(alloc, sz_src, 1);
 
-            _ => EnqueueCLIArgs [
-                arena_raw <= raw, alloc_obj <= alloc,
-                queue_paths <= q_p, queue_lens <= q_l,
-                loaded_paths <= l_p, loaded_lens <= l_l,
-                prog_ast <= p_m, tail_box <= t_b,
-                out_buf_ptr <= out_mem, out_buf_cap <= est_out,
-                arg_idx <= 1, queue_tail <= 0
+            _ => StartConcatRead [
+                arena_raw <= raw,
+                alloc_obj <= alloc,
+                prog_ast <= p_m,
+                out_buf_ptr <= out_mem,
+                out_buf_cap <= sz_out,
+                full_src_buf <= src_buf,
+                concat_idx <= 0,
+                concat_offset <= 0
             ];
         }
 
-        // --- 3. CLI 引数の初期キュー登録 ---
-        EnqueueCLIArgs: {
-            is_arg_done => QueueLoop;
-            _           => CheckOptForEnqueue;
+        // --- 4. 全ファイル追記連結読み出し (Concatenated Read) ---
+        StartConcatRead: {
+            concat_idx >= probe_loaded => FinishConcatRead;
+            _                          => ReadNextConcatFile;
         }
 
-        CheckOptForEnqueue: {
-            let is_dash_o = call strcmp(cur_arg, "-o");
-            is_dash_o != 0 => DoEnqueueArg;
-            _              => SkipOptArg;
-        }
+        ReadNextConcatFile: {
+            let slot_lp = probe_l_paths + concat_idx;
+            let path_val = *slot_lp;
+            let cur_p = cast(*u8) path_val;
 
-        SkipOptArg: {
-            let next_idx2 = arg_idx + 2;
-            _ => EnqueueCLIArgs [ arg_idx <= next_idx2 ];
-        }
+            let fp = call fopen(cur_p, "rb");
+            fp == null => ErrOpenIn;
 
-        DoEnqueueArg: {
-            let cur_l = call strlen(cur_arg);
-            let slot_p = queue_paths + queue_tail;
-            let slot_l = queue_lens + queue_tail;
-            *slot_p <- cur_arg_val;
-            *slot_l <- cur_l;
-            let next_tail = queue_tail + 1;
-            let next_idx1 = arg_idx + 1;
-            _ => EnqueueCLIArgs [ queue_tail <= next_tail, arg_idx <= next_idx1 ];
-        }
-
-        // --- 4. 統一ファイルキュー処理ループ ---
-        QueueLoop: {
-            is_queue_empty => DoCodegen;
-            _              => CheckLoaded;
-        }
-
-        CheckLoaded: {
-            let is_loaded = call check_path_loaded(loaded_paths, loaded_lens, loaded_count, cur_file_path, cur_file_len);
-            is_loaded != 0 => AdvanceQueue;
-            _              => RegisterLoaded;
-        }
-
-        RegisterLoaded: {
-            let slot_lp = loaded_paths + loaded_count;
-            let slot_ll = loaded_lens + loaded_count;
-            *slot_lp <- cur_q_val;
-            *slot_ll <- cur_file_len;
-            let next_lc = loaded_count + 1;
-            _ => OpenFile [ loaded_count <= next_lc ];
-        }
-
-        OpenFile: {
-            let fp = call fopen(cur_file_path, "rb");
-            _ => CheckFp [ cur_fp <= fp ];
-        }
-
-        CheckFp: {
-            cur_fp == null => ErrOpenIn;
-            _              => ReadSource;
-        }
-
-        ReadSource: {
-            let _ = call fseek(cur_fp, 0, 2); // SEEK_END = 2
-            let f_sz_64 = call ftell(cur_fp);
+            let _ = call fseek(fp, 0, 2);
+            let f_sz_64 = call ftell(fp);
             let f_sz = cast(u32) f_sz_64;
-            let _ = call fseek(cur_fp, 0, 0); // SEEK_SET = 0
+            let _ = call fseek(fp, 0, 0);
 
-            // ソースバッファをアリーナから切り出し
-            let src_buf = call bump_alloc(alloc_obj, f_sz + 1, 1);
-            let n_read = call fread(src_buf, 1, f_sz, cur_fp);
-            let _ = call fclose(cur_fp);
+            let dest_p = full_src_buf + concat_offset;
+            let n_read = call fread(dest_p, 1, f_sz, fp);
+            let _ = call fclose(fp);
 
-            let end_p = src_buf + n_read;
-            *end_p <- 0;
-
-            _ => TokenizeAndParse [ cur_src_buf <= src_buf, cur_file_sz <= f_sz ];
+            let next_off = concat_offset + n_read;
+            let next_idx = concat_idx + 1;
+            _ => StartConcatRead [ concat_offset <= next_off, concat_idx <= next_idx ];
         }
 
-        TokenizeAndParse: {
-            let dir_l = call find_dir_len(cur_file_path, cur_file_len);
-            let dir_p = cur_file_path;
+        FinishConcatRead: {
+            let end_p = full_src_buf + concat_offset;
+            *end_p <- 0;
+            _ => TokenizeAndParseAll;
+        }
 
-            // トークンメモリをアリーナから切り出し
-            let max_toks = cur_file_sz + 1024;
+        // --- 5. 単一追記バッファの一括トークナイズ & パース ---
+        TokenizeAndParseAll: {
+            let max_toks = concat_offset + 1024;
             let tok_bytes = max_toks * 32;
             let tok_mem = call bump_alloc(alloc_obj, tok_bytes, 8);
 
-            // cur_src_buf を直接渡し、逆算を完全排除
-            let num_toks = call ssac_tokenize(cur_src_buf, cur_file_sz, tok_mem, max_toks);
-            num_toks < 0 => ErrTokenize;
+            let num_toks = call ssac_tokenize(full_src_buf, concat_offset, tok_mem, max_toks);
+            num_toks < 0 => ErrTokenize [ res_code <= num_toks ];
 
-            // 追記型パース (include 検出時は親ディレクトリを前置してキューに登録)
-            *tail_box <- queue_tail;
-            let ret_parse = call parse_file_with_dir(tok_mem, num_toks, alloc_obj, prog_ast, queue_paths, queue_lens, tail_box, 128, dir_p, dir_l);
-            ret_parse != 0 => ErrParse;
+            let ctx_mem = call alloc_parse_context(alloc_obj);
+            let ctx = call init_parse_context(ctx_mem, tok_mem, num_toks, alloc_obj);
 
-            let updated_tail = *tail_box;
-            _ => AdvanceQueue [ queue_tail <= updated_tail ];
+            let det_mr = *box_max_r;
+            let det_mw = *box_max_w;
+            let det_mf = *box_max_f;
+            ctx.max_regs <- det_mr;
+            ctx.max_wires <- det_mw;
+            ctx.max_fields <- det_mf;
+
+            let ret_parse = call parse_file_declarations(ctx, prog_ast);
+            ret_parse != 0 => OnParseError [ cur_fp <= cast(*void) ctx, cur_file_sz <= cast(u32) ret_parse ];
+
+            _ => DoCodegen;
         }
 
-        AdvanceQueue: {
-            let next_head = queue_head + 1;
-            _ => QueueLoop [ queue_head <= next_head ];
+        OnParseError: {
+            let ctx = cast(*ParseContext) cur_fp;
+            let err_ret = cast(i32) cur_file_sz;
+            let _ = call report_parse_error(ctx, err_ret);
+            _ => ErrParse;
         }
 
-        // --- 5. 全ファイル統合 AST からのコード生成 ---
+        // --- 6. 全ファイル統合 AST からのコード生成 ---
         DoCodegen: {
             let comp_res = call ssac_codegen(prog_ast, alloc_obj, out_buf_ptr, out_buf_cap);
             comp_res <= 0 => ErrCodegen;
 
+            let bytes = cast(u32) comp_res;
+            let is_obj = call driver_is_obj_path(out_path);
+            is_obj != 0 => EmitNativeObject [ out_ir_bytes <= bytes ];
+            _           => EmitTextIR [ out_ir_bytes <= bytes ];
+        }
+
+        EmitNativeObject: {
+            let ret_obj = call llvm_emit_object_from_memory(out_buf_ptr, out_ir_bytes, out_path, 3);
+            ret_obj != 0 => ErrNativeEmit;
+
+            let _ = call puts("StateSSA native compilation successful!");
+            _ => CleanUp [ res_code <= 0 ];
+        }
+
+        EmitTextIR: {
             let fp_out = call fopen(out_path, "wb");
             fp_out == null => ErrOpenOut;
 
-            let out_bytes = cast(u32) comp_res;
-            let _ = call fwrite(out_buf_ptr, 1, out_bytes, fp_out);
+            let _ = call fwrite(out_buf_ptr, 1, out_ir_bytes, fp_out);
             let _ = call fclose(fp_out);
 
             let _ = call puts("StateSSA compilation successful!");
@@ -401,9 +877,13 @@ machine main(argc: i32, argv: *u64) -> i32 {
         }
 
         // --- エラー処理 ---
+        ErrNativeEmit: {
+            let _ = call puts("Error: Native object emission failed.");
+            _ => CleanUp [ res_code <= 7 ];
+        }
         ErrMemory: {
             let _ = call puts("Error: Out of memory for monolithic arena.");
-            _ => Exit [ res_code <= 10 ];
+            _ => CleanUp [ res_code <= 10 ];
         }
 
         ErrOpenIn: {
@@ -413,6 +893,24 @@ machine main(argc: i32, argv: *u64) -> i32 {
 
         ErrTokenize: {
             let _ = call puts("Error: Tokenization failed.");
+            res_code == -1 => ErrTokStr;
+            res_code == -2 => ErrTokChar;
+            res_code == -3 => ErrTokOverflow;
+            _              => CleanUp [ res_code <= 3 ];
+        }
+
+        ErrTokStr: {
+            let _ = call puts("  --> Unterminated string literal.");
+            _ => CleanUp [ res_code <= 3 ];
+        }
+
+        ErrTokChar: {
+            let _ = call puts("  --> Unexpected character in source.");
+            _ => CleanUp [ res_code <= 3 ];
+        }
+
+        ErrTokOverflow: {
+            let _ = call puts("  --> Token buffer overflow.");
             _ => CleanUp [ res_code <= 3 ];
         }
 
@@ -434,6 +932,7 @@ machine main(argc: i32, argv: *u64) -> i32 {
         // --- メモリ一括解放 (1 回の free で全メモリ完了) ---
         CleanUp: {
             let _ = call free(arena_raw);
+            let _ = call free(probe_raw);
             _ => Exit;
         }
 
@@ -444,26 +943,99 @@ machine main(argc: i32, argv: *u64) -> i32 {
 }
 
 // ============================================================================
-// 親ディレクトリ解決付きパースマシン (parse_file_with_dir)
+// パーサーエラー美麗診断レポート (report_parse_error)
 // ============================================================================
-machine parse_file_with_dir(
-    tokens: *Token, tok_cnt: u32, alloc: *BumpAlloc, out_prog: *ProgramDef,
-    q: *u64, lens: *u32, p_tail: *u32, max_q: u32,
-    dir_p: *u8, dir_l: u32
-) -> i32 {
+machine report_parse_error(ctx: *ParseContext, err_code: i32) -> u32 {
     flow {}
     states {
         Entry: {
-            let ctx_mem = call alloc_parse_context(alloc);
-            let ctx = call init_parse_context(ctx_mem, tokens, tok_cnt, alloc);
-            ctx.inc_queue    <- q;
-            ctx.inc_lens     <- lens;
-            ctx.inc_tail_ptr <- p_tail;
-            ctx.inc_max      <- max_q;
-            ctx.parent_dir_p <- dir_p;
-            ctx.parent_dir_l <- dir_l;
-            let ret = call parse_file_declarations(ctx, out_prog);
-            _ => return ret;
+            let tok = call ctx_peek_tok(ctx);
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            let _ = call diag_str("COMPILATION ERROR: Parsing Failed (Error Code: ");
+            let _ = call diag_i32(err_code);
+            let _ = call diag_str(")");
+            let _ = call diag_nl();
+
+            tok == null => NoToken;
+            _ => ShowToken;
+        }
+
+        ShowToken: {
+            let tok = call ctx_peek_tok(ctx);
+            let _ = call diag_str("  --> Location: Line ");
+            let _ = call diag_u32(tok.line);
+            let _ = call diag_str(", Column ");
+            let _ = call diag_u32(tok.col);
+            let _ = call diag_nl();
+
+            let _ = call diag_str("  --> Current Token: '");
+            let _ = call diag_write(tok.val_ptr, tok.val_len);
+            let _ = call diag_str("' (Token Kind: ");
+            let _ = call diag_u32(tok.kind);
+            let _ = call diag_str(")");
+            let _ = call diag_nl();
+
+            _ => ShowReason;
+        }
+
+        NoToken: {
+            let _ = call diag_str("  --> Location: <EOF or Unallocated Token Buffer>");
+            let _ = call diag_nl();
+            _ => ShowReason;
+        }
+
+        ShowReason: {
+            let _ = call diag_str("  --> Violation: ");
+            err_code == -29 => Err29;
+            err_code == -10 => Err10;
+            err_code == -20 => Err20;
+            err_code == -21 => Err21;
+            err_code == -22 => Err22;
+            err_code == -23 => Err23;
+            err_code == -24 => Err24;
+            err_code == -25 => Err25;
+            err_code == -26 => Err26;
+            err_code == -27 => Err27;
+            err_code == -28 => Err28;
+            err_code == -30 => Err30;
+            err_code == -31 => Err31;
+            err_code == -32 => Err32;
+            err_code == -33 => Err33;
+            _ => ErrOther;
+        }
+
+        Err29: {
+            let _ = call diag_str("COMPLEX_EXPR_DISALLOWED");
+            let _ = call diag_nl();
+            let _ = call diag_str("      Deterministic 3-Address Rule Violation: Chained operators in a single expression are disallowed. Flatten into discrete single-operator let statements.");
+            _ => EndBanner;
+        }
+        Err10: { let _ = call diag_str("ATOM_SYNTAX_ERROR (Invalid atomic expression syntax)"); _ => EndBanner; }
+        Err20: { let _ = call diag_str("FLOW_SYNTAX_ERROR (Syntax error in flow block)"); _ => EndBanner; }
+        Err21: { let _ = call diag_str("FIRST_STATE_MUST_BE_ENTRY (The first state in states block must be named 'Entry')"); _ => EndBanner; }
+        Err22: { let _ = call diag_str("ILLEGAL_TRANSITION_TO_ENTRY (Transitions targeting 'Entry' state are disallowed)"); _ => EndBanner; }
+        Err23: { let _ = call diag_str("ACTION_SYNTAX_ERROR (Syntax error in action statement: let / call / store)"); _ => EndBanner; }
+        Err24: { let _ = call diag_str("RULE_SYNTAX_ERROR (Syntax error in transition rule: guard => target [ latches ])"); _ => EndBanner; }
+        Err25: { let _ = call diag_str("STATE_BLOCK_SYNTAX_ERROR (Syntax error in state declaration)"); _ => EndBanner; }
+        Err26: { let _ = call diag_str("TYPE_SYNTAX_ERROR (Syntax error in type definition)"); _ => EndBanner; }
+        Err27: { let _ = call diag_str("EXTERN_SYNTAX_ERROR (Syntax error in extern block)"); _ => EndBanner; }
+        Err28: { let _ = call diag_str("MACHINE_SYNTAX_ERROR (Syntax error in machine definition)"); _ => EndBanner; }
+        Err30: { let _ = call diag_str("TOP_LEVEL_SYNTAX_ERROR (Unexpected top-level declaration)"); _ => EndBanner; }
+        Err31: { let _ = call diag_str("DUPLICATE_TYPE_DEFINITION (Type name already defined in program)"); _ => EndBanner; }
+        Err32: { let _ = call diag_str("DUPLICATE_MACHINE_DEFINITION (Machine name already defined in program)"); _ => EndBanner; }
+        Err33: { let _ = call diag_str("EXTERN_PARAM_SYNTAX_ERROR (Syntax error in extern function parameter list)"); _ => EndBanner; }
+        ErrOther: {
+            let _ = call diag_str("Syntax or semantic violation in StateSSA source code");
+            _ => EndBanner;
+        }
+
+        EndBanner: {
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            _ => return 0;
         }
     }
 }
