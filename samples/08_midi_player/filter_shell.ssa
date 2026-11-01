@@ -1,0 +1,450 @@
+// ============================================================================
+// StateSSA 08_midi_player: filter_shell.ssa
+// 2D Adaptive Filter Shell: Temporal Feedback (n -> n+1) & Spatial Stereo Link
+// Supports: None(Hard Clip), pf(RC Low-Pass IIR), phs(Deterministic Polyphony Trim)
+// ============================================================================
+
+include "midi_types.ssa";
+
+extern "C" {
+    fn malloc(sz: u32) -> *u8;
+    fn free(p: *u8) -> void;
+    fn sqrtf(x: f32) -> f32;
+    fn fabsf(x: f32) -> f32;
+}
+
+// ----------------------------------------------------------------------------
+// Machine: Filter_Create
+// ----------------------------------------------------------------------------
+machine Filter_Create(nc_mode: u32, sample_rate: f32) -> *FilterContext {
+    flow {}
+    states {
+        Entry: {
+            let p_mem = call malloc(64);
+            let ctx = cast(*FilterContext) p_mem;
+
+            ctx.nc_mode       <- nc_mode;
+            ctx.sample_rate   <- sample_rate;
+            ctx.prev_y_L      <- cast(f32) 0.0;
+            ctx.prev_y_R      <- cast(f32) 0.0;
+            // 14kHz cutoff at 44.1kHz: alpha ~= 0.666666
+            ctx.alpha         <- cast(f32) 0.666666;
+            ctx.phs_base_gain <- cast(f32) 1.0;
+            ctx.gain_trim     <- cast(f32) 1.0;
+            ctx.common_ratio  <- cast(f32) 1.0;
+
+            _ => return ctx;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: Filter_Destroy
+// ----------------------------------------------------------------------------
+machine Filter_Destroy(ctx: *FilterContext) -> void {
+    flow {}
+    states {
+        Entry: {
+            ctx == null => Return;
+            _ => DoFree;
+        }
+        DoFree: {
+            let _ = call free(cast(*u8) ctx);
+            _ => Return;
+        }
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: Filter_SetPHSBase
+// Computes deterministic headroom scaling sqrt(8.0 / max(8, peak_voices))
+// ----------------------------------------------------------------------------
+machine Filter_SetPHSBase(ctx: *FilterContext, peak_voices: u32) -> void {
+    flow {}
+    states {
+        Entry: {
+            ctx == null => Return;
+            peak_voices <= 8 => SetUnity;
+            _ => CalcScale;
+        }
+        SetUnity: {
+            let u = cast(f32) 1.0;
+            ctx.phs_base_gain <- u;
+            _ => Return;
+        }
+        CalcScale: {
+            let pv_f = cast(f32) peak_voices;
+            let eight = cast(f32) 8.0;
+            let ratio = eight / pv_f;
+            let g = call sqrtf(ratio);
+            let g_f = cast(f32) g;
+            ctx.phs_base_gain <- g_f;
+            _ => Return;
+        }
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: Filter_PreProcessVoice
+// Modulates voice gain & modulation index before synthesis core entry
+// ----------------------------------------------------------------------------
+machine Filter_PreProcessVoice(ctx: *FilterContext, params: *SpatialVoiceParams) -> void {
+    flow {}
+    states {
+        Entry: {
+            ctx == null => Return;
+            let mode = ctx.nc_mode;
+            mode == 7 => ApplyDynamic;
+            mode == 6 => ApplyDynPHS;
+            mode == 5 => ApplyDynamic;
+            mode == 1 => ApplyPHS;
+            _ => ApplyFeedbackOnly;
+        }
+        ApplyDynPHS: {
+            let bg = ctx.phs_base_gain;
+            let tr = ctx.gain_trim;
+            let g = bg * tr;
+            params.gain_L    <- g;
+            params.gain_R    <- g;
+            params.gain_mono <- g;
+            _ => Return;
+        }
+        ApplyDynamic: {
+            let u = cast(f32) 1.0;
+            params.gain_L    <- u;
+            params.gain_R    <- u;
+            params.gain_mono <- u;
+            _ => Return;
+        }
+        ApplyPHS: {
+            let bg = ctx.phs_base_gain;
+            let tr = ctx.gain_trim;
+            let eff_g = bg * tr;
+            let pgl = params.gain_L;
+            let pgr = params.gain_R;
+            let pgm = params.gain_mono;
+            let gl = pgl * eff_g;
+            let gr = pgr * eff_g;
+            let gm = pgm * eff_g;
+            params.gain_L    <- gl;
+            params.gain_R    <- gr;
+            params.gain_mono <- gm;
+            _ => Return;
+        }
+        ApplyFeedbackOnly: {
+            let trim = ctx.gain_trim;
+            let pgl = params.gain_L;
+            let pgr = params.gain_R;
+            let pgm = params.gain_mono;
+            let gl = pgl * trim;
+            let gr = pgr * trim;
+            let gm = pgm * trim;
+            params.gain_L    <- gl;
+            params.gain_R    <- gr;
+            params.gain_mono <- gm;
+            _ => Return;
+        }
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: Filter_PostProcessInterleave
+// Post-filter conditioning, cross-channel stereo link, temporal feedback & PCM export
+// ----------------------------------------------------------------------------
+machine Filter_PostProcessInterleave(
+    ctx: *FilterContext,
+    raw_l: *f32,
+    raw_r: *f32,
+    out_pcm: *i16,
+    num_samples: u32,
+    total_rendered: u32,
+    is_stereo: i1
+) -> void {
+    flow {
+        reg cur_i: u32 = 0;
+        reg r_yl: f32;
+        reg r_yr: f32;
+        reg r_pcm_l: i32 = 0;
+        reg r_pcm_r: i32 = 0;
+    }
+    states {
+        Entry: {
+            num_samples == 0 => Return;
+            is_stereo != 0 => StereoLoop [ cur_i <= 0 ];
+            _ => MonoLoop [ cur_i <= 0 ];
+        }
+
+        // ====================================================================
+        // Stereo Processing Loop (with Stereo Link & PF / Bypass)
+        // ====================================================================
+        StereoLoop: {
+            cur_i >= num_samples => Return;
+            let sl = *(raw_l + cur_i);
+            let sr = *(raw_r + cur_i);
+
+            // 1. Horizontal Coordination (Stereo Link peak evaluation)
+            let mag_l = call fabsf(sl);
+            let mag_r = call fabsf(sr);
+            let is_r_greater = mag_r > mag_l;
+            is_r_greater != 0 => PeakIsR [ r_yl <= sl, r_yr <= sr ];
+            _ => PeakIsL [ r_yl <= sl, r_yr <= sr ];
+        }
+
+        PeakIsL: {
+            let mag = call fabsf(r_yl);
+            _ => CheckPeakThreshold [ r_yl <= r_yl, r_yr <= r_yr ];
+        }
+
+        PeakIsR: {
+            let mag = call fabsf(r_yr);
+            _ => CheckPeakThreshold [ r_yl <= r_yl, r_yr <= r_yr ];
+        }
+
+        CheckPeakThreshold: {
+            let mode = ctx.nc_mode;
+            mode == 7 => ApplyDynPFAnalog;
+            mode == 2 => ApplyPFIIR;
+            _ => ApplyBypass;
+        }
+
+        // --- Mode 7: dyn_pf (Virtual Analog Soft Saturation + Slew Limiter + RC Filter) ---
+        ApplyDynPFAnalog: {
+            let scl = cast(f32) 0.15258789;
+            let norm_l = r_yl * scl;
+            let norm_r = r_yr * scl;
+            let n2_l = norm_l * norm_l;
+            let n2_r = norm_r * norm_r;
+            let one = cast(f32) 1.0;
+            let d_l = one + n2_l;
+            let d_r = one + n2_r;
+            let sq_l = call sqrtf(d_l);
+            let sq_r = call sqrtf(d_r);
+            let fsq_l = cast(f32) sq_l;
+            let fsq_r = cast(f32) sq_r;
+            let sat_norm_l = norm_l / fsq_l;
+            let sat_norm_r = norm_r / fsq_r;
+            let inv_scl = cast(f32) 6.5536;
+            let x_sat_l = sat_norm_l * inv_scl;
+            let x_sat_r = sat_norm_r * inv_scl;
+
+            let prev_l = ctx.prev_y_L;
+            let prev_r = ctx.prev_y_R;
+            let diff_l = x_sat_l - prev_l;
+            let diff_r = x_sat_r - prev_r;
+            _ => DynPFSlewL [ r_yl <= diff_l, r_yr <= diff_r ];
+        }
+
+        DynPFSlewL: {
+            let slew_max = cast(f32) 1.5;
+            let neg_slew = cast(f32) -1.5;
+            r_yl > slew_max => DynPFSlewClampHighL;
+            r_yl < neg_slew => DynPFSlewClampLowL;
+            _ => DynPFSlewR;
+        }
+        DynPFSlewClampHighL: {
+            let sm = cast(f32) 1.5;
+            _ => DynPFSlewR [ r_yl <= sm ];
+        }
+        DynPFSlewClampLowL: {
+            let nsm = cast(f32) -1.5;
+            _ => DynPFSlewR [ r_yl <= nsm ];
+        }
+
+        DynPFSlewR: {
+            let slew_max = cast(f32) 1.5;
+            let neg_slew = cast(f32) -1.5;
+            r_yr > slew_max => DynPFSlewClampHighR;
+            r_yr < neg_slew => DynPFSlewClampLowR;
+            _ => DynPFIntegrate;
+        }
+        DynPFSlewClampHighR: {
+            let sm = cast(f32) 1.5;
+            _ => DynPFIntegrate [ r_yr <= sm ];
+        }
+        DynPFSlewClampLowR: {
+            let nsm = cast(f32) -1.5;
+            _ => DynPFIntegrate [ r_yr <= nsm ];
+        }
+
+        DynPFIntegrate: {
+            let alpha = cast(f32) 0.5;
+            let prev_l = ctx.prev_y_L;
+            let prev_r = ctx.prev_y_R;
+            let d_l = alpha * r_yl;
+            let d_r = alpha * r_yr;
+            let yl = prev_l + d_l;
+            let yr = prev_r + d_r;
+            ctx.prev_y_L <- yl;
+            ctx.prev_y_R <- yr;
+            _ => EvalTemporalFeedback [ r_yl <= yl, r_yr <= yr ];
+        }
+
+        // --- Mode 2: pf (RC Low-Pass IIR Filter) ---
+        ApplyPFIIR: {
+            let a = ctx.alpha;
+            let prev_l = ctx.prev_y_L;
+            let prev_r = ctx.prev_y_R;
+            let diff_l = r_yl - prev_l;
+            let diff_r = r_yr - prev_r;
+            let adl = a * diff_l;
+            let adr = a * diff_r;
+            let yl = prev_l + adl;
+            let yr = prev_r + adr;
+            ctx.prev_y_L <- yl;
+            ctx.prev_y_R <- yr;
+            _ => EvalTemporalFeedback [ r_yl <= yl, r_yr <= yr ];
+        }
+
+        // --- Mode 0/1: Bypass / PHS (Direct) ---
+        ApplyBypass: {
+            ctx.prev_y_L <- r_yl;
+            ctx.prev_y_R <- r_yr;
+            _ => EvalTemporalFeedback [ r_yl <= r_yl, r_yr <= r_yr ];
+        }
+
+        // --- Temporal Feedback & PCM Scale ---
+        EvalTemporalFeedback: {
+            let scale_l = r_yl * cast(f32) 5000.0;
+            let scale_r = r_yr * cast(f32) 5000.0;
+            let il = cast(i32) scale_l;
+            let ir = cast(i32) scale_r;
+            _ => ClampStereoL [ r_pcm_l <= il, r_pcm_r <= ir ];
+        }
+
+        ClampStereoL: {
+            r_pcm_l > 32767 => ClampHighL;
+            r_pcm_l < -32768 => ClampLowL;
+            _ => ClampStereoR;
+        }
+        ClampHighL: {
+            _ => ClampStereoR [ r_pcm_l <= 32767 ];
+        }
+        ClampLowL: {
+            _ => ClampStereoR [ r_pcm_l <= -32767 ];
+        }
+
+        ClampStereoR: {
+            r_pcm_r > 32767 => ClampHighR;
+            r_pcm_r < -32768 => ClampLowR;
+            _ => StoreInterleavedPCM;
+        }
+        ClampHighR: {
+            _ => StoreInterleavedPCM [ r_pcm_r <= 32767 ];
+        }
+        ClampLowR: {
+            _ => StoreInterleavedPCM [ r_pcm_r <= -32767 ];
+        }
+
+        StoreInterleavedPCM: {
+            let out_idx = (total_rendered + cur_i) * 2;
+            let s16_l = cast(i16) r_pcm_l;
+            let s16_r = cast(i16) r_pcm_r;
+            *(out_pcm + out_idx)       <- s16_l;
+            *(out_pcm + (out_idx + 1)) <- s16_r;
+            _ => StereoLoop [ cur_i <= cur_i + 1 ];
+        }
+
+        // ====================================================================
+        // Mono Processing Loop
+        // ====================================================================
+        MonoLoop: {
+            cur_i >= num_samples => Return;
+            let sm = *(raw_l + cur_i);
+            let mode = ctx.nc_mode;
+            mode == 7 => ApplyMonoDynPFAnalog [ r_yl <= sm ];
+            mode == 2 => ApplyMonoPF [ r_yl <= sm ];
+            _ => ApplyMonoBypass [ r_yl <= sm ];
+        }
+
+        ApplyMonoDynPFAnalog: {
+            let scl = cast(f32) 0.15258789;
+            let norm_m = r_yl * scl;
+            let n2_m = norm_m * norm_m;
+            let one = cast(f32) 1.0;
+            let d_m = one + n2_m;
+            let sq_m = call sqrtf(d_m);
+            let fsq_m = cast(f32) sq_m;
+            let sat_norm_m = norm_m / fsq_m;
+            let inv_scl = cast(f32) 6.5536;
+            let x_sat_m = sat_norm_m * inv_scl;
+
+            let prev_m = ctx.prev_y_L;
+            let diff_m = x_sat_m - prev_m;
+            _ => MonoDynPFSlew [ r_yl <= diff_m ];
+        }
+
+        MonoDynPFSlew: {
+            let slew_max = cast(f32) 1.5;
+            let neg_slew = cast(f32) -1.5;
+            r_yl > slew_max => MonoDynPFSlewClampHigh;
+            r_yl < neg_slew => MonoDynPFSlewClampLow;
+            _ => MonoDynPFIntegrate;
+        }
+        MonoDynPFSlewClampHigh: {
+            let sm = cast(f32) 1.5;
+            _ => MonoDynPFIntegrate [ r_yl <= sm ];
+        }
+        MonoDynPFSlewClampLow: {
+            let nsm = cast(f32) -1.5;
+            _ => MonoDynPFIntegrate [ r_yl <= nsm ];
+        }
+
+        MonoDynPFIntegrate: {
+            let alpha = cast(f32) 0.5;
+            let prev_m = ctx.prev_y_L;
+            let d_m = alpha * r_yl;
+            let ym = prev_m + d_m;
+            ctx.prev_y_L <- ym;
+            _ => ConvertMonoPCM [ r_yl <= ym ];
+        }
+
+        ApplyMonoPF: {
+            let a = ctx.alpha;
+            let prev_l = ctx.prev_y_L;
+            let diff_l = r_yl - prev_l;
+            let adl = a * diff_l;
+            let yl = prev_l + adl;
+            ctx.prev_y_L <- yl;
+            _ => ConvertMonoPCM [ r_yl <= yl ];
+        }
+
+        ApplyMonoBypass: {
+            ctx.prev_y_L <- r_yl;
+            _ => ConvertMonoPCM [ r_yl <= r_yl ];
+        }
+
+        ConvertMonoPCM: {
+            let scale_m = r_yl * cast(f32) 5000.0;
+            let im = cast(i32) scale_m;
+            im > 32767 => ClampMonoHigh;
+            im < -32768 => ClampMonoLow;
+            _ => StoreMonoPCM [ r_pcm_l <= im ];
+        }
+        ClampMonoHigh: {
+            _ => StoreMonoPCM [ r_pcm_l <= 32767 ];
+        }
+        ClampMonoLow: {
+            _ => StoreMonoPCM [ r_pcm_l <= -32767 ];
+        }
+
+        StoreMonoPCM: {
+            let out_idx = total_rendered + cur_i;
+            let s16_m = cast(i16) r_pcm_l;
+            *(out_pcm + out_idx) <- s16_m;
+            _ => MonoLoop [ cur_i <= cur_i + 1 ];
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}

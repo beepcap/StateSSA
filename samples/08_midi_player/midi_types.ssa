@@ -76,3 +76,63 @@ type SynthPipeline = {
     pcm_L_buf:    *i16,          // Scratch PCM buffer for Left pipe
     pcm_R_buf:    *i16           // Scratch PCM buffer for Right pipe
 };
+
+// ----------------------------------------------------------------------------
+// Type: FeedbackSignal
+// Temporal feedback wire from Post-Filter to Pre-Filter (n -> n+1)
+// ----------------------------------------------------------------------------
+type FeedbackSignal = {
+    gain_trim:       f32,   // Dynamic gain attenuation factor (1.0 = none, <1.0 = attenuate)
+    overflow_flag:   u32,   // Saturation / clip detected flag
+    residual_energy: f32    // Transient / residual filter energy
+};
+
+// ----------------------------------------------------------------------------
+// Type: StereoLinkState
+// Spatial cross-channel coordination state (Left <-> Right)
+// ----------------------------------------------------------------------------
+type StereoLinkState = {
+    peak_L:       f32,      // Instantaneous peak magnitude (Left)
+    peak_R:       f32,      // Instantaneous peak magnitude (Right)
+    common_ratio: f32       // Unified gain attenuation ratio preserving stereo image
+};
+
+// ----------------------------------------------------------------------------
+// Type: FilterContext
+// 2D Adaptive filter shell state & memory context
+// ----------------------------------------------------------------------------
+type FilterContext = {
+    nc_mode:       u32,     // 0: None(Hard), 1: PHS, 2: PF(RC Low-Pass), 3: SC, 4: LP
+    sample_rate:   f32,     // Audio sampling frequency (e.g. 44100.0)
+    prev_y_L:      f32,     // Last filter output sample y[n-1] (Left)
+    prev_y_R:      f32,     // Last filter output sample y[n-1] (Right)
+    alpha:         f32,     // IIR smoothing factor (alpha = dt / (RC + dt))
+    phs_base_gain: f32,     // Deterministic peak polyphony scaling: sqrt(8.0 / N_peak)
+    gain_trim:     f32,     // Temporal feedback trim factor
+    common_ratio:  f32      // Spatial stereo link ratio
+};
+
+// ----------------------------------------------------------------------------
+// Type: MultiChannelCore
+// Multi-channel coordinator governing N-channel FM synthesis workers
+// ----------------------------------------------------------------------------
+type MultiChannelCore = {
+    engine_L:     *PolyFMEngine, // Left channel FM synthesis worker
+    engine_R:     *PolyFMEngine, // Right channel FM synthesis worker (null in mono)
+    is_stereo:    i1,            // 1: Stereo, 0: Mono
+    num_channels: u32,           // Total active channels (1 or 2)
+    total_blocks: u32            // Allocated SIMD voice blocks (K)
+};
+
+// ----------------------------------------------------------------------------
+// Type: UnifiedSynth
+// New unified synthesis instrument encapsulating PreFilter, MultiCore & PostFilter
+// ----------------------------------------------------------------------------
+type UnifiedSynth = {
+    core:         *MultiChannelCore, // Coordinated multi-channel FM core
+    filter:       *FilterContext,    // 2D adaptive filter shell
+    is_stereo:    i1,                // Stereo output mode flag
+    raw_l_buf:    *f32,              // Intermediate float scratch buffer (Left, 2048)
+    raw_r_buf:    *f32,              // Intermediate float scratch buffer (Right, 2048)
+    pcm_out_buf:  *i16               // Interleaved 16-bit PCM scratch buffer (4096)
+};

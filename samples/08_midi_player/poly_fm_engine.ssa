@@ -149,7 +149,7 @@ machine PolyFM_Destroy(engine: *PolyFMEngine) -> void {
 // ----------------------------------------------------------------------------
 // Machine: PolyFM_SetVoice
 // ----------------------------------------------------------------------------
-machine PolyFM_SetVoice(engine: *PolyFMEngine, voice_idx: u32, dphi: f32, cm_ratio: f32, base_mod: f32, is_attack: i1) -> void {
+machine PolyFM_SetVoice(engine: *PolyFMEngine, voice_idx: u32, dphi: f32, cm_ratio: f32, base_mod: f32, gain: f32, is_attack: i1) -> void {
     flow {}
     states {
         Entry: {
@@ -183,7 +183,7 @@ machine PolyFM_SetVoice(engine: *PolyFMEngine, voice_idx: u32, dphi: f32, cm_rat
 
             let p_ea = cast(*f32)(p_b + 64) + lane;
             let p_ei = cast(*f32)(p_b + 80) + lane;
-            *p_ea <- cast(f32) 1.0;
+            *p_ea <- gain;
             *p_ei <- base_mod;
             _ => Return;
         }
@@ -234,7 +234,7 @@ machine PolyFM_SilenceVoice(engine: *PolyFMEngine, voice_idx: u32) -> void {
 // ----------------------------------------------------------------------------
 // Machine: PolyFM_RenderStep
 // ----------------------------------------------------------------------------
-machine PolyFM_RenderStep(engine: *PolyFMEngine, out_pcm: *i16, num_samples: u32, apply_window: i1) -> void {
+machine PolyFM_RenderStep(engine: *PolyFMEngine, out_raw: *f32, num_samples: u32, apply_window: i1) -> void {
     flow {
         reg cur_sample: u32 = 0;
         reg cur_block: u32 = 0;
@@ -634,50 +634,31 @@ machine PolyFM_RenderStep(engine: *PolyFMEngine, out_pcm: *i16, num_samples: u32
             let raw_mix = mix01 + mix23;
 
             apply_window != 0 => WindowCheck [ r_mix <= raw_mix ];
-            _ => ScaleAndClampPCM [ r_mix <= raw_mix ];
+            _ => StoreRawSample [ r_mix <= raw_mix ];
         }
 
         WindowCheck: {
             cur_sample < 30 => WindowAttack;
             let decay_start = num_samples - 30;
             cur_sample >= decay_start => WindowDecay;
-            _ => ScaleAndClampPCM;
+            _ => StoreRawSample;
         }
 
         WindowAttack: {
             let ramp = cast(f32) cur_sample / cast(f32) 30.0;
             let w_mix = r_mix * ramp;
-            _ => ScaleAndClampPCM [ r_mix <= w_mix ];
+            _ => StoreRawSample [ r_mix <= w_mix ];
         }
 
         WindowDecay: {
             let rem = num_samples - cur_sample;
             let ramp = cast(f32) rem / cast(f32) 30.0;
             let w_mix = r_mix * ramp;
-            _ => ScaleAndClampPCM [ r_mix <= w_mix ];
+            _ => StoreRawSample [ r_mix <= w_mix ];
         }
 
-        ScaleAndClampPCM: {
-            let pcm_f = r_mix * cast(f32) 5000.0;
-            let pcm_i = cast(i32) pcm_f;
-
-            pcm_i > 32767 => StoreClampHigh;
-            pcm_i < -32768 => StoreClampLow;
-            _ => StoreNormalPCM [ r_pcm_i <= pcm_i ];
-        }
-
-        StoreClampHigh: {
-            *(out_pcm + cur_sample) <- cast(i16) 32767;
-            _ => SampleAdvance;
-        }
-
-        StoreClampLow: {
-            *(out_pcm + cur_sample) <- cast(i16) -32767;
-            _ => SampleAdvance;
-        }
-
-        StoreNormalPCM: {
-            *(out_pcm + cur_sample) <- cast(i16) r_pcm_i;
+        StoreRawSample: {
+            *(out_raw + cur_sample) <- r_mix;
             _ => SampleAdvance;
         }
 

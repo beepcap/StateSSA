@@ -1,0 +1,204 @@
+// ============================================================================
+// StateSSA 08_midi_player: multichannel_fm_core.ssa
+// Multi-Channel FM Synthesis Core Coordinator (Governs N-channel PolyFM Workers)
+// Handles spatial parameter dispatch, synchronized execution & float extraction
+// ============================================================================
+
+include "midi_types.ssa";
+
+extern "C" {
+    fn malloc(sz: u32) -> *u8;
+    fn free(p: *u8) -> void;
+}
+
+// ----------------------------------------------------------------------------
+// Machine: MultiChannel_Create
+// ----------------------------------------------------------------------------
+machine MultiChannel_Create(total_blocks: u32, is_stereo: i1) -> *MultiChannelCore {
+    flow {
+        reg core_ptr: *MultiChannelCore = null;
+    }
+    states {
+        Entry: {
+            let p_mem = call malloc(64);
+            let core = cast(*MultiChannelCore) p_mem;
+
+            let eng_l = call PolyFM_Create(total_blocks);
+            core.engine_L     <- eng_l;
+            core.is_stereo    <- is_stereo;
+            core.total_blocks <- total_blocks;
+
+            is_stereo != 0 => SetupStereo [ core_ptr <= core ];
+            _ => SetupMono [ core_ptr <= core ];
+        }
+
+        SetupStereo: {
+            let tb = core_ptr.total_blocks;
+            let eng_r = call PolyFM_Create(tb);
+            core_ptr.engine_R     <- eng_r;
+            core_ptr.num_channels <- 2;
+            _ => return core_ptr;
+        }
+
+        SetupMono: {
+            core_ptr.engine_R     <- null;
+            core_ptr.num_channels <- 1;
+            _ => return core_ptr;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: MultiChannel_Destroy
+// ----------------------------------------------------------------------------
+machine MultiChannel_Destroy(core: *MultiChannelCore) -> void {
+    flow {}
+    states {
+        Entry: {
+            core == null => Return;
+            _ => DoDestroy;
+        }
+
+        DoDestroy: {
+            let el = core.engine_L;
+            let _ = call PolyFM_Destroy(el);
+
+            let er = core.engine_R;
+            let er_not_null = er != null;
+            er_not_null != 0 => FreeRight;
+            _ => FreeCore;
+        }
+
+        FreeRight: {
+            let er = core.engine_R;
+            let _ = call PolyFM_Destroy(er);
+            _ => FreeCore;
+        }
+
+        FreeCore: {
+            let _ = call free(cast(*u8) core);
+            _ => Return;
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: MultiChannel_SetVoice
+// Dispatches acoustic parameters to Left and Right FM workers
+// ----------------------------------------------------------------------------
+machine MultiChannel_SetVoice(
+    core: *MultiChannelCore,
+    voice_idx: u32,
+    params: *SpatialVoiceParams
+) -> void {
+    flow {}
+    states {
+        Entry: {
+            core == null => Return;
+            let st = core.is_stereo;
+            st != 0 => SetStereoVoice;
+            _ => SetMonoVoice;
+        }
+
+        SetStereoVoice: {
+            let el = core.engine_L;
+            let d_l = params.dphi_L;
+            let cm = params.cm_ratio;
+            let bm = params.base_mod;
+            let gl = params.gain_L;
+
+            // Configure Left FM Worker
+            let _ = call PolyFM_SetVoice(el, voice_idx, d_l, cm, bm, gl, 1);
+
+            let er = core.engine_R;
+            let d_r = params.dphi_R;
+            let gr = params.gain_R;
+
+            // Configure Right FM Worker
+            let _ = call PolyFM_SetVoice(er, voice_idx, d_r, cm, bm, gr, 1);
+            _ => Return;
+        }
+
+        SetMonoVoice: {
+            let el = core.engine_L;
+            let d_l = params.dphi_L;
+            let cm = params.cm_ratio;
+            let bm = params.base_mod;
+            let gm = params.gain_mono;
+
+            let _ = call PolyFM_SetVoice(el, voice_idx, d_l, cm, bm, gm, 1);
+            _ => Return;
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: MultiChannel_SilenceVoice
+// ----------------------------------------------------------------------------
+machine MultiChannel_SilenceVoice(core: *MultiChannelCore, voice_idx: u32) -> void {
+    flow {}
+    states {
+        Entry: {
+            core == null => Return;
+            let el = core.engine_L;
+            let _ = call PolyFM_SilenceVoice(el, voice_idx);
+
+            let st = core.is_stereo;
+            st != 0 => SilenceRight;
+            _ => Return;
+        }
+
+        SilenceRight: {
+            let er = core.engine_R;
+            let _ = call PolyFM_SilenceVoice(er, voice_idx);
+            _ => Return;
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: MultiChannel_RenderRaw
+// Synchronously renders num_samples into float intermediate buffers
+// ----------------------------------------------------------------------------
+machine MultiChannel_RenderRaw(
+    core: *MultiChannelCore,
+    out_raw_l: *f32,
+    out_raw_r: *f32,
+    num_samples: u32
+) -> void {
+    flow {}
+    states {
+        Entry: {
+            core == null => Return;
+            num_samples == 0 => Return;
+            let el = core.engine_L;
+            let _ = call PolyFM_RenderStep(el, out_raw_l, num_samples, 0);
+
+            let st = core.is_stereo;
+            st != 0 => RenderRight;
+            _ => Return;
+        }
+
+        RenderRight: {
+            let er = core.engine_R;
+            let _ = call PolyFM_RenderStep(er, out_raw_r, num_samples, 0);
+            _ => Return;
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}

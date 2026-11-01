@@ -1,10 +1,12 @@
 // ============================================================================
 // StateSSA 08_midi_player: synth_pipeline.ssa
-// Independent Dual/Mono Synthesis Pipeline Orchestrator & PCM Interleaver
-// Backed by 07 poly_fm_engine.ssa (SIMD f32x4 + Pyramid Tournament Reduction)
+// Unified Synthesis Instrument Orchestrator (PreFilter -> MultiCore -> PostFilter)
+// Backed by multichannel_fm_core.ssa and filter_shell.ssa (2D Adaptive Matrix)
 // ============================================================================
 
 include "midi_types.ssa";
+include "multichannel_fm_core.ssa";
+include "filter_shell.ssa";
 
 extern "C" {
     fn malloc(sz: u32) -> *u8;
@@ -14,44 +16,32 @@ extern "C" {
 // ----------------------------------------------------------------------------
 // Machine: SynthPipeline_Create
 // ----------------------------------------------------------------------------
-machine SynthPipeline_Create(total_blocks: u32, is_stereo: i1) -> *SynthPipeline {
+machine SynthPipeline_Create(total_blocks: u32, is_stereo: i1, nc_mode: u32) -> *UnifiedSynth {
     flow {
-        reg pipe_ptr: *SynthPipeline = null;
+        reg synth_ptr: *UnifiedSynth = null;
     }
     states {
         Entry: {
             let p_mem = call malloc(64);
-            let pipe = cast(*SynthPipeline) p_mem;
+            let synth = cast(*UnifiedSynth) p_mem;
 
-            // Scratch buffer size: 2048 samples * 2 bytes = 4096 bytes
-            let p_scratch_l = call malloc(4096);
-            let eng_l = call PolyFM_Create(total_blocks);
+            // Scratch buffers: 2048 samples * 4 bytes (f32) = 8192 bytes
+            let p_raw_l = call malloc(8192);
+            let p_raw_r = call malloc(8192);
+            // PCM buffer: 4096 samples * 2 bytes (i16) = 8192 bytes
+            let p_pcm   = call malloc(8192);
 
-            pipe.engine_L     <- eng_l;
-            pipe.is_stereo    <- is_stereo;
-            pipe.total_blocks <- total_blocks;
-            pipe.pcm_L_buf    <- cast(*i16) p_scratch_l;
+            let core = call MultiChannel_Create(total_blocks, is_stereo);
+            let filter = call Filter_Create(nc_mode, cast(f32) 44100.0);
 
-            is_stereo != 0 => SetupStereoPipe [ pipe_ptr <= pipe ];
-            _ => SetupMonoPipe [ pipe_ptr <= pipe ];
-        }
+            synth.core        <- core;
+            synth.filter      <- filter;
+            synth.is_stereo   <- is_stereo;
+            synth.raw_l_buf   <- cast(*f32) p_raw_l;
+            synth.raw_r_buf   <- cast(*f32) p_raw_r;
+            synth.pcm_out_buf <- cast(*i16) p_pcm;
 
-        SetupStereoPipe: {
-            let tb = pipe_ptr.total_blocks;
-            let eng_r = call PolyFM_Create(tb);
-            let p_scratch_r = call malloc(4096);
-
-            pipe_ptr.engine_R  <- eng_r;
-            pipe_ptr.pcm_R_buf <- cast(*i16) p_scratch_r;
-
-            _ => return pipe_ptr;
-        }
-
-        SetupMonoPipe: {
-            pipe_ptr.engine_R  <- null;
-            pipe_ptr.pcm_R_buf <- null;
-
-            _ => return pipe_ptr;
+            _ => return synth;
         }
     }
 }
@@ -59,36 +49,29 @@ machine SynthPipeline_Create(total_blocks: u32, is_stereo: i1) -> *SynthPipeline
 // ----------------------------------------------------------------------------
 // Machine: SynthPipeline_Destroy
 // ----------------------------------------------------------------------------
-machine SynthPipeline_Destroy(pipe: *SynthPipeline) -> void {
+machine SynthPipeline_Destroy(synth: *UnifiedSynth) -> void {
     flow {}
     states {
         Entry: {
-            pipe == null => Return;
+            synth == null => Return;
             _ => DoDestroy;
         }
 
         DoDestroy: {
-            let el = pipe.engine_L;
-            let _ = call PolyFM_Destroy(el);
+            let c = synth.core;
+            let _ = call MultiChannel_Destroy(c);
 
-            let er = pipe.engine_R;
-            let er_not_null = er != null;
-            er_not_null != 0 => FreeRightEngine;
-            _ => FreeBuffers;
-        }
+            let f = synth.filter;
+            let _ = call Filter_Destroy(f);
 
-        FreeRightEngine: {
-            let er = pipe.engine_R;
-            let _ = call PolyFM_Destroy(er);
-            let pr = pipe.pcm_R_buf;
-            let _ = call free(cast(*u8) pr);
-            _ => FreeBuffers;
-        }
+            let pl = synth.raw_l_buf;
+            let pr = synth.raw_r_buf;
+            let pp = synth.pcm_out_buf;
 
-        FreeBuffers: {
-            let pl = pipe.pcm_L_buf;
             let _ = call free(cast(*u8) pl);
-            let _ = call free(cast(*u8) pipe);
+            let _ = call free(cast(*u8) pr);
+            let _ = call free(cast(*u8) pp);
+            let _ = call free(cast(*u8) synth);
             _ => Return;
         }
 
@@ -99,38 +82,44 @@ machine SynthPipeline_Destroy(pipe: *SynthPipeline) -> void {
 }
 
 // ----------------------------------------------------------------------------
+// Machine: SynthPipeline_SetPHSBase
+// ----------------------------------------------------------------------------
+machine SynthPipeline_SetPHSBase(synth: *UnifiedSynth, peak_voices: u32) -> void {
+    flow {}
+    states {
+        Entry: {
+            synth == null => Return;
+            let f = synth.filter;
+            let _ = call Filter_SetPHSBase(f, peak_voices);
+            _ => Return;
+        }
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Machine: SynthPipeline_SetVoice
-// Dispatches spatial acoustic parameters to Left (and Right) FM engines
+// Pre-filters voice parameters, then dispatches to multi-channel core
 // ----------------------------------------------------------------------------
 machine SynthPipeline_SetVoice(
-    pipe: *SynthPipeline,
+    synth: *UnifiedSynth,
     voice_idx: u32,
     params: *SpatialVoiceParams
 ) -> void {
     flow {}
     states {
         Entry: {
-            let el = pipe.engine_L;
-            let d_l = params.dphi_L;
-            let cm = params.cm_ratio;
-            let bm = params.base_mod;
+            synth == null => Return;
 
-            // Configure Left FM Pipeline
-            let _ = call PolyFM_SetVoice(el, voice_idx, d_l, cm, bm, 1);
+            // 1. Pre-Filter Stage: Apply PHS & dynamic feedback trim
+            let f = synth.filter;
+            let _ = call Filter_PreProcessVoice(f, params);
 
-            let st = pipe.is_stereo;
-            st != 0 => SetRightVoice;
-            _ => Return;
-        }
-
-        SetRightVoice: {
-            let er = pipe.engine_R;
-            let d_r = params.dphi_R;
-            let cm = params.cm_ratio;
-            let bm = params.base_mod;
-
-            // Configure Right FM Pipeline
-            let _ = call PolyFM_SetVoice(er, voice_idx, d_r, cm, bm, 1);
+            // 2. Dispatch to Multi-Channel FM Core
+            let c = synth.core;
+            let _ = call MultiChannel_SetVoice(c, voice_idx, params);
             _ => Return;
         }
 
@@ -143,21 +132,13 @@ machine SynthPipeline_SetVoice(
 // ----------------------------------------------------------------------------
 // Machine: SynthPipeline_SilenceVoice
 // ----------------------------------------------------------------------------
-machine SynthPipeline_SilenceVoice(pipe: *SynthPipeline, voice_idx: u32) -> void {
+machine SynthPipeline_SilenceVoice(synth: *UnifiedSynth, voice_idx: u32) -> void {
     flow {}
     states {
         Entry: {
-            let el = pipe.engine_L;
-            let _ = call PolyFM_SilenceVoice(el, voice_idx);
-
-            let st = pipe.is_stereo;
-            st != 0 => SilenceRight;
-            _ => Return;
-        }
-
-        SilenceRight: {
-            let er = pipe.engine_R;
-            let _ = call PolyFM_SilenceVoice(er, voice_idx);
+            synth == null => Return;
+            let c = synth.core;
+            let _ = call MultiChannel_SilenceVoice(c, voice_idx);
             _ => Return;
         }
 
@@ -169,11 +150,11 @@ machine SynthPipeline_SilenceVoice(pipe: *SynthPipeline, voice_idx: u32) -> void
 
 // ----------------------------------------------------------------------------
 // Machine: SynthPipeline_Render
-// Renders num_samples into out_pcm (Mono or Interleaved Stereo)
+// Renders num_samples through MultiCore -> PostFilter into out_pcm
 // Handles arbitrary sample spans safely via 2048-sample chunking loop
 // ----------------------------------------------------------------------------
 machine SynthPipeline_Render(
-    pipe: *SynthPipeline,
+    synth: *UnifiedSynth,
     out_pcm: *i16,
     num_samples: u32
 ) -> void {
@@ -181,26 +162,14 @@ machine SynthPipeline_Render(
         reg total_rendered: u32 = 0;
         reg rem_samples:    u32 = 0;
         reg cur_chunk:      u32 = 0;
-        reg chunk_i:        u32 = 0;
     }
     states {
         Entry: {
             num_samples == 0 => Return;
-            let st = pipe.is_stereo;
-            st != 0 => StartStereoChunking [ rem_samples <= num_samples, total_rendered <= 0 ];
-            _ => RenderMono;
+            _ => StartChunking [ rem_samples <= num_samples, total_rendered <= 0 ];
         }
 
-        // --- Mono Mode ---
-        RenderMono: {
-            let el = pipe.engine_L;
-            // Directly render into destination out_pcm buffer
-            let _ = call PolyFM_RenderStep(el, out_pcm, num_samples, 0);
-            _ => Return;
-        }
-
-        // --- Stereo Mode (Chunked Rendering to avoid scratch overflow) ---
-        StartStereoChunking: {
+        StartChunking: {
             rem_samples == 0 => Return;
             rem_samples > 2048 => ChunkIsMax;
             _ => ChunkIsRem;
@@ -215,41 +184,25 @@ machine SynthPipeline_Render(
         }
 
         ExecChunkRender: {
-            let el = pipe.engine_L;
-            let er = pipe.engine_R;
-            let p_l = pipe.pcm_L_buf;
-            let p_r = pipe.pcm_R_buf;
+            let c = synth.core;
+            let f = synth.filter;
+            let raw_l = synth.raw_l_buf;
+            let raw_r = synth.raw_r_buf;
+            let st = synth.is_stereo;
 
-            // 1. Render Left and Right Pipes for cur_chunk samples
-            let _ = call PolyFM_RenderStep(el, p_l, cur_chunk, 0);
-            let _ = call PolyFM_RenderStep(er, p_r, cur_chunk, 0);
+            // 1. Synthesize Raw float wave in Multi-Channel Core
+            let _ = call MultiChannel_RenderRaw(c, raw_l, raw_r, cur_chunk);
 
-            // 2. Interleave [L0, R0, L1, R1, ...] into destination
-            _ => InterleaveLoop [ chunk_i <= 0 ];
-        }
+            // 2. Post-Filter Stage: Stereo Link, PF IIR, Feedback & PCM conversion
+            let _ = call Filter_PostProcessInterleave(f, raw_l, raw_r, out_pcm, cur_chunk, total_rendered, st);
 
-        InterleaveLoop: {
-            chunk_i >= cur_chunk => AdvanceChunk;
-            _ => InterleaveSample;
-        }
-
-        InterleaveSample: {
-            let p_l = pipe.pcm_L_buf;
-            let p_r = pipe.pcm_R_buf;
-            let s_l = *(p_l + chunk_i);
-            let s_r = *(p_r + chunk_i);
-
-            let cur_out_idx = (total_rendered + chunk_i) * 2;
-            *(out_pcm + cur_out_idx)       <- s_l;
-            *(out_pcm + (cur_out_idx + 1)) <- s_r;
-
-            _ => InterleaveLoop [ chunk_i <= chunk_i + 1 ];
+            _ => AdvanceChunk;
         }
 
         AdvanceChunk: {
             let next_rem = rem_samples - cur_chunk;
-            let next_tot = total_rendered + cur_chunk;
-            _ => StartStereoChunking [ rem_samples <= next_rem, total_rendered <= next_tot ];
+            let next_total = total_rendered + cur_chunk;
+            _ => StartChunking [ rem_samples <= next_rem, total_rendered <= next_total ];
         }
 
         Return: {

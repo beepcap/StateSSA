@@ -23,12 +23,24 @@ extern "C" {
     fn write(fd: i32, buf: *u8, count: u32) -> i32;
     fn puts(s: *u8) -> i32;
     fn printf(fmt: *u8, s1: *u8, s2: *u8) -> i32;
+    fn strrchr(s: *u8, c: i32) -> *u8;
+    fn isatty(fd: i32) -> i32;
+    fn poll(fds: *u8, nfds: u32, timeout: i32) -> i32;
+    fn read(fd: i32, buf: *u8, count: u32) -> i32;
+    fn dprintf(fd: i32, fmt: *u8, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i32;
 }
 
 // ----------------------------------------------------------------------------
 // Machine: midi_player_run
 // ----------------------------------------------------------------------------
-machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 {
+machine midi_player_run(
+    mid_path: *u8,
+    out_wav_path: *u8,
+    is_stereo: i1,
+    nc_mode: u32,
+    cur_idx: u32,
+    total_files: u32
+) -> i32 {
     flow {
         reg hex_dphi: *u8 = "0000000017F54D3949345A39E92D67390DED7439BABE8139C675893945A29139304B9A39EE77A3395730AD39B77CB739DB65C23917F5CD394934DA39E92DE7390DEDF439BABE013AC675093A45A2113A304B1A3AEE77233A57302D3AB77C373ADB65423A17F54D3A49345A3AE92D673A0DED743ABABE813AC675893A45A2913A304B9A3AEE77A33A5730AD3AB77CB73ADB65C23A17F5CD3A4934DA3AE92DE73A0DEDF43ABABE013BC675093B45A2113B304B1A3BEE77233B57302D3BB77C373BDB65423B17F54D3B49345A3BE92D673B0DED743BBABE813BC675893B45A2913B304B9A3BEE77A33B5730AD3BB77CB73BDB65C23B17F5CD3B4934DA3BE92DE73A0DEDF43BBABE013CC675093C45A2113C304B1A3CEE77233C57302D3CB77C373CDB65423C17F54D3C49345A3CE92D673C0DED743CBABE813CC675893C45A2913C304B9A3CEE77A33C5730AD3CB77CB73CDB65C23C17F5CD3C4934DA3CE92DE73C0DEDF43CBABE013DC675093D45A2113D304B1A3DEE77233D57302D3DB77C373DDB65423D17F54D3D49345A3DE92D673D0DED743DBABE813DC675893D45A2913D304B9A3DEE77A33D5730AD3DB77CB73DDB65C23D17F5CD3D4934DA3DE92DE73D0DEDF43DBABE013EC675093E45A2113E304B1A3EEE77233E57302D3EB77C373EDB65423E17F54D3E49345A3EE92D673E0DED743EBABE813EC675893E45A2913E";
 
@@ -63,16 +75,20 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
         reg mid_file:       *void = null;
         reg wav_file:       *void = null;
         reg is_stdout:      i1  = 0;
+        reg peak_poly:      u32 = 0;
         reg riff_hdr:       *u8 = null;
 
         reg file_track_start:  *u8 = null;
         reg total_blocks_calc: u32 = 0;
         reg max_voices:        u32 = 0;
+
+        reg is_interactive:    i1  = 0;
+        reg p_pollfd:          *u8 = null;
+        reg p_keybuf:          *u8 = null;
+        reg file_basename:     *u8 = null;
     }
     states {
         Entry: {
-            let _ = call puts("StateSSA Multi-Track MIDI Synthesizer Player");
-
             // 1. Allocate helper structs & tables
             let p_dphi = call malloc(512);
             let p_hdr  = call malloc(16);
@@ -86,7 +102,10 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
             // Decode 128 note frequencies
             let _ = call SpatialStage_DecodeDphiTable(hex_dphi, cast(*f32) p_dphi);
 
-            _ => OpenFile [
+            // Check if stdin is an interactive terminal
+            let tty_res = call isatty(0);
+            let is_tty = tty_res == 1;
+            is_tty != 0 => SetupInteractive [
                 dphi_table <= cast(*f32) p_dphi,
                 midi_hdr <= cast(*MidiHeader) p_hdr,
                 voice_slots <= null,
@@ -95,6 +114,64 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
                 riff_hdr <= p_rhdr,
                 chunk_buf <= cast(*i16) p_chunk
             ];
+            _ => SetupNonInteractive [
+                dphi_table <= cast(*f32) p_dphi,
+                midi_hdr <= cast(*MidiHeader) p_hdr,
+                voice_slots <= null,
+                spatial_params <= cast(*SpatialVoiceParams) p_sp,
+                event_out <= cast(*MidiEvent) p_ev,
+                riff_hdr <= p_rhdr,
+                chunk_buf <= cast(*i16) p_chunk
+            ];
+        }
+
+        SetupInteractive: {
+            let p_poll = call malloc(8);
+            let p_pfd = cast(*i32) p_poll;
+            *p_pfd <- 0; // stdin fd
+            let p_pev = cast(*i16)(p_poll + 4);
+            *p_pev <- 1; // POLLIN (0x0001)
+            let p_prev = cast(*i16)(p_poll + 6);
+            *p_prev <- 0;
+            let p_kb = call malloc(64);
+
+            let p_slash = call strrchr(mid_path, 47); // '/'
+            let has_slash = p_slash != null;
+            has_slash != 0 => BaseFromSlash [
+                is_interactive <= 1,
+                p_pollfd <= p_poll,
+                p_keybuf <= p_kb
+            ];
+            _ => BaseFromDirect [
+                is_interactive <= 1,
+                p_pollfd <= p_poll,
+                p_keybuf <= p_kb
+            ];
+        }
+
+        SetupNonInteractive: {
+            let p_slash = call strrchr(mid_path, 47); // '/'
+            let has_slash = p_slash != null;
+            has_slash != 0 => BaseFromSlash [
+                is_interactive <= 0,
+                p_pollfd <= null,
+                p_keybuf <= null
+            ];
+            _ => BaseFromDirect [
+                is_interactive <= 0,
+                p_pollfd <= null,
+                p_keybuf <= null
+            ];
+        }
+
+        BaseFromSlash: {
+            let p_slash = call strrchr(mid_path, 47);
+            let bname = p_slash + 1;
+            _ => OpenFile [ file_basename <= bname ];
+        }
+
+        BaseFromDirect: {
+            _ => OpenFile [ file_basename <= mid_path ];
         }
 
         // --------------------------------------------------------------------
@@ -149,14 +226,16 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
                 cursors <= cast(*TrackCursor) p_cursors,
                 num_tracks <= ntrks,
                 division <= div,
-                file_track_start <= first_track
+                file_track_start <= first_track,
+                peak_poly <= peak_v
             ];
             _ => InitPolyBlocks [
                 cursors <= cast(*TrackCursor) p_cursors,
                 num_tracks <= ntrks,
                 division <= div,
                 file_track_start <= first_track,
-                total_blocks_calc <= blocks_raw
+                total_blocks_calc <= blocks_raw,
+                peak_poly <= peak_v
             ];
         }
 
@@ -174,7 +253,8 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
             let p_slot = call malloc(slot_bytes);
             let _ = call memset(p_slot, 0, slot_bytes);
 
-            let pipe = call SynthPipeline_Create(total_blocks_calc, is_stereo);
+            let pipe = call SynthPipeline_Create(total_blocks_calc, is_stereo, nc_mode);
+            let _ = call SynthPipeline_SetPHSBase(pipe, peak_poly);
 
             // Rewind track cursors to 0 tick
             let f_end = file_buf + file_len;
@@ -264,12 +344,11 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
         // Multi-Track Timeline Loop
         // --------------------------------------------------------------------
         StartSequencer: {
-            is_stdout != 0 => AdvanceTimeline;
-            _ => PrintFileStart;
-        }
-
-        PrintFileStart: {
-            let _ = call puts("Starting multi-track timeline synthesis...");
+            let track_no = cast(u64) (cur_idx + 1);
+            let track_tot = cast(u64) total_files;
+            let p_bname_u64 = cast(u64) file_basename;
+            let fmt_hdr = "%c--- [Track %lu/%lu] %s ---%c";
+            let _ = call dprintf(2, fmt_hdr, 10, track_no, track_tot, p_bname_u64, 10);
             _ => AdvanceTimeline;
         }
 
@@ -389,7 +468,45 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
         AdvanceChunkProgress: {
             let next_rem = rem_to_render - cur_chunk_s;
             let next_tot = total_samples + cur_chunk_s;
+            is_interactive != 0 => PollInteractiveKey [ rem_to_render <= next_rem, total_samples <= next_tot ];
             _ => StartChunkLoop [ rem_to_render <= next_rem, total_samples <= next_tot ];
+        }
+
+        PollInteractiveKey: {
+            let p_rev = cast(*i16) (p_pollfd + 6);
+            *p_rev <- 0;
+            let ret = call poll(p_pollfd, 1, 0);
+            ret > 0 => ReadInteractiveKey;
+            _ => StartChunkLoop;
+        }
+
+        ReadInteractiveKey: {
+            let p_rev = cast(*i16) (p_pollfd + 6);
+            let rev = cast(i32) *p_rev;
+            let has_in = rev & 1;
+            has_in != 0 => FetchKeyBytes;
+            _ => StartChunkLoop;
+        }
+
+        FetchKeyBytes: {
+            let nread = call read(0, p_keybuf, 64);
+            nread > 0 => ScanKeyForEnter;
+            _ => StartChunkLoop;
+        }
+
+        ScanKeyForEnter: {
+            let b0 = *p_keybuf;
+            let is_lf = b0 == 10;
+            let is_cr = b0 == 13;
+            let is_enter = is_lf || is_cr;
+            is_enter != 0 => HandleSkip;
+            _ => StartChunkLoop;
+        }
+
+        HandleSkip: {
+            let fmt_skip = "%c>> [Skipped by User]%c";
+            let _ = call dprintf(2, fmt_skip, 10, 10, 0, 0, 0);
+            _ => FinishAndSave;
         }
 
         SubtractTicksFromTracks: {
@@ -559,6 +676,8 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
         }
 
         FinishStdout: {
+            let fmt_fin = "%c>> Finished.%c";
+            let _ = call dprintf(2, fmt_fin, 10, 10, 0, 0, 0);
             _ => CleanupResources;
         }
 
@@ -590,7 +709,8 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
 
             let _ = call fwrite(riff_hdr, 1, 44, wav_file);
             let _ = call fclose(wav_file);
-            let _ = call puts("MIDI stereo synthesis complete! WAV rendered successfully.");
+            let fmt_fin = "%c>> Finished (WAV saved).%c";
+            let _ = call dprintf(2, fmt_fin, 10, 10, 0, 0, 0);
             _ => CleanupResources;
         }
 
@@ -615,7 +735,8 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
 
             let _ = call fwrite(riff_hdr, 1, 44, wav_file);
             let _ = call fclose(wav_file);
-            let _ = call puts("MIDI mono synthesis complete! WAV rendered successfully.");
+            let fmt_fin = "%c>> Finished (Mono WAV saved).%c";
+            let _ = call dprintf(2, fmt_fin, 10, 10, 0, 0, 0);
             _ => CleanupResources;
         }
 
@@ -630,6 +751,8 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
             let _ = call free(cast(*u8) chunk_buf);
             let _ = call free(cast(*u8) dphi_table);
             let _ = call free(cast(*u8) midi_hdr);
+            let _ = call free(p_pollfd);
+            let _ = call free(p_keybuf);
 
             _ => return 0;
         }
@@ -657,6 +780,7 @@ machine main(argc: i32, argv: *u64) -> i32 {
         reg cur_file_i:  u32 = 0;
         reg out_path:    *u8 = "-";
         reg is_stereo:   i1  = 1;
+        reg nc_mode:     u32 = 5; // default: dynamic
         reg files_buf:   *u64 = null;
     }
     states {
@@ -670,6 +794,7 @@ machine main(argc: i32, argv: *u64) -> i32 {
                 cur_file_i <= 0,
                 out_path <= "-",
                 is_stereo <= 1,
+                nc_mode <= 5,
                 files_buf <= cast(*u64) mem
             ];
         }
@@ -692,10 +817,16 @@ machine main(argc: i32, argv: *u64) -> i32 {
             let arg = cast(*u8) *(argv + arg_i);
             let c1 = cast(i32) *(arg + 1);
             let c2 = cast(i32) *(arg + 2);
+            let c3 = cast(i32) *(arg + 3);
 
             // Match "-o"
             let is_o = (c1 == 111) && (c2 == 0);
             is_o != 0 => HandleOptionO;
+
+            // Match "-nc"
+            let is_nc1 = (c1 == 110) & (c2 == 99);
+            let is_nc = is_nc1 & (c3 == 0);
+            is_nc != 0 => HandleOptionNC;
 
             // Match "--mono" (starts with '-', '-', 'm')
             let is_mono = (c1 == 45) && (c2 == 109);
@@ -719,6 +850,75 @@ machine main(argc: i32, argv: *u64) -> i32 {
             _ => ParseLoop [ out_path <= next_arg, arg_i <= arg_i + 2 ];
         }
 
+        HandleOptionNC: {
+            let max_args = cast(u32) argc;
+            let next_i = arg_i + 1;
+            next_i >= max_args => MissingArgVal;
+            let val_arg = cast(*u8) *(argv + next_i);
+            let v0 = cast(i32) *val_arg;
+            let v1 = cast(i32) *(val_arg + 1);
+            let v2 = cast(i32) *(val_arg + 2);
+            let v3 = cast(i32) *(val_arg + 3);
+            let v4 = cast(i32) *(val_arg + 4);
+            let v5 = cast(i32) *(val_arg + 5);
+
+            // "normal" (110, 111, 114, 109) -> 0
+            let is_norm_1 = (v0 == 110) & (v1 == 111);
+            let is_norm_2 = (v2 == 114) & (v3 == 109);
+            let is_norm = is_norm_1 & is_norm_2;
+            is_norm != 0 => SetNCNormal;
+
+            // "pf" (112, 102) -> 2
+            let is_pf = (v0 == 112) && (v1 == 102);
+            is_pf != 0 => SetNCPF;
+
+            // "phs" (112, 104) -> 1
+            let is_phs = (v0 == 112) && (v1 == 104);
+            is_phs != 0 => SetNCPHS;
+
+            // "dyn_pf" (100, 121, 110, 95, 112, 102) -> 7
+            let is_dpf_1 = (v0 == 100) & (v1 == 121);
+            let is_dpf_2 = (v2 == 110) & (v3 == 95);
+            let is_dpf_3 = (v4 == 112) & (v5 == 102);
+            let is_dyn_pf = (is_dpf_1 & is_dpf_2) & is_dpf_3;
+            is_dyn_pf != 0 => SetNCDynPF;
+
+            // "dyn_phs" (100, 121, 110, 95, 112, 104) -> 6
+            let is_dyn_phs = (is_dpf_1 & is_dpf_2) & (v4 == 112);
+            is_dyn_phs != 0 => SetNCDynPHS;
+
+            // "dynamic" (100, 121) -> 5
+            let is_dyn = (v0 == 100) && (v1 == 121);
+            is_dyn != 0 => SetNCDynamic;
+
+            // default fallback: 5 (dynamic)
+            _ => ParseLoop [ nc_mode <= 5, arg_i <= arg_i + 2 ];
+        }
+
+        SetNCNormal: {
+            _ => ParseLoop [ nc_mode <= 0, arg_i <= arg_i + 2 ];
+        }
+
+        SetNCPF: {
+            _ => ParseLoop [ nc_mode <= 2, arg_i <= arg_i + 2 ];
+        }
+
+        SetNCPHS: {
+            _ => ParseLoop [ nc_mode <= 1, arg_i <= arg_i + 2 ];
+        }
+
+        SetNCDynPF: {
+            _ => ParseLoop [ nc_mode <= 7, arg_i <= arg_i + 2 ];
+        }
+
+        SetNCDynPHS: {
+            _ => ParseLoop [ nc_mode <= 6, arg_i <= arg_i + 2 ];
+        }
+
+        SetNCDynamic: {
+            _ => ParseLoop [ nc_mode <= 5, arg_i <= arg_i + 2 ];
+        }
+
         HandleOptionMono: {
             _ => ParseLoop [ is_stereo <= 0, arg_i <= arg_i + 1 ];
         }
@@ -732,6 +932,10 @@ machine main(argc: i32, argv: *u64) -> i32 {
 
         CheckExecution: {
             num_files == 0 => ShowHelp;
+
+            // Print banner to stderr
+            let fmt_banner = "StateSSA Multi-Track MIDI Synthesizer Player (v0.14.0)%c";
+            let _ = call dprintf(2, fmt_banner, 10, 0, 0, 0, 0);
 
             // Check if -o was used with multiple input files
             let c0 = cast(i32) *out_path;
@@ -751,7 +955,7 @@ machine main(argc: i32, argv: *u64) -> i32 {
 
         PlayCurrent: {
             let cur_file = cast(*u8) *(files_buf + cur_file_i);
-            let _ = call midi_player_run(cur_file, out_path, is_stereo);
+            let _ = call midi_player_run(cur_file, out_path, is_stereo, nc_mode, cur_file_i, num_files);
             _ => PlayLoop [ cur_file_i <= cur_file_i + 1 ];
         }
 
@@ -764,11 +968,14 @@ machine main(argc: i32, argv: *u64) -> i32 {
             let _ = call puts("Usage: midi_player [options] <song1.mid> [song2.mid ...]");
             let _ = call puts("Options:");
             let _ = call puts("  -o <file.wav>   Render to WAV file (default: stdout streaming)");
+            let _ = call puts("  -nc <mode>      Noise control: dynamic (default), dyn_pf, dyn_phs, pf, phs, normal");
             let _ = call puts("  --mono          Synthesize mono audio (default: 3D stereo)");
             let _ = call puts("  -h, --help      Display this help message");
             let _ = call puts("");
             let _ = call puts("Examples:");
             let _ = call puts("  midi_player song.mid | aplay -f cd");
+            let _ = call puts("  midi_player song.mid -nc dyn_pf | aplay -f cd");
+            let _ = call puts("  midi_player song.mid -nc normal | aplay -f cd");
             let _ = call puts("  midi_player *.mid | aplay -f cd");
             let _ = call puts("  midi_player song.mid -o output.wav");
             _ => return 1;

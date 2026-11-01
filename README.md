@@ -152,7 +152,7 @@ MIDI mono synthesis complete! WAV rendered successfully.
 | **05** | **io_uring Web Server** | `samples/05_web_server/` | Linux `io_uring` 非同期システムコール直結、Zero-copy HTTP Web サーバー |
 | **06** | **Fixed-Point Math** | `samples/06_fixed_math/` | `q64` (Q32.32) 固定小数点実数計算、C 数学ライブラリ（`libm`）境界自動変換 |
 | **07** | **SIMD Vivaldi Winter** | `samples/07_simd_vivaldi_winter/` | `f32x4` SIMD 演算、4ボイス FM 弦楽合奏音響合成、44.1kHz 16bit WAV 出力 |
-| **08** | **FM MIDI Player** | `samples/08_midi_player/` | SMF Format 0/1 並行パース、事前スキャン動的ポリフォニー、純粋FM合成、リアルタイムUNIXパイプ再生 |
+| **08** | **FM MIDI Player** | `samples/08_midi_player/` | SMF Format 0/1 並行パース、事前スキャン動的ポリフォニー、実機バーチャル・アナログ再現 (`-nc dyn_pf`)、リアルタイムUNIXパイプ再生 |
 
 > [!TIP]
 > 各サンプルの詳細な解説、ソースコードの設計思想、および個別手動ビルド・実行手順については、**[SAMPLES.md](SAMPLES.md)** を参照してください。
