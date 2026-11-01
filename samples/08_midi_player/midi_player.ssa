@@ -1,0 +1,713 @@
+// ============================================================================
+// StateSSA 08_midi_player: midi_player.ssa
+// Multi-Track Standard MIDI File (SMF Format 0 & 1) Synthesizer Player
+// Top-Level Timeline Scheduler, Multi-Cursor Streamer & RIFF WAV Exporter
+// Backed by 5-Module Decoupled Architecture (Parser -> Spatial -> Dual Pipeline)
+// ============================================================================
+
+include "midi_types.ssa";
+include "midi_parser.ssa";
+include "spatial_stage.ssa";
+include "synth_pipeline.ssa";
+
+extern "C" {
+    fn malloc(sz: u32) -> *u8;
+    fn free(p: *u8) -> void;
+    fn memset(s: *u8, c: i32, n: u32) -> *u8;
+    fn fopen(path: *u8, mode: *u8) -> *void;
+    fn fread(ptr: *u8, size: u32, nmemb: u32, stream: *void) -> u32;
+    fn fseek(stream: *void, offset: i64, whence: i32) -> i32;
+    fn ftell(stream: *void) -> i64;
+    fn fwrite(ptr: *u8, size: u32, nmemb: u32, stream: *void) -> u32;
+    fn fclose(stream: *void) -> i32;
+    fn write(fd: i32, buf: *u8, count: u32) -> i32;
+    fn puts(s: *u8) -> i32;
+    fn printf(fmt: *u8, s1: *u8, s2: *u8) -> i32;
+}
+
+// ----------------------------------------------------------------------------
+// Machine: midi_player_run
+// ----------------------------------------------------------------------------
+machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 {
+    flow {
+        reg hex_dphi: *u8 = "0000000017F54D3949345A39E92D67390DED7439BABE8139C675893945A29139304B9A39EE77A3395730AD39B77CB739DB65C23917F5CD394934DA39E92DE7390DEDF439BABE013AC675093A45A2113A304B1A3AEE77233A57302D3AB77C373ADB65423A17F54D3A49345A3AE92D673A0DED743ABABE813AC675893A45A2913A304B9A3AEE77A33A5730AD3AB77CB73ADB65C23A17F5CD3A4934DA3AE92DE73A0DEDF43ABABE013BC675093B45A2113B304B1A3BEE77233B57302D3BB77C373BDB65423B17F54D3B49345A3BE92D673B0DED743BBABE813BC675893B45A2913B304B9A3BEE77A33B5730AD3BB77CB73BDB65C23B17F5CD3B4934DA3BE92DE73A0DEDF43BBABE013CC675093C45A2113C304B1A3CEE77233C57302D3CB77C373CDB65423C17F54D3C49345A3CE92D673C0DED743CBABE813CC675893C45A2913C304B9A3CEE77A33C5730AD3CB77CB73CDB65C23C17F5CD3C4934DA3CE92DE73C0DEDF43CBABE013DC675093D45A2113D304B1A3DEE77233D57302D3DB77C373DDB65423D17F54D3D49345A3DE92D673D0DED743DBABE813DC675893D45A2913D304B9A3DEE77A33D5730AD3DB77CB73DDB65C23D17F5CD3D4934DA3DE92DE73D0DEDF43DBABE013EC675093E45A2113E304B1A3EEE77233E57302D3EB77C373EDB65423E17F54D3E49345A3EE92D673E0DED743EBABE813EC675893E45A2913E";
+
+        reg file_buf:       *u8 = null;
+        reg file_len:       u32 = 0;
+        reg dphi_table:     *f32 = null;
+        reg midi_hdr:       *MidiHeader = null;
+        reg cursors:        *TrackCursor = null;
+        reg voice_slots:    *VoiceSlot = null;
+        reg pipeline:       *SynthPipeline = null;
+        reg spatial_params: *SpatialVoiceParams = null;
+        reg event_out:      *MidiEvent = null;
+
+        reg chunk_buf:      *i16 = null;
+        reg total_samples:  u32 = 0;
+        reg tempo_uspq:     u32 = 500000; // default 120 BPM
+        reg division:       u32 = 480;
+        reg num_tracks:     u32 = 0;
+
+        reg min_wait:       u32 = 0;
+        reg t_scan_idx:     u32 = 0;
+        reg t_disp_idx:     u32 = 0;
+        reg v_search_idx:   u32 = 0;
+        reg found_slot:     u32 = 0;
+        reg target_ch:      u8 = 0;
+        reg target_note:    u8 = 0;
+        reg samples_to_render: u32 = 0;
+        reg rem_to_render:  u32 = 0;
+        reg cur_chunk_s:    u32 = 0;
+        reg cur_chunk_bytes: u32 = 0;
+
+        reg mid_file:       *void = null;
+        reg wav_file:       *void = null;
+        reg is_stdout:      i1  = 0;
+        reg riff_hdr:       *u8 = null;
+
+        reg file_track_start:  *u8 = null;
+        reg total_blocks_calc: u32 = 0;
+        reg max_voices:        u32 = 0;
+    }
+    states {
+        Entry: {
+            let _ = call puts("StateSSA Multi-Track MIDI Synthesizer Player");
+
+            // 1. Allocate helper structs & tables
+            let p_dphi = call malloc(512);
+            let p_hdr  = call malloc(16);
+            let p_sp   = call malloc(32);
+            let p_ev   = call malloc(16);
+            let p_rhdr = call malloc(44);
+
+            // Allocate 8KB chunk PCM buffer (holds 2048 stereo samples)
+            let p_chunk = call malloc(8192);
+
+            // Decode 128 note frequencies
+            let _ = call SpatialStage_DecodeDphiTable(hex_dphi, cast(*f32) p_dphi);
+
+            _ => OpenFile [
+                dphi_table <= cast(*f32) p_dphi,
+                midi_hdr <= cast(*MidiHeader) p_hdr,
+                voice_slots <= null,
+                spatial_params <= cast(*SpatialVoiceParams) p_sp,
+                event_out <= cast(*MidiEvent) p_ev,
+                riff_hdr <= p_rhdr,
+                chunk_buf <= cast(*i16) p_chunk
+            ];
+        }
+
+        // --------------------------------------------------------------------
+        // Load MIDI File from Disk into Memory
+        // --------------------------------------------------------------------
+        OpenFile: {
+            let mode = "rb";
+            let f = call fopen(mid_path, mode);
+            let is_null = f == null;
+            is_null != 0 => FileOpenError;
+            _ => ReadFileContents [ mid_file <= f ];
+        }
+
+        ReadFileContents: {
+            // Get file length: fseek(f, 0, SEEK_END); ftell(f); fseek(f, 0, SEEK_SET);
+            let _ = call fseek(mid_file, cast(i64) 0, 2);
+            let sz = call ftell(mid_file);
+            let _ = call fseek(mid_file, cast(i64) 0, 0);
+
+            let sz_u32 = cast(u32) sz;
+            let mem = call malloc(sz_u32);
+            let _ = call fread(mem, 1, sz_u32, mid_file);
+            let _ = call fclose(mid_file);
+
+            _ => ParseMidi [ file_buf <= mem, file_len <= sz_u32 ];
+        }
+
+        ParseMidi: {
+            let first_track = call MidiParse_Header(file_buf, file_len, midi_hdr);
+            let is_null = first_track == null;
+            is_null != 0 => InvalidMidi;
+
+            let ntrks_raw = midi_hdr.num_tracks;
+            let ntrks = cast(u32) ntrks_raw;
+            let div_raw   = midi_hdr.division;
+            let div   = cast(u32) div_raw;
+
+            // Allocate TrackCursor array: num_tracks * 32 bytes
+            let c_sz = ntrks * 32;
+            let p_cursors = call malloc(c_sz);
+            let f_end = file_buf + file_len;
+
+            // 1. Initial track cursors scan
+            let _ = call MidiParse_InitTracks(first_track, f_end, ntrks, cast(*TrackCursor) p_cursors);
+
+            // 2. High-speed dry-run pre-scan to determine true peak polyphony
+            let peak_v = call MidiParse_ScanPeakPolyphony(cast(*TrackCursor) p_cursors, ntrks, event_out);
+
+            // 3. Compute required blocks K = ceil(peak_v / 4)
+            let blocks_raw = (peak_v + 3) / 4;
+            blocks_raw == 0 => InitOneBlock [
+                cursors <= cast(*TrackCursor) p_cursors,
+                num_tracks <= ntrks,
+                division <= div,
+                file_track_start <= first_track
+            ];
+            _ => InitPolyBlocks [
+                cursors <= cast(*TrackCursor) p_cursors,
+                num_tracks <= ntrks,
+                division <= div,
+                file_track_start <= first_track,
+                total_blocks_calc <= blocks_raw
+            ];
+        }
+
+        InitOneBlock: {
+            _ => AllocVoiceArena [ total_blocks_calc <= 1 ];
+        }
+
+        InitPolyBlocks: {
+            _ => AllocVoiceArena;
+        }
+
+        AllocVoiceArena: {
+            let max_v = total_blocks_calc * 4;
+            let slot_bytes = max_v * 4;
+            let p_slot = call malloc(slot_bytes);
+            let _ = call memset(p_slot, 0, slot_bytes);
+
+            let pipe = call SynthPipeline_Create(total_blocks_calc, is_stereo);
+
+            // Rewind track cursors to 0 tick
+            let f_end = file_buf + file_len;
+            let _ = call MidiParse_InitTracks(file_track_start, f_end, num_tracks, cursors);
+
+            _ => CheckOutputMode [
+                pipeline <= pipe,
+                voice_slots <= cast(*VoiceSlot) p_slot,
+                max_voices <= max_v,
+                total_samples <= 0
+            ];
+        }
+
+        CheckOutputMode: {
+            let c0 = cast(i32) *out_wav_path;
+            let c1 = cast(i32) *(out_wav_path + 1);
+            let is_dash = (c0 == 45) && (c1 == 0); // '-'
+            is_dash != 0 => SetupStdout;
+            _ => SetupOutputFile;
+        }
+
+        SetupStdout: {
+            // Streaming stdout mode: emit initial streaming WAV header (data_size = 0x7FFFFFFF)
+            _ => WriteStdoutHdr [ is_stdout <= 1, wav_file <= null ];
+        }
+
+        WriteStdoutHdr: {
+            is_stereo != 0 => EmitStdoutHdrStereo;
+            _ => EmitStdoutHdrMono;
+        }
+
+        EmitStdoutHdrStereo: {
+            let h = riff_hdr;
+            *h <- 82; *(h + 1) <- 73; *(h + 2) <- 70; *(h + 3) <- 70; // RIFF
+            let p_sz = cast(*i32)(h + 4); *p_sz <- 2147483647; // 0x7FFFFFFF (Streaming)
+            *(h + 8) <- 87; *(h + 9) <- 65; *(h + 10) <- 86; *(h + 11) <- 69; // WAVE
+            *(h + 12) <- 102; *(h + 13) <- 109; *(h + 14) <- 116; *(h + 15) <- 32; // fmt
+            let p_sc1 = cast(*i32)(h + 16); *p_sc1 <- 16;
+            let p_fmt = cast(*i16)(h + 20); *p_fmt <- 1; // PCM
+            let p_ch  = cast(*i16)(h + 22); *p_ch  <- 2; // Stereo
+            let p_sr  = cast(*i32)(h + 24); *p_sr  <- 44100;
+            let p_br  = cast(*i32)(h + 28); *p_br  <- 176400; // 44100 * 4
+            let p_ba  = cast(*i16)(h + 32); *p_ba  <- 4; // 2ch * 2bytes
+            let p_bps = cast(*i16)(h + 34); *p_bps <- 16;
+            *(h + 36) <- 100; *(h + 37) <- 97; *(h + 38) <- 116; *(h + 39) <- 97; // data
+            let p_ds  = cast(*i32)(h + 40); *p_ds  <- 2147483647;
+
+            let _ = call write(1, riff_hdr, 44);
+            _ => StartSequencer;
+        }
+
+        EmitStdoutHdrMono: {
+            let h = riff_hdr;
+            *h <- 82; *(h + 1) <- 73; *(h + 2) <- 70; *(h + 3) <- 70; // RIFF
+            let p_sz = cast(*i32)(h + 4); *p_sz <- 2147483647;
+            *(h + 8) <- 87; *(h + 9) <- 65; *(h + 10) <- 86; *(h + 11) <- 69; // WAVE
+            *(h + 12) <- 102; *(h + 13) <- 109; *(h + 14) <- 116; *(h + 15) <- 32; // fmt
+            let p_sc1 = cast(*i32)(h + 16); *p_sc1 <- 16;
+            let p_fmt = cast(*i16)(h + 20); *p_fmt <- 1; // PCM
+            let p_ch  = cast(*i16)(h + 22); *p_ch  <- 1; // Mono
+            let p_sr  = cast(*i32)(h + 24); *p_sr  <- 44100;
+            let p_br  = cast(*i32)(h + 28); *p_br  <- 88200; // 44100 * 2
+            let p_ba  = cast(*i16)(h + 32); *p_ba  <- 2; // 1ch * 2bytes
+            let p_bps = cast(*i16)(h + 34); *p_bps <- 16;
+            *(h + 36) <- 100; *(h + 37) <- 97; *(h + 38) <- 116; *(h + 39) <- 97; // data
+            let p_ds  = cast(*i32)(h + 40); *p_ds  <- 2147483647;
+
+            let _ = call write(1, riff_hdr, 44);
+            _ => StartSequencer;
+        }
+
+        SetupOutputFile: {
+            let mode = "wb";
+            let f = call fopen(out_wav_path, mode);
+            let is_null = f == null;
+            is_null != 0 => FileOpenError;
+            _ => WriteFilePlaceholderHdr [ is_stdout <= 0, wav_file <= f ];
+        }
+
+        WriteFilePlaceholderHdr: {
+            let _ = call memset(riff_hdr, 0, 44);
+            let _ = call fwrite(riff_hdr, 1, 44, wav_file);
+            _ => StartSequencer;
+        }
+
+        // --------------------------------------------------------------------
+        // Multi-Track Timeline Loop
+        // --------------------------------------------------------------------
+        StartSequencer: {
+            is_stdout != 0 => AdvanceTimeline;
+            _ => PrintFileStart;
+        }
+
+        PrintFileStart: {
+            let _ = call puts("Starting multi-track timeline synthesis...");
+            _ => AdvanceTimeline;
+        }
+
+        AdvanceTimeline: {
+            _ => ScanMinWait [ min_wait <= 4294967295, t_scan_idx <= 0 ];
+        }
+
+        ScanMinWait: {
+            t_scan_idx >= num_tracks => CheckMinWait;
+            _ => CheckTrackWait;
+        }
+
+        CheckTrackWait: {
+            let c = cursors + t_scan_idx;
+            let act = c.is_active;
+            act != 0 => CompareWait;
+            _ => NextScanTrack;
+        }
+
+        CompareWait: {
+            let c = cursors + t_scan_idx;
+            let wt = c.wait_ticks;
+            wt < min_wait => UpdateMinWait [ min_wait <= wt ];
+            _ => NextScanTrack;
+        }
+
+        UpdateMinWait: {
+            _ => NextScanTrack;
+        }
+
+        NextScanTrack: {
+            _ => ScanMinWait [ t_scan_idx <= t_scan_idx + 1 ];
+        }
+
+        CheckMinWait: {
+            // If min_wait is still 0xFFFFFFFF, all tracks finished!
+            min_wait == 4294967295 => FinishAndSave;
+            min_wait > 0 => RenderAudioTicks;
+            _ => DispatchEventsAtCurrentTick [ t_disp_idx <= 0 ];
+        }
+
+        // --------------------------------------------------------------------
+        // Render Audio for delta ticks: S = ΔT * (44100 * uspq) / (1000000 * div)
+        // --------------------------------------------------------------------
+        RenderAudioTicks: {
+            let div = division;
+            div == 0 => FallbackDiv;
+            _ => DoCalcSamples;
+        }
+
+        FallbackDiv: {
+            _ => DoCalcSamples [ division <= 480 ];
+        }
+
+        DoCalcSamples: {
+            let s_per_beat = (cast(f32) 44100.0 * cast(f32) tempo_uspq) / cast(f32) 1000000.0;
+            let s_per_tick = s_per_beat / cast(f32) division;
+            let total_s_f = cast(f32) min_wait * s_per_tick;
+            let total_s = cast(u32) total_s_f;
+
+            total_s > 0 => StartChunkLoop [ rem_to_render <= total_s ];
+            _ => SubtractTicksFromTracks [ t_scan_idx <= 0 ];
+        }
+
+        StartChunkLoop: {
+            rem_to_render == 0 => SubtractTicksFromTracks [ t_scan_idx <= 0 ];
+            rem_to_render > 2048 => ChunkIsMax;
+            _ => ChunkIsRem;
+        }
+
+        ChunkIsMax: {
+            _ => ExecChunkRender [ cur_chunk_s <= 2048 ];
+        }
+
+        ChunkIsRem: {
+            _ => ExecChunkRender [ cur_chunk_s <= rem_to_render ];
+        }
+
+        ExecChunkRender: {
+            let _ = call SynthPipeline_Render(pipeline, chunk_buf, cur_chunk_s);
+            is_stdout != 0 => WriteChunkStdout;
+            _ => WriteChunkFile;
+        }
+
+        WriteChunkFile: {
+            let bytes = cur_chunk_s * 2;
+            is_stereo != 0 => WriteChunkFileStereo;
+            _ => DoWriteFile [ cur_chunk_bytes <= bytes ];
+        }
+
+        WriteChunkFileStereo: {
+            let b4 = cur_chunk_s * 4;
+            _ => DoWriteFile [ cur_chunk_bytes <= b4 ];
+        }
+
+        DoWriteFile: {
+            let _ = call fwrite(cast(*u8) chunk_buf, 1, cur_chunk_bytes, wav_file);
+            _ => AdvanceChunkProgress;
+        }
+
+        WriteChunkStdout: {
+            let bytes = cur_chunk_s * 2;
+            is_stereo != 0 => WriteChunkStdoutStereo;
+            _ => DoWriteStdout [ cur_chunk_bytes <= bytes ];
+        }
+
+        WriteChunkStdoutStereo: {
+            let b4 = cur_chunk_s * 4;
+            _ => DoWriteStdout [ cur_chunk_bytes <= b4 ];
+        }
+
+        DoWriteStdout: {
+            let _ = call write(1, cast(*u8) chunk_buf, cur_chunk_bytes);
+            _ => AdvanceChunkProgress;
+        }
+
+        AdvanceChunkProgress: {
+            let next_rem = rem_to_render - cur_chunk_s;
+            let next_tot = total_samples + cur_chunk_s;
+            _ => StartChunkLoop [ rem_to_render <= next_rem, total_samples <= next_tot ];
+        }
+
+        SubtractTicksFromTracks: {
+            t_scan_idx >= num_tracks => DispatchEventsAtCurrentTick [ t_disp_idx <= 0 ];
+            _ => SubTrackWait;
+        }
+
+        SubTrackWait: {
+            let c = cursors + t_scan_idx;
+            let act = c.is_active;
+            act != 0 => DoSub;
+            _ => NextSubTrack;
+        }
+
+        DoSub: {
+            let c = cursors + t_scan_idx;
+            let wt = c.wait_ticks;
+            let n_wt = wt - min_wait;
+            c.wait_ticks <- n_wt;
+            _ => NextSubTrack;
+        }
+
+        NextSubTrack: {
+            _ => SubtractTicksFromTracks [ t_scan_idx <= t_scan_idx + 1 ];
+        }
+
+        // --------------------------------------------------------------------
+        // Dispatch All MIDI Events that are ready (wait_ticks == 0)
+        // --------------------------------------------------------------------
+        DispatchEventsAtCurrentTick: {
+            t_disp_idx >= num_tracks => AdvanceTimeline;
+            _ => CheckTrackReady;
+        }
+
+        CheckTrackReady: {
+            let c = cursors + t_disp_idx;
+            let act = c.is_active;
+            let wt  = c.wait_ticks;
+            let is_ready = (act != 0) && (wt == 0);
+            is_ready != 0 => ReadOneEvent;
+            _ => NextDispTrack;
+        }
+
+        ReadOneEvent: {
+            let c = cursors + t_disp_idx;
+            let ok = call MidiParse_ReadTrackEvent(c, event_out);
+            ok == 0 => NextDispTrack;
+            _ => ProcessMidiEvent;
+        }
+
+        ProcessMidiEvent: {
+            let et = event_out.event_type;
+            et == 1 => HandleNoteOn;
+            et == 2 => HandleNoteOff;
+            et == 3 => HandleSetTempo;
+            _ => CheckTrackReady; // Loop again for same track in case of delta=0!
+        }
+
+        // --- Note On: Allocate Slot & Configure Pipeline ---
+        HandleNoteOn: {
+            let ch = event_out.channel;
+            let n  = event_out.note;
+            let v  = event_out.velocity;
+
+            // Find free voice slot (0..63)
+            _ => SearchFreeSlot [ v_search_idx <= 0 ];
+        }
+
+        SearchFreeSlot: {
+            v_search_idx >= max_voices => CheckTrackReady; // All dynamically allocated voices occupied
+            let slot = voice_slots + v_search_idx;
+            let act = slot.is_active;
+            act == 0 => FoundFreeSlot;
+            _ => NextSearchSlot;
+        }
+
+        NextSearchSlot: {
+            _ => SearchFreeSlot [ v_search_idx <= v_search_idx + 1 ];
+        }
+
+        FoundFreeSlot: {
+            let slot = voice_slots + v_search_idx;
+            let ch = event_out.channel;
+            let n  = event_out.note;
+            let v  = event_out.velocity;
+            let t_u8 = cast(u8) t_disp_idx;
+
+            slot.is_active <- 1;
+            slot.track_id  <- t_u8;
+            slot.channel   <- ch;
+            slot.midi_note <- n;
+
+            // Compute 3D Spatial Acoustic Parameters
+            let note_u32 = cast(u32) n;
+            let vel_u32  = cast(u32) v;
+            let _ = call SpatialStage_ComputeParams(
+                t_disp_idx,
+                note_u32,
+                vel_u32,
+                is_stereo,
+                dphi_table,
+                spatial_params
+            );
+
+            // Set Voice in Synthesis Pipeline
+            let _ = call SynthPipeline_SetVoice(pipeline, v_search_idx, spatial_params);
+
+            _ => CheckTrackReady;
+        }
+
+        // --- Note Off: Find Slot & Silence Voice ---
+        HandleNoteOff: {
+            let ch = event_out.channel;
+            let n  = event_out.note;
+            _ => SearchActiveSlot [
+                target_ch <= ch,
+                target_note <= n,
+                v_search_idx <= 0
+            ];
+        }
+
+        SearchActiveSlot: {
+            v_search_idx >= max_voices => CheckTrackReady;
+            let slot = voice_slots + v_search_idx;
+            let act = slot.is_active;
+            let sn  = slot.midi_note;
+            let sch = slot.channel;
+            let m1 = (act != 0) && (sn == target_note);
+            let match = m1 && (sch == target_ch);
+            match != 0 => FoundSlotToSilence;
+            _ => NextActiveSlot;
+        }
+
+        NextActiveSlot: {
+            _ => SearchActiveSlot [ v_search_idx <= v_search_idx + 1 ];
+        }
+
+        FoundSlotToSilence: {
+            let slot = voice_slots + v_search_idx;
+            slot.is_active <- 0;
+            let _ = call SynthPipeline_SilenceVoice(pipeline, v_search_idx);
+            _ => CheckTrackReady;
+        }
+
+        // --- Set Tempo ---
+        HandleSetTempo: {
+            let uspq = event_out.tempo_uspq;
+            uspq > 0 => UpdateTempo;
+            _ => CheckTrackReady;
+        }
+
+        UpdateTempo: {
+            let uspq = event_out.tempo_uspq;
+            _ => CheckTrackReady [ tempo_uspq <= uspq ];
+        }
+
+        NextDispTrack: {
+            _ => DispatchEventsAtCurrentTick [ t_disp_idx <= t_disp_idx + 1 ];
+        }
+
+        // --------------------------------------------------------------------
+        // Finalize: Rewrite Accurate RIFF Header (File) or Exit (Stdout)
+        // --------------------------------------------------------------------
+        FinishAndSave: {
+            is_stdout != 0 => FinishStdout;
+            _ => RewriteFileHeader;
+        }
+
+        FinishStdout: {
+            _ => CleanupResources;
+        }
+
+        RewriteFileHeader: {
+            // Seek back to start of file to rewrite exact data length
+            let _ = call fseek(wav_file, cast(i64) 0, 0);
+            is_stereo != 0 => RewriteStereoHdr;
+            _ => RewriteMonoHdr;
+        }
+
+        RewriteStereoHdr: {
+            let total_bytes = total_samples * 4;
+            let riff_size = cast(i32) total_bytes + 36;
+
+            let h = riff_hdr;
+            *h <- 82; *(h + 1) <- 73; *(h + 2) <- 70; *(h + 3) <- 70; // RIFF
+            let p_sz = cast(*i32)(h + 4); *p_sz <- riff_size;
+            *(h + 8) <- 87; *(h + 9) <- 65; *(h + 10) <- 86; *(h + 11) <- 69; // WAVE
+            *(h + 12) <- 102; *(h + 13) <- 109; *(h + 14) <- 116; *(h + 15) <- 32; // fmt
+            let p_sc1 = cast(*i32)(h + 16); *p_sc1 <- 16;
+            let p_fmt = cast(*i16)(h + 20); *p_fmt <- 1; // PCM
+            let p_ch  = cast(*i16)(h + 22); *p_ch  <- 2; // Stereo
+            let p_sr  = cast(*i32)(h + 24); *p_sr  <- 44100;
+            let p_br  = cast(*i32)(h + 28); *p_br  <- 176400; // 44100 * 4
+            let p_ba  = cast(*i16)(h + 32); *p_ba  <- 4; // 2ch * 2bytes
+            let p_bps = cast(*i16)(h + 34); *p_bps <- 16;
+            *(h + 36) <- 100; *(h + 37) <- 97; *(h + 38) <- 116; *(h + 39) <- 97; // data
+            let p_ds  = cast(*i32)(h + 40); *p_ds  <- cast(i32) total_bytes;
+
+            let _ = call fwrite(riff_hdr, 1, 44, wav_file);
+            let _ = call fclose(wav_file);
+            let _ = call puts("MIDI stereo synthesis complete! WAV rendered successfully.");
+            _ => CleanupResources;
+        }
+
+        RewriteMonoHdr: {
+            let total_bytes = total_samples * 2;
+            let riff_size = cast(i32) total_bytes + 36;
+
+            let h = riff_hdr;
+            *h <- 82; *(h + 1) <- 73; *(h + 2) <- 70; *(h + 3) <- 70; // RIFF
+            let p_sz = cast(*i32)(h + 4); *p_sz <- riff_size;
+            *(h + 8) <- 87; *(h + 9) <- 65; *(h + 10) <- 86; *(h + 11) <- 69; // WAVE
+            *(h + 12) <- 102; *(h + 13) <- 109; *(h + 14) <- 116; *(h + 15) <- 32; // fmt
+            let p_sc1 = cast(*i32)(h + 16); *p_sc1 <- 16;
+            let p_fmt = cast(*i16)(h + 20); *p_fmt <- 1; // PCM
+            let p_ch  = cast(*i16)(h + 22); *p_ch  <- 1; // Mono
+            let p_sr  = cast(*i32)(h + 24); *p_sr  <- 44100;
+            let p_br  = cast(*i32)(h + 28); *p_br  <- 88200; // 44100 * 2
+            let p_ba  = cast(*i16)(h + 32); *p_ba  <- 2; // 1ch * 2bytes
+            let p_bps = cast(*i16)(h + 34); *p_bps <- 16;
+            *(h + 36) <- 100; *(h + 37) <- 97; *(h + 38) <- 116; *(h + 39) <- 97; // data
+            let p_ds  = cast(*i32)(h + 40); *p_ds  <- cast(i32) total_bytes;
+
+            let _ = call fwrite(riff_hdr, 1, 44, wav_file);
+            let _ = call fclose(wav_file);
+            let _ = call puts("MIDI mono synthesis complete! WAV rendered successfully.");
+            _ => CleanupResources;
+        }
+
+        CleanupResources: {
+            let _ = call SynthPipeline_Destroy(pipeline);
+            let _ = call free(file_buf);
+            let _ = call free(cast(*u8) cursors);
+            let _ = call free(cast(*u8) voice_slots);
+            let _ = call free(cast(*u8) spatial_params);
+            let _ = call free(cast(*u8) event_out);
+            let _ = call free(cast(*u8) riff_hdr);
+            let _ = call free(cast(*u8) chunk_buf);
+            let _ = call free(cast(*u8) dphi_table);
+            let _ = call free(cast(*u8) midi_hdr);
+
+            _ => return 0;
+        }
+
+        FileOpenError: {
+            let _ = call puts("Error: Failed to open file (input MIDI or output WAV).");
+            _ => return 1;
+        }
+
+        InvalidMidi: {
+            let _ = call puts("Error: Invalid or corrupt Standard MIDI File.");
+            _ => return 1;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// CLI Entry Point
+// ----------------------------------------------------------------------------
+machine main(argc: i32, argv: *u64) -> i32 {
+    flow {
+        reg in_mid:   *u8 = null;
+        reg out_wav:  *u8 = null;
+        reg is_st:    i1  = 1;
+    }
+    states {
+        Entry: {
+            argc < 2 => DefaultArgs;
+            _ => ParseCliArgs;
+        }
+
+        DefaultArgs: {
+            let def_in  = "tmp/midi/vivaldi_winter.mid";
+            let def_out = "winter_stereo.wav";
+            _ => RunPlayer [ in_mid <= def_in, out_wav <= def_out, is_st <= 1 ];
+        }
+
+        ParseCliArgs: {
+            let p1 = cast(*u8) *(argv + 1);
+            argc < 3 => DefaultOutPath [ in_mid <= p1 ];
+            _ => ReadOutPath [ in_mid <= p1 ];
+        }
+
+        DefaultOutPath: {
+            let def_out = "output.wav";
+            _ => CheckMonoFlag [ out_wav <= def_out ];
+        }
+
+        ReadOutPath: {
+            let p2 = cast(*u8) *(argv + 2);
+            _ => CheckMonoFlag [ out_wav <= p2 ];
+        }
+
+        CheckMonoFlag: {
+            argc >= 4 => CheckArg3;
+            _ => RunPlayer [ is_st <= 1 ];
+        }
+
+        CheckArg3: {
+            let p3 = cast(*u8) *(argv + 3);
+            // Check if p3 == "--mono" (starts with '-', '-')
+            let c0 = cast(i32) *p3;
+            let c1 = cast(i32) *(p3 + 1);
+            let c2 = cast(i32) *(p3 + 2);
+            let is_dash = (c0 == 45) && (c1 == 45);
+            let is_m = is_dash && (c2 == 109); // "--m"
+            is_m != 0 => SetMonoMode;
+            _ => RunPlayer [ is_st <= 1 ];
+        }
+
+        SetMonoMode: {
+            let _ = call puts("[Mode] Mono Output Selected");
+            _ => RunPlayer [ is_st <= 0 ];
+        }
+
+        RunPlayer: {
+            let res = call midi_player_run(in_mid, out_wav, is_st);
+            _ => return res;
+        }
+    }
+}

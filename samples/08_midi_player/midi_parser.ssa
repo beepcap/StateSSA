@@ -1,0 +1,563 @@
+// ============================================================================
+// StateSSA 08_midi_player: midi_parser.ssa
+// Multi-Track Standard MIDI File (SMF Format 0 & Format 1) Binary Parser FSM
+// Pure StateSSA, Zero C Middleware, Streaming Track Cursor Architecture
+// ============================================================================
+
+include "midi_types.ssa";
+
+extern "C" {
+    fn malloc(sz: u32) -> *u8;
+    fn free(p: *u8) -> void;
+}
+
+// ----------------------------------------------------------------------------
+// Machine: MidiParse_ReadVLQ
+// Decodes a 7-bit Variable Length Quantity (VLQ) from stream
+// ----------------------------------------------------------------------------
+machine MidiParse_ReadVLQ(p_in: *u8, end_p: *u8, out_val: *u32) -> *u8 {
+    flow {
+        reg cur_p: *u8 = null;
+        reg acc:   u32 = 0;
+    }
+    states {
+        Entry: {
+            _ => Loop [ cur_p <= p_in, acc <= 0 ];
+        }
+
+        Loop: {
+            let p_val = cast(u64) cur_p;
+            let end_val = cast(u64) end_p;
+            p_val >= end_val => Done;
+            _ => ReadByte;
+        }
+
+        ReadByte: {
+            let b = cast(u32) *cur_p;
+            let next_p = cur_p + 1;
+            let payload = b & 127;
+            let next_acc = (acc << 7) | payload;
+            let cont = b & 128;
+            cont != 0 => NextCont [ cur_p <= next_p, acc <= next_acc ];
+            _ => Finish [ cur_p <= next_p, acc <= next_acc ];
+        }
+
+        NextCont: {
+            _ => Loop;
+        }
+
+        Finish: {
+            *out_val <- acc;
+            _ => return cur_p;
+        }
+
+        Done: {
+            *out_val <- acc;
+            _ => return cur_p;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: MidiParse_Header
+// Parses 'MThd' chunk header (14 bytes)
+// ----------------------------------------------------------------------------
+machine MidiParse_Header(file_data: *u8, file_len: u32, out_hdr: *MidiHeader) -> *u8 {
+    flow {
+        reg res_ptr: *u8 = null;
+    }
+    states {
+        Entry: {
+            file_len < 14 => Fail;
+            _ => CheckMagic;
+        }
+
+        CheckMagic: {
+            // 'MThd' = 77, 84, 104, 100
+            let b0 = cast(i32) *file_data;
+            let b1 = cast(i32) *(file_data + 1);
+            let b2 = cast(i32) *(file_data + 2);
+            let b3 = cast(i32) *(file_data + 3);
+
+            let ok0 = b0 == 77;
+            let ok1 = b1 == 84;
+            let ok2 = b2 == 104;
+            let ok3 = b3 == 100;
+            let ok01 = ok0 & ok1;
+            let ok23 = ok2 & ok3;
+            let ok_magic = ok01 & ok23;
+            ok_magic != 0 => ReadFields;
+            _ => Fail;
+        }
+
+        ReadFields: {
+            let f0 = cast(u16) *(file_data + 8);
+            let f1 = cast(u16) *(file_data + 9);
+            let fmt = (f0 << 8) | f1;
+
+            let t0 = cast(u16) *(file_data + 10);
+            let t1 = cast(u16) *(file_data + 11);
+            let ntracks = (t0 << 8) | t1;
+
+            let d0 = cast(u16) *(file_data + 12);
+            let d1 = cast(u16) *(file_data + 13);
+            let div = (d0 << 8) | d1;
+
+            out_hdr.format     <- fmt;
+            out_hdr.num_tracks <- ntracks;
+            out_hdr.division   <- div;
+
+            let first_track = file_data + 14;
+            _ => Success [ res_ptr <= first_track ];
+        }
+
+        Success: {
+            _ => return res_ptr;
+        }
+
+        Fail: {
+            _ => return null;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: MidiParse_InitTracks
+// Scans all 'MTrk' chunks and initializes TrackCursor array
+// ----------------------------------------------------------------------------
+machine MidiParse_InitTracks(first_track: *u8, file_end: *u8, num_tracks: u32, out_cursors: *TrackCursor) -> u32 {
+    flow {
+        reg cur_p:    *u8 = null;
+        reg t_idx:    u32 = 0;
+        reg p_vlq:    *u32 = null;
+        reg cur_cursor: *TrackCursor = null;
+        reg trk_data_start: *u8 = null;
+        reg trk_data_end:   *u8 = null;
+    }
+    states {
+        Entry: {
+            let mem = call malloc(4);
+            _ => Loop [ cur_p <= first_track, t_idx <= 0, p_vlq <= cast(*u32) mem ];
+        }
+
+        Loop: {
+            t_idx >= num_tracks => Cleanup;
+            let p_val = cast(u64) cur_p;
+            let end_val = cast(u64) file_end;
+            p_val >= end_val => Cleanup;
+            _ => CheckMTrk;
+        }
+
+        CheckMTrk: {
+            // 'MTrk' = 77, 84, 114, 107
+            let b0 = cast(i32) *cur_p;
+            let b1 = cast(i32) *(cur_p + 1);
+            let b2 = cast(i32) *(cur_p + 2);
+            let b3 = cast(i32) *(cur_p + 3);
+
+            let ok0 = b0 == 77;
+            let ok1 = b1 == 84;
+            let ok2 = b2 == 114;
+            let ok3 = b3 == 107;
+            let ok01 = ok0 & ok1;
+            let ok23 = ok2 & ok3;
+            let ok = ok01 & ok23;
+            ok != 0 => ReadTrackLen;
+            _ => Cleanup; // Unexpected chunk or truncated file
+        }
+
+        ReadTrackLen: {
+            let l0 = cast(u32) *(cur_p + 4);
+            let l1 = cast(u32) *(cur_p + 5);
+            let l2 = cast(u32) *(cur_p + 6);
+            let l3 = cast(u32) *(cur_p + 7);
+            let t01 = (l0 << 24) | (l1 << 16);
+            let t23 = (l2 << 8) | l3;
+            let trk_len = t01 | t23;
+
+            let data_start = cur_p + 8;
+            let data_end = data_start + trk_len;
+
+            let c_ptr = out_cursors + t_idx;
+
+            _ => DecodeFirstDelta [
+                cur_cursor <= c_ptr,
+                trk_data_start <= data_start,
+                trk_data_end <= data_end
+            ];
+        }
+
+        DecodeFirstDelta: {
+            let next_p = call MidiParse_ReadVLQ(trk_data_start, trk_data_end, p_vlq);
+            let initial_dt = *p_vlq;
+
+            cur_cursor.ptr            <- next_p;
+            cur_cursor.end_ptr        <- trk_data_end;
+            cur_cursor.wait_ticks     <- initial_dt;
+            cur_cursor.running_status <- 0;
+            cur_cursor.is_active      <- 1;
+
+            _ => AdvanceTrack [ cur_p <= trk_data_end, t_idx <= t_idx + 1 ];
+        }
+
+        AdvanceTrack: {
+            _ => Loop;
+        }
+
+        Cleanup: {
+            let _ = call free(cast(*u8) p_vlq);
+            _ => return t_idx;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: MidiParse_ReadTrackEvent
+// Reads next event from cursor, updates cursor state & delta-time
+// ----------------------------------------------------------------------------
+machine MidiParse_ReadTrackEvent(cursor: *TrackCursor, out_event: *MidiEvent) -> u32 {
+    flow {
+        reg p_vlq: *u32 = null;
+        reg cur_p: *u8 = null;
+        reg cur_end: *u8 = null;
+        reg cur_status: u32 = 0;
+        reg p_payload: *u8 = null;
+        reg next_event_p: *u8 = null;
+    }
+    states {
+        Entry: {
+            let act = cursor.is_active;
+            act == 0 => Inactive;
+
+            let p = cursor.ptr;
+            let ep = cursor.end_ptr;
+            let p_val = cast(u64) p;
+            let ep_val = cast(u64) ep;
+            p_val >= ep_val => MarkTrackDone;
+
+            let mem = call malloc(4);
+            _ => DetermineStatus [
+                p_vlq <= cast(*u32) mem,
+                cur_p <= p,
+                cur_end <= ep
+            ];
+        }
+
+        DetermineStatus: {
+            let b = cast(u32) *cur_p;
+            b < 128 => UseRunningStatus;
+            _ => UseNewStatus;
+        }
+
+        UseRunningStatus: {
+            let raw_rs = cursor.running_status;
+            let rs = cast(u32) raw_rs;
+            _ => DispatchStatus [ cur_status <= rs, p_payload <= cur_p ];
+        }
+
+        UseNewStatus: {
+            let st = cast(u32) *cur_p;
+            let p_next = cur_p + 1;
+            st < 240 => UpdateRunningStatus [ cur_status <= st, p_payload <= p_next ];
+            _ => DispatchStatus [ cur_status <= st, p_payload <= p_next ];
+        }
+
+        UpdateRunningStatus: {
+            cursor.running_status <- cast(u8) cur_status;
+            _ => DispatchStatus;
+        }
+
+        DispatchStatus: {
+            // Check status high nibble or special
+            cur_status == 255 => ParseMetaEvent; // 0xFF
+            cur_status == 240 => ParseSysEx;     // 0xF0
+            cur_status == 247 => ParseSysEx;     // 0xF7
+
+            let s_hi = cur_status & 240;
+            s_hi == 144 => ParseNoteOn;          // 0x90
+            s_hi == 128 => ParseNoteOff;         // 0x80
+            s_hi == 192 => ParseOneByteEvent;    // 0xC0 Program Change
+            s_hi == 208 => ParseOneByteEvent;    // 0xD0 Channel Pressure
+            _ => ParseTwoByteEvent;              // 0xA0, 0xB0, 0xE0
+        }
+
+        // --- Note On (0x9n) ---
+        ParseNoteOn: {
+            let ch = cast(u8)(cur_status & 15);
+            let n = *p_payload;
+            let v = *(p_payload + 1);
+            let np = p_payload + 2;
+
+            out_event.channel  <- ch;
+            out_event.note     <- n;
+            out_event.velocity <- v;
+
+            let v_u32 = cast(u32) v;
+            v_u32 > 0 => NoteOnActive [ next_event_p <= np ];
+            _ => NoteOnSilent [ next_event_p <= np ]; // Vel 0 = Note Off
+        }
+
+        NoteOnActive: {
+            out_event.event_type <- 1; // Note-On
+            _ => ReadNextDelta;
+        }
+
+        NoteOnSilent: {
+            out_event.event_type <- 2; // Note-Off
+            _ => ReadNextDelta;
+        }
+
+        // --- Note Off (0x8n) ---
+        ParseNoteOff: {
+            let ch = cast(u8)(cur_status & 15);
+            let n = *p_payload;
+            let v = *(p_payload + 1);
+            let np = p_payload + 2;
+
+            out_event.event_type <- 2; // Note-Off
+            out_event.channel    <- ch;
+            out_event.note       <- n;
+            out_event.velocity   <- v;
+
+            _ => ReadNextDelta [ next_event_p <= np ];
+        }
+
+        // --- 1-Byte Event (0xCn, 0xDn) ---
+        ParseOneByteEvent: {
+            out_event.event_type <- 0; // Other / Ignored
+            let np = p_payload + 1;
+            _ => ReadNextDelta [ next_event_p <= np ];
+        }
+
+        // --- 2-Byte Event (0xAn, 0xBn, 0xEn) ---
+        ParseTwoByteEvent: {
+            out_event.event_type <- 0; // Other / Ignored
+            let np = p_payload + 2;
+            _ => ReadNextDelta [ next_event_p <= np ];
+        }
+
+        // --- SysEx Event (0xF0, 0xF7) ---
+        ParseSysEx: {
+            out_event.event_type <- 0;
+            let p_len = call MidiParse_ReadVLQ(p_payload, cur_end, p_vlq);
+            let len = *p_vlq;
+            let np = p_len + len;
+            _ => ReadNextDelta [ next_event_p <= np ];
+        }
+
+        // --- Meta Event (0xFF) ---
+        ParseMetaEvent: {
+            let m_type = cast(u32) *p_payload;
+            let p_len_in = p_payload + 1;
+            let p_data_in = call MidiParse_ReadVLQ(p_len_in, cur_end, p_vlq);
+            let m_len = *p_vlq;
+            let np = p_data_in + m_len;
+
+            m_type == 81 => MetaTempo [ next_event_p <= np, p_payload <= p_data_in ]; // 0x51
+            m_type == 47 => MetaTrackEnd [ next_event_p <= np ];                      // 0x2F
+            _ => MetaOther [ next_event_p <= np ];
+        }
+
+        MetaTempo: {
+            let b0 = cast(u32) *p_payload;
+            let b1 = cast(u32) *(p_payload + 1);
+            let b2 = cast(u32) *(p_payload + 2);
+            let u01 = (b0 << 16) | (b1 << 8);
+            let uspq = u01 | b2;
+
+            out_event.event_type <- 3; // Set-Tempo
+            out_event.tempo_uspq <- uspq;
+            _ => ReadNextDelta;
+        }
+
+        MetaTrackEnd: {
+            out_event.event_type <- 4; // End-Of-Track
+            cursor.is_active <- 0;
+            cursor.wait_ticks <- 4294967295; // 0xFFFFFFFF
+            let _ = call free(cast(*u8) p_vlq);
+            _ => return 1;
+        }
+
+        MetaOther: {
+            out_event.event_type <- 0; // Other meta
+            _ => ReadNextDelta;
+        }
+
+        // --- Read Next Delta-Time for this track ---
+        ReadNextDelta: {
+            let p_val = cast(u64) next_event_p;
+            let ep_val = cast(u64) cur_end;
+            p_val >= ep_val => TrackFinished;
+            _ => FetchNextDelta;
+        }
+
+        FetchNextDelta: {
+            let p_after = call MidiParse_ReadVLQ(next_event_p, cur_end, p_vlq);
+            let next_dt = *p_vlq;
+            cursor.ptr        <- p_after;
+            cursor.wait_ticks <- next_dt;
+
+            let _ = call free(cast(*u8) p_vlq);
+            _ => return 1;
+        }
+
+        TrackFinished: {
+            cursor.is_active  <- 0;
+            cursor.wait_ticks <- 4294967295;
+            let _ = call free(cast(*u8) p_vlq);
+            _ => return 1;
+        }
+
+        MarkTrackDone: {
+            cursor.is_active  <- 0;
+            cursor.wait_ticks <- 4294967295;
+            _ => return 0;
+        }
+
+        Inactive: {
+            _ => return 0;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: MidiParse_ScanPeakPolyphony
+// Fast dry-run pre-scan of multi-track MIDI timeline to find maximum concurrent voices
+// ----------------------------------------------------------------------------
+machine MidiParse_ScanPeakPolyphony(cursors: *TrackCursor, num_tracks: u32, event_out: *MidiEvent) -> u32 {
+    flow {
+        reg min_wait:      u32 = 4294967295;
+        reg t_scan_idx:    u32 = 0;
+        reg t_disp_idx:    u32 = 0;
+        reg active_voices: u32 = 0;
+        reg peak_voices:   u32 = 0;
+    }
+    states {
+        Entry: {
+            _ => ScanMinWait [ min_wait <= 4294967295, t_scan_idx <= 0, active_voices <= 0, peak_voices <= 0 ];
+        }
+
+        ScanMinWait: {
+            t_scan_idx >= num_tracks => CheckMinWait;
+            _ => CheckTrackWait;
+        }
+
+        CheckTrackWait: {
+            let c = cursors + t_scan_idx;
+            let act = c.is_active;
+            act != 0 => CompareWait;
+            _ => NextScanTrack;
+        }
+
+        CompareWait: {
+            let c = cursors + t_scan_idx;
+            let wt = c.wait_ticks;
+            wt < min_wait => UpdateMinWait [ min_wait <= wt ];
+            _ => NextScanTrack;
+        }
+
+        UpdateMinWait: {
+            _ => NextScanTrack;
+        }
+
+        NextScanTrack: {
+            _ => ScanMinWait [ t_scan_idx <= t_scan_idx + 1 ];
+        }
+
+        CheckMinWait: {
+            min_wait == 4294967295 => FinishScan;
+            min_wait > 0 => SubtractTicks [ t_scan_idx <= 0 ];
+            _ => DispatchEvents [ t_disp_idx <= 0 ];
+        }
+
+        SubtractTicks: {
+            t_scan_idx >= num_tracks => DispatchEvents [ t_disp_idx <= 0 ];
+            _ => SubTrackWait;
+        }
+
+        SubTrackWait: {
+            let c = cursors + t_scan_idx;
+            let act = c.is_active;
+            act != 0 => DoSub;
+            _ => NextSubTrack;
+        }
+
+        DoSub: {
+            let c = cursors + t_scan_idx;
+            let wt = c.wait_ticks;
+            let n_wt = wt - min_wait;
+            c.wait_ticks <- n_wt;
+            _ => NextSubTrack;
+        }
+
+        NextSubTrack: {
+            _ => SubtractTicks [ t_scan_idx <= t_scan_idx + 1 ];
+        }
+
+        DispatchEvents: {
+            t_disp_idx >= num_tracks => AdvanceTimeline;
+            _ => CheckTrackReady;
+        }
+
+        AdvanceTimeline: {
+            _ => ScanMinWait [ min_wait <= 4294967295, t_scan_idx <= 0 ];
+        }
+
+        CheckTrackReady: {
+            let c = cursors + t_disp_idx;
+            let act = c.is_active;
+            let wt  = c.wait_ticks;
+            let is_ready = (act != 0) && (wt == 0);
+            is_ready != 0 => ReadOneEvent;
+            _ => NextDispTrack;
+        }
+
+        ReadOneEvent: {
+            let c = cursors + t_disp_idx;
+            let ok = call MidiParse_ReadTrackEvent(c, event_out);
+            ok == 0 => NextDispTrack;
+            _ => ClassifyEvent;
+        }
+
+        ClassifyEvent: {
+            let et = event_out.event_type;
+            et == 1 => HandleNoteOn;
+            et == 2 => HandleNoteOff;
+            _ => CheckTrackReady; // Other events (tempo, meta, CC)
+        }
+
+        HandleNoteOn: {
+            let v = event_out.velocity;
+            v == 0 => HandleNoteOff;
+            _ => DoNoteOn;
+        }
+
+        DoNoteOn: {
+            let next_act = active_voices + 1;
+            next_act > peak_voices => UpdatePeak [ active_voices <= next_act, peak_voices <= next_act ];
+            _ => CheckTrackReady [ active_voices <= next_act ];
+        }
+
+        UpdatePeak: {
+            _ => CheckTrackReady;
+        }
+
+        HandleNoteOff: {
+            active_voices > 0 => DoNoteOff;
+            _ => CheckTrackReady;
+        }
+
+        DoNoteOff: {
+            let next_act = active_voices - 1;
+            _ => CheckTrackReady [ active_voices <= next_act ];
+        }
+
+        NextDispTrack: {
+            _ => DispatchEvents [ t_disp_idx <= t_disp_idx + 1 ];
+        }
+
+        FinishScan: {
+            _ => return peak_voices;
+        }
+    }
+}

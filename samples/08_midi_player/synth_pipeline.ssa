@@ -1,0 +1,259 @@
+// ============================================================================
+// StateSSA 08_midi_player: synth_pipeline.ssa
+// Independent Dual/Mono Synthesis Pipeline Orchestrator & PCM Interleaver
+// Backed by 07 poly_fm_engine.ssa (SIMD f32x4 + Pyramid Tournament Reduction)
+// ============================================================================
+
+include "midi_types.ssa";
+
+extern "C" {
+    fn malloc(sz: u32) -> *u8;
+    fn free(p: *u8) -> void;
+}
+
+// ----------------------------------------------------------------------------
+// Machine: SynthPipeline_Create
+// ----------------------------------------------------------------------------
+machine SynthPipeline_Create(total_blocks: u32, is_stereo: i1) -> *SynthPipeline {
+    flow {
+        reg pipe_ptr: *SynthPipeline = null;
+    }
+    states {
+        Entry: {
+            let p_mem = call malloc(64);
+            let pipe = cast(*SynthPipeline) p_mem;
+
+            // Scratch buffer size: 2048 samples * 2 bytes = 4096 bytes
+            let p_scratch_l = call malloc(4096);
+            let eng_l = call PolyFM_Create(total_blocks);
+
+            pipe.engine_L     <- eng_l;
+            pipe.is_stereo    <- is_stereo;
+            pipe.total_blocks <- total_blocks;
+            pipe.pcm_L_buf    <- cast(*i16) p_scratch_l;
+
+            is_stereo != 0 => SetupStereoPipe [ pipe_ptr <= pipe ];
+            _ => SetupMonoPipe [ pipe_ptr <= pipe ];
+        }
+
+        SetupStereoPipe: {
+            let tb = pipe_ptr.total_blocks;
+            let eng_r = call PolyFM_Create(tb);
+            let p_scratch_r = call malloc(4096);
+
+            pipe_ptr.engine_R  <- eng_r;
+            pipe_ptr.pcm_R_buf <- cast(*i16) p_scratch_r;
+
+            _ => return pipe_ptr;
+        }
+
+        SetupMonoPipe: {
+            pipe_ptr.engine_R  <- null;
+            pipe_ptr.pcm_R_buf <- null;
+
+            _ => return pipe_ptr;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: SynthPipeline_Destroy
+// ----------------------------------------------------------------------------
+machine SynthPipeline_Destroy(pipe: *SynthPipeline) -> void {
+    flow {}
+    states {
+        Entry: {
+            pipe == null => Return;
+            _ => DoDestroy;
+        }
+
+        DoDestroy: {
+            let el = pipe.engine_L;
+            let _ = call PolyFM_Destroy(el);
+
+            let er = pipe.engine_R;
+            let er_not_null = er != null;
+            er_not_null != 0 => FreeRightEngine;
+            _ => FreeBuffers;
+        }
+
+        FreeRightEngine: {
+            let er = pipe.engine_R;
+            let _ = call PolyFM_Destroy(er);
+            let pr = pipe.pcm_R_buf;
+            let _ = call free(cast(*u8) pr);
+            _ => FreeBuffers;
+        }
+
+        FreeBuffers: {
+            let pl = pipe.pcm_L_buf;
+            let _ = call free(cast(*u8) pl);
+            let _ = call free(cast(*u8) pipe);
+            _ => Return;
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: SynthPipeline_SetVoice
+// Dispatches spatial acoustic parameters to Left (and Right) FM engines
+// ----------------------------------------------------------------------------
+machine SynthPipeline_SetVoice(
+    pipe: *SynthPipeline,
+    voice_idx: u32,
+    params: *SpatialVoiceParams
+) -> void {
+    flow {}
+    states {
+        Entry: {
+            let el = pipe.engine_L;
+            let d_l = params.dphi_L;
+            let cm = params.cm_ratio;
+            let bm = params.base_mod;
+
+            // Configure Left FM Pipeline
+            let _ = call PolyFM_SetVoice(el, voice_idx, d_l, cm, bm, 1);
+
+            let st = pipe.is_stereo;
+            st != 0 => SetRightVoice;
+            _ => Return;
+        }
+
+        SetRightVoice: {
+            let er = pipe.engine_R;
+            let d_r = params.dphi_R;
+            let cm = params.cm_ratio;
+            let bm = params.base_mod;
+
+            // Configure Right FM Pipeline
+            let _ = call PolyFM_SetVoice(er, voice_idx, d_r, cm, bm, 1);
+            _ => Return;
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: SynthPipeline_SilenceVoice
+// ----------------------------------------------------------------------------
+machine SynthPipeline_SilenceVoice(pipe: *SynthPipeline, voice_idx: u32) -> void {
+    flow {}
+    states {
+        Entry: {
+            let el = pipe.engine_L;
+            let _ = call PolyFM_SilenceVoice(el, voice_idx);
+
+            let st = pipe.is_stereo;
+            st != 0 => SilenceRight;
+            _ => Return;
+        }
+
+        SilenceRight: {
+            let er = pipe.engine_R;
+            let _ = call PolyFM_SilenceVoice(er, voice_idx);
+            _ => Return;
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: SynthPipeline_Render
+// Renders num_samples into out_pcm (Mono or Interleaved Stereo)
+// Handles arbitrary sample spans safely via 2048-sample chunking loop
+// ----------------------------------------------------------------------------
+machine SynthPipeline_Render(
+    pipe: *SynthPipeline,
+    out_pcm: *i16,
+    num_samples: u32
+) -> void {
+    flow {
+        reg total_rendered: u32 = 0;
+        reg rem_samples:    u32 = 0;
+        reg cur_chunk:      u32 = 0;
+        reg chunk_i:        u32 = 0;
+    }
+    states {
+        Entry: {
+            num_samples == 0 => Return;
+            let st = pipe.is_stereo;
+            st != 0 => StartStereoChunking [ rem_samples <= num_samples, total_rendered <= 0 ];
+            _ => RenderMono;
+        }
+
+        // --- Mono Mode ---
+        RenderMono: {
+            let el = pipe.engine_L;
+            // Directly render into destination out_pcm buffer
+            let _ = call PolyFM_RenderStep(el, out_pcm, num_samples, 0);
+            _ => Return;
+        }
+
+        // --- Stereo Mode (Chunked Rendering to avoid scratch overflow) ---
+        StartStereoChunking: {
+            rem_samples == 0 => Return;
+            rem_samples > 2048 => ChunkIsMax;
+            _ => ChunkIsRem;
+        }
+
+        ChunkIsMax: {
+            _ => ExecChunkRender [ cur_chunk <= 2048 ];
+        }
+
+        ChunkIsRem: {
+            _ => ExecChunkRender [ cur_chunk <= rem_samples ];
+        }
+
+        ExecChunkRender: {
+            let el = pipe.engine_L;
+            let er = pipe.engine_R;
+            let p_l = pipe.pcm_L_buf;
+            let p_r = pipe.pcm_R_buf;
+
+            // 1. Render Left and Right Pipes for cur_chunk samples
+            let _ = call PolyFM_RenderStep(el, p_l, cur_chunk, 0);
+            let _ = call PolyFM_RenderStep(er, p_r, cur_chunk, 0);
+
+            // 2. Interleave [L0, R0, L1, R1, ...] into destination
+            _ => InterleaveLoop [ chunk_i <= 0 ];
+        }
+
+        InterleaveLoop: {
+            chunk_i >= cur_chunk => AdvanceChunk;
+            _ => InterleaveSample;
+        }
+
+        InterleaveSample: {
+            let p_l = pipe.pcm_L_buf;
+            let p_r = pipe.pcm_R_buf;
+            let s_l = *(p_l + chunk_i);
+            let s_r = *(p_r + chunk_i);
+
+            let cur_out_idx = (total_rendered + chunk_i) * 2;
+            *(out_pcm + cur_out_idx)       <- s_l;
+            *(out_pcm + (cur_out_idx + 1)) <- s_r;
+
+            _ => InterleaveLoop [ chunk_i <= chunk_i + 1 ];
+        }
+
+        AdvanceChunk: {
+            let next_rem = rem_samples - cur_chunk;
+            let next_tot = total_rendered + cur_chunk;
+            _ => StartStereoChunking [ rem_samples <= next_rem, total_rendered <= next_tot ];
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}

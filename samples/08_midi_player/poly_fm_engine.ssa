@@ -1,0 +1,692 @@
+// ============================================================================
+// StateSSA Polyphonic FM Synthesis Engine with Pyramid Tournament Reduction
+// Pure SIMD f32x4 Kernel, Scalable K-Block Voice Arena, In-Place Tree Mixer
+// Exact Zero-Crossing 7th-Order Minimax Polynomial Oscillator + Boundary Window
+// ============================================================================
+
+extern "C" {
+    fn malloc(sz: u32) -> *u8;
+    fn free(p: *u8) -> void;
+    fn memset(s: *u8, c: i32, n: u32) -> *u8;
+}
+
+// ----------------------------------------------------------------------------
+// Type: PolyFMEngine
+// ----------------------------------------------------------------------------
+type PolyFMEngine = {
+    total_blocks: u32,
+    c_half_buf:   *u8,
+    c_c1_buf:     *u8,
+    c_c3_buf:     *u8,
+    c_c5_buf:     *u8,
+    c_c7_buf:     *u8,
+    c_da_buf:     *u8,
+    c_di_buf:     *u8,
+    arena_buf:    *u8,
+    pyr_buf:      *u8
+};
+
+// ----------------------------------------------------------------------------
+// Machine: PolyFM_Create
+// ----------------------------------------------------------------------------
+machine PolyFM_Create(total_blocks: u32) -> *PolyFMEngine {
+    flow {
+        reg num_b: u32 = 1;
+        reg engine_ptr: *PolyFMEngine = null;
+    }
+    states {
+        Entry: {
+            total_blocks > 0 => ValidBlocks [ num_b <= total_blocks ];
+            _ => ValidBlocks [ num_b <= 1 ];
+        }
+
+        ValidBlocks: {
+            // 1. Allocate engine struct: 80 bytes
+            let p_eng = call malloc(80);
+            let eng = cast(*PolyFMEngine) p_eng;
+
+            // 2. Allocate SIMD constant buffers (16 bytes each)
+            let p_half = call malloc(16);
+            let p_c1   = call malloc(16);
+            let p_c3   = call malloc(16);
+            let p_c5   = call malloc(16);
+            let p_c7   = call malloc(16);
+            let p_da   = call malloc(16);
+            let p_di   = call malloc(16);
+
+            // 3. Initialize Minimax & Decay Constants
+            let pf_half = cast(*f32) p_half;
+            *pf_half <- cast(f32) 0.5; *(pf_half + 1) <- cast(f32) 0.5;
+            *(pf_half + 2) <- cast(f32) 0.5; *(pf_half + 3) <- cast(f32) 0.5;
+
+            let pf_c1 = cast(*f32) p_c1;
+            *pf_c1 <- cast(f32) -6.2790035; *(pf_c1 + 1) <- cast(f32) -6.2790035;
+            *(pf_c1 + 2) <- cast(f32) -6.2790035; *(pf_c1 + 3) <- cast(f32) -6.2790035;
+
+            let pf_c3 = cast(*f32) p_c3;
+            *pf_c3 <- cast(f32) 41.104262; *(pf_c3 + 1) <- cast(f32) 41.104262;
+            *(pf_c3 + 2) <- cast(f32) 41.104262; *(pf_c3 + 3) <- cast(f32) 41.104262;
+
+            let pf_c5 = cast(*f32) p_c5;
+            *pf_c5 <- cast(f32) -77.99433; *(pf_c5 + 1) <- cast(f32) -77.99433;
+            *(pf_c5 + 2) <- cast(f32) -77.99433; *(pf_c5 + 3) <- cast(f32) -77.99433;
+
+            let pf_c7 = cast(*f32) p_c7;
+            *pf_c7 <- cast(f32) 56.16535; *(pf_c7 + 1) <- cast(f32) 56.16535;
+            *(pf_c7 + 2) <- cast(f32) 56.16535; *(pf_c7 + 3) <- cast(f32) 56.16535;
+
+            let pf_da = cast(*f32) p_da;
+            *pf_da <- cast(f32) 0.99988; *(pf_da + 1) <- cast(f32) 0.99988;
+            *(pf_da + 2) <- cast(f32) 0.99988; *(pf_da + 3) <- cast(f32) 0.99988;
+
+            let pf_di = cast(*f32) p_di;
+            *pf_di <- cast(f32) 0.99980; *(pf_di + 1) <- cast(f32) 0.99980;
+            *(pf_di + 2) <- cast(f32) 0.99980; *(pf_di + 3) <- cast(f32) 0.99980;
+
+            // 4. Allocate Voice Arena (num_b * 160 bytes)
+            let arena_sz = num_b * 160;
+            let p_arena = call malloc(arena_sz);
+            let _ = call memset(p_arena, 0, arena_sz);
+
+            // 5. Allocate Pyramid Reduction Buffer (num_b * 16 bytes)
+            let pyr_sz = num_b * 16;
+            let p_pyr = call malloc(pyr_sz);
+            let _ = call memset(p_pyr, 0, pyr_sz);
+
+            // 6. Populate engine struct
+            eng.total_blocks <- num_b;
+            eng.c_half_buf   <- p_half;
+            eng.c_c1_buf     <- p_c1;
+            eng.c_c3_buf     <- p_c3;
+            eng.c_c5_buf     <- p_c5;
+            eng.c_c7_buf     <- p_c7;
+            eng.c_da_buf     <- p_da;
+            eng.c_di_buf     <- p_di;
+            eng.arena_buf    <- p_arena;
+            eng.pyr_buf      <- p_pyr;
+
+            _ => Return [ engine_ptr <= eng ];
+        }
+
+        Return: {
+            _ => return engine_ptr;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: PolyFM_Destroy
+// ----------------------------------------------------------------------------
+machine PolyFM_Destroy(engine: *PolyFMEngine) -> void {
+    flow {}
+    states {
+        Entry: {
+            let is_null = engine == null;
+            is_null != 0 => Return;
+            _ => DoFree;
+        }
+
+        DoFree: {
+            let _ = call free(engine.c_half_buf);
+            let _ = call free(engine.c_c1_buf);
+            let _ = call free(engine.c_c3_buf);
+            let _ = call free(engine.c_c5_buf);
+            let _ = call free(engine.c_c7_buf);
+            let _ = call free(engine.c_da_buf);
+            let _ = call free(engine.c_di_buf);
+            let _ = call free(engine.arena_buf);
+            let _ = call free(engine.pyr_buf);
+            let _ = call free(cast(*u8) engine);
+            _ => Return;
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: PolyFM_SetVoice
+// ----------------------------------------------------------------------------
+machine PolyFM_SetVoice(engine: *PolyFMEngine, voice_idx: u32, dphi: f32, cm_ratio: f32, base_mod: f32, is_attack: i1) -> void {
+    flow {}
+    states {
+        Entry: {
+            let b_idx = voice_idx / 4;
+            let tb = engine.total_blocks;
+            b_idx >= tb => Return;
+            _ => Dispatch;
+        }
+
+        Dispatch: {
+            let b_idx = voice_idx / 4;
+            let lane = voice_idx & 3;
+            let b_off = b_idx * 160;
+            let p_b = engine.arena_buf + b_off;
+
+            let p_dc = cast(*f32)(p_b + 48) + lane;
+            let p_dm = cast(*f32)(p_b + 32) + lane;
+            *p_dc <- dphi;
+            let d_m = dphi * cm_ratio;
+            *p_dm <- d_m;
+
+            is_attack != 0 => TriggerAttack;
+            _ => Return;
+        }
+
+        TriggerAttack: {
+            let b_idx = voice_idx / 4;
+            let lane = voice_idx & 3;
+            let b_off = b_idx * 160;
+            let p_b = engine.arena_buf + b_off;
+
+            let p_ea = cast(*f32)(p_b + 64) + lane;
+            let p_ei = cast(*f32)(p_b + 80) + lane;
+            *p_ea <- cast(f32) 1.0;
+            *p_ei <- base_mod;
+            _ => Return;
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: PolyFM_SilenceVoice
+// ----------------------------------------------------------------------------
+machine PolyFM_SilenceVoice(engine: *PolyFMEngine, voice_idx: u32) -> void {
+    flow {}
+    states {
+        Entry: {
+            let b_idx = voice_idx / 4;
+            let tb = engine.total_blocks;
+            b_idx >= tb => Return;
+            _ => Silence;
+        }
+
+        Silence: {
+            let b_idx = voice_idx / 4;
+            let lane = voice_idx & 3;
+            let b_off = b_idx * 160;
+            let p_b = engine.arena_buf + b_off;
+
+            let p_dc = cast(*f32)(p_b + 48) + lane;
+            let p_dm = cast(*f32)(p_b + 32) + lane;
+            let p_ea = cast(*f32)(p_b + 64) + lane;
+            let p_ei = cast(*f32)(p_b + 80) + lane;
+
+            *p_dc <- cast(f32) 0.0;
+            *p_dm <- cast(f32) 0.0;
+            *p_ea <- cast(f32) 0.0;
+            *p_ei <- cast(f32) 0.0;
+            _ => Return;
+        }
+
+        Return: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: PolyFM_RenderStep
+// ----------------------------------------------------------------------------
+machine PolyFM_RenderStep(engine: *PolyFMEngine, out_pcm: *i16, num_samples: u32, apply_window: i1) -> void {
+    flow {
+        reg cur_sample: u32 = 0;
+        reg cur_block: u32 = 0;
+        reg pyr_len: u32 = 0;
+        reg pyr_pair: u32 = 0;
+        reg pyr_num_pairs: u32 = 0;
+
+        reg reg_half: *u8 = null;
+        reg reg_c1: *u8 = null;
+        reg reg_c3: *u8 = null;
+        reg reg_c5: *u8 = null;
+        reg reg_c7: *u8 = null;
+        reg reg_da: *u8 = null;
+        reg reg_di: *u8 = null;
+        reg reg_arena: *u8 = null;
+        reg reg_pyr: *u8 = null;
+        reg reg_blocks: u32 = 0;
+
+        reg r_pm0: f32; reg r_pm1: f32;
+        reg r_pm2: f32; reg r_pm3: f32;
+        reg r_pc0: f32; reg r_pc1: f32;
+        reg r_pc2: f32; reg r_pc3: f32;
+        reg r_mod0: f32; reg r_mod1: f32;
+        reg r_mod2: f32; reg r_mod3: f32;
+        reg r_mix: f32;
+        reg r_pcm_i: i32 = 0;
+    }
+    states {
+        Entry: {
+            let h  = engine.c_half_buf;
+            let c1 = engine.c_c1_buf;
+            let c3 = engine.c_c3_buf;
+            let c5 = engine.c_c5_buf;
+            let c7 = engine.c_c7_buf;
+            let da = engine.c_da_buf;
+            let di = engine.c_di_buf;
+            let ar = engine.arena_buf;
+            let py = engine.pyr_buf;
+            let tb = engine.total_blocks;
+
+            _ => SampleLoop [
+                reg_half <= h,
+                reg_c1 <= c1,
+                reg_c3 <= c3,
+                reg_c5 <= c5,
+                reg_c7 <= c7,
+                reg_da <= da,
+                reg_di <= di,
+                reg_arena <= ar,
+                reg_pyr <= py,
+                reg_blocks <= tb,
+                cur_sample <= 0
+            ];
+        }
+
+        // --------------------------------------------------------------------
+        // Sample Loop
+        // --------------------------------------------------------------------
+        SampleLoop: {
+            cur_sample >= num_samples => RenderStepDone;
+            _ => BlockLoop [ cur_block <= 0 ];
+        }
+
+        // --------------------------------------------------------------------
+        // Block FM Synthesis Loop (0 <= cur_block < reg_blocks)
+        // --------------------------------------------------------------------
+        BlockLoop: {
+            cur_block >= reg_blocks => StartPyramid;
+            _ => RenderSIMDPhaseM;
+        }
+
+        RenderSIMDPhaseM: {
+            let b_off = cur_block * 160;
+            let p_b = reg_arena + b_off;
+            let p_pm = cast(*f32)(p_b + 0);
+            let p_dm = cast(*f32)(p_b + 32);
+
+            let pm0 = *p_pm + *p_dm;
+            let pm1 = *(p_pm + 1) + *(p_dm + 1);
+            let pm2 = *(p_pm + 2) + *(p_dm + 2);
+            let pm3 = *(p_pm + 3) + *(p_dm + 3);
+
+            _ => WrapPM0 [ r_pm0 <= pm0, r_pm1 <= pm1, r_pm2 <= pm2, r_pm3 <= pm3 ];
+        }
+
+        WrapPM0: {
+            r_pm0 >= cast(f32) 1.0 => WrapPM0Sub;
+            _ => WrapPM1;
+        }
+        WrapPM0Sub: {
+            let v = r_pm0 - cast(f32) 1.0;
+            _ => WrapPM1 [ r_pm0 <= v ];
+        }
+
+        WrapPM1: {
+            r_pm1 >= cast(f32) 1.0 => WrapPM1Sub;
+            _ => WrapPM2;
+        }
+        WrapPM1Sub: {
+            let v = r_pm1 - cast(f32) 1.0;
+            _ => WrapPM2 [ r_pm1 <= v ];
+        }
+
+        WrapPM2: {
+            r_pm2 >= cast(f32) 1.0 => WrapPM2Sub;
+            _ => WrapPM3;
+        }
+        WrapPM2Sub: {
+            let v = r_pm2 - cast(f32) 1.0;
+            _ => WrapPM3 [ r_pm2 <= v ];
+        }
+
+        WrapPM3: {
+            r_pm3 >= cast(f32) 1.0 => WrapPM3Sub;
+            _ => StoreWrappedPM;
+        }
+        WrapPM3Sub: {
+            let v = r_pm3 - cast(f32) 1.0;
+            _ => StoreWrappedPM [ r_pm3 <= v ];
+        }
+
+        StoreWrappedPM: {
+            let b_off = cur_block * 160;
+            let p_b = reg_arena + b_off;
+            let p_pm = cast(*f32)(p_b + 0);
+            *p_pm <- r_pm0; *(p_pm + 1) <- r_pm1;
+            *(p_pm + 2) <- r_pm2; *(p_pm + 3) <- r_pm3;
+
+            // Minimax 7th-order Sine for Modulator
+            let v_half = *cast(*f32x4) reg_half;
+            let v_c1 = *cast(*f32x4) reg_c1;
+            let v_c3 = *cast(*f32x4) reg_c3;
+            let v_c5 = *cast(*f32x4) reg_c5;
+            let v_c7 = *cast(*f32x4) reg_c7;
+
+            let v_pm = *cast(*f32x4)(p_b + 0);
+            let v_xm = v_pm - v_half;
+            let v_xm2 = v_xm * v_xm;
+
+            let v_t7m = v_c7 * v_xm2;
+            let v_t57m = v_c5 + v_t7m;
+            let v_t5m = v_t57m * v_xm2;
+            let v_t35m = v_c3 + v_t5m;
+            let v_t3m = v_t35m * v_xm2;
+            let v_t1m = v_c1 + v_t3m;
+            let v_sin_m = v_xm * v_t1m;
+
+            let v_ei = *cast(*f32x4)(p_b + 80);
+            let v_m = v_sin_m * v_ei;
+            *cast(*f32x4)(p_b + 112) <- v_m;
+
+            _ => UpdatePhaseC;
+        }
+
+        UpdatePhaseC: {
+            let b_off = cur_block * 160;
+            let p_b = reg_arena + b_off;
+            let p_pc = cast(*f32)(p_b + 16);
+            let p_dc = cast(*f32)(p_b + 48);
+
+            let pc0 = *p_pc + *p_dc;
+            let pc1 = *(p_pc + 1) + *(p_dc + 1);
+            let pc2 = *(p_pc + 2) + *(p_dc + 2);
+            let pc3 = *(p_pc + 3) + *(p_dc + 3);
+
+            _ => WrapPC0 [ r_pc0 <= pc0, r_pc1 <= pc1, r_pc2 <= pc2, r_pc3 <= pc3 ];
+        }
+
+        WrapPC0: {
+            r_pc0 >= cast(f32) 1.0 => WrapPC0Sub;
+            _ => WrapPC1;
+        }
+        WrapPC0Sub: {
+            let v = r_pc0 - cast(f32) 1.0;
+            _ => WrapPC1 [ r_pc0 <= v ];
+        }
+
+        WrapPC1: {
+            r_pc1 >= cast(f32) 1.0 => WrapPC1Sub;
+            _ => WrapPC2;
+        }
+        WrapPC1Sub: {
+            let v = r_pc1 - cast(f32) 1.0;
+            _ => WrapPC2 [ r_pc1 <= v ];
+        }
+
+        WrapPC2: {
+            r_pc2 >= cast(f32) 1.0 => WrapPC2Sub;
+            _ => WrapPC3;
+        }
+        WrapPC2Sub: {
+            let v = r_pc2 - cast(f32) 1.0;
+            _ => WrapPC3 [ r_pc2 <= v ];
+        }
+
+        WrapPC3: {
+            r_pc3 >= cast(f32) 1.0 => WrapPC3Sub;
+            _ => StoreWrappedPC;
+        }
+        WrapPC3Sub: {
+            let v = r_pc3 - cast(f32) 1.0;
+            _ => StoreWrappedPC [ r_pc3 <= v ];
+        }
+
+        StoreWrappedPC: {
+            let b_off = cur_block * 160;
+            let p_b = reg_arena + b_off;
+            let p_pc = cast(*f32)(p_b + 16);
+            *p_pc <- r_pc0; *(p_pc + 1) <- r_pc1;
+            *(p_pc + 2) <- r_pc2; *(p_pc + 3) <- r_pc3;
+
+            let p_sm = cast(*f32)(p_b + 112);
+            let m_scale = cast(f32) 0.15;
+            let sm0 = *p_sm;
+            let sm1 = *(p_sm + 1);
+            let sm2 = *(p_sm + 2);
+            let sm3 = *(p_sm + 3);
+
+            let m0 = sm0 * m_scale;
+            let m1 = sm1 * m_scale;
+            let m2 = sm2 * m_scale;
+            let m3 = sm3 * m_scale;
+
+            let raw_mod0 = r_pc0 + m0;
+            let raw_mod1 = r_pc1 + m1;
+            let raw_mod2 = r_pc2 + m2;
+            let raw_mod3 = r_pc3 + m3;
+
+            _ => WrapPMod0 [ r_mod0 <= raw_mod0, r_mod1 <= raw_mod1, r_mod2 <= raw_mod2, r_mod3 <= raw_mod3 ];
+        }
+
+        WrapPMod0: {
+            r_mod0 >= cast(f32) 1.0 => WrapPMod0Sub;
+            r_mod0 < cast(f32) 0.0  => WrapPMod0Add;
+            _ => WrapPMod1;
+        }
+        WrapPMod0Sub: {
+            let v = r_mod0 - cast(f32) 1.0;
+            _ => WrapPMod1 [ r_mod0 <= v ];
+        }
+        WrapPMod0Add: {
+            let v = r_mod0 + cast(f32) 1.0;
+            _ => WrapPMod1 [ r_mod0 <= v ];
+        }
+
+        WrapPMod1: {
+            r_mod1 >= cast(f32) 1.0 => WrapPMod1Sub;
+            r_mod1 < cast(f32) 0.0  => WrapPMod1Add;
+            _ => WrapPMod2;
+        }
+        WrapPMod1Sub: {
+            let v = r_mod1 - cast(f32) 1.0;
+            _ => WrapPMod2 [ r_mod1 <= v ];
+        }
+        WrapPMod1Add: {
+            let v = r_mod1 + cast(f32) 1.0;
+            _ => WrapPMod2 [ r_mod1 <= v ];
+        }
+
+        WrapPMod2: {
+            r_mod2 >= cast(f32) 1.0 => WrapPMod2Sub;
+            r_mod2 < cast(f32) 0.0  => WrapPMod2Add;
+            _ => WrapPMod3;
+        }
+        WrapPMod2Sub: {
+            let v = r_mod2 - cast(f32) 1.0;
+            _ => WrapPMod3 [ r_mod2 <= v ];
+        }
+        WrapPMod2Add: {
+            let v = r_mod2 + cast(f32) 1.0;
+            _ => WrapPMod3 [ r_mod2 <= v ];
+        }
+
+        WrapPMod3: {
+            r_mod3 >= cast(f32) 1.0 => WrapPMod3Sub;
+            r_mod3 < cast(f32) 0.0  => WrapPMod3Add;
+            _ => StoreWrappedPMod;
+        }
+        WrapPMod3Sub: {
+            let v = r_mod3 - cast(f32) 1.0;
+            _ => StoreWrappedPMod [ r_mod3 <= v ];
+        }
+        WrapPMod3Add: {
+            let v = r_mod3 + cast(f32) 1.0;
+            _ => StoreWrappedPMod [ r_mod3 <= v ];
+        }
+
+        StoreWrappedPMod: {
+            let b_off = cur_block * 160;
+            let p_b = reg_arena + b_off;
+            let p_pmod = cast(*f32)(p_b + 96);
+            *p_pmod <- r_mod0; *(p_pmod + 1) <- r_mod1;
+            *(p_pmod + 2) <- r_mod2; *(p_pmod + 3) <- r_mod3;
+
+            // Minimax 7th-order Sine for Carrier
+            let v_half = *cast(*f32x4) reg_half;
+            let v_c1 = *cast(*f32x4) reg_c1;
+            let v_c3 = *cast(*f32x4) reg_c3;
+            let v_c5 = *cast(*f32x4) reg_c5;
+            let v_c7 = *cast(*f32x4) reg_c7;
+
+            let v_pmod = *cast(*f32x4)(p_b + 96);
+            let v_xc = v_pmod - v_half;
+            let v_xc2 = v_xc * v_xc;
+
+            let v_t7c = v_c7 * v_xc2;
+            let v_t57c = v_c5 + v_t7c;
+            let v_t5c = v_t57c * v_xc2;
+            let v_t35c = v_c3 + v_t5c;
+            let v_t3c = v_t35c * v_xc2;
+            let v_t1c = v_c1 + v_t3c;
+            let v_sin_c = v_xc * v_t1c;
+
+            let v_ea = *cast(*f32x4)(p_b + 64);
+            let v_car = v_sin_c * v_ea;
+            *cast(*f32x4)(p_b + 128) <- v_car;
+
+            // Store directly to Pyramid Buffer slot for this block
+            let p_pyr_elem = cast(*f32x4) reg_pyr + cur_block;
+            *p_pyr_elem <- v_car;
+
+            // Exponential Envelope Decay (SIMD)
+            let v_da = *cast(*f32x4) reg_da;
+            let v_di = *cast(*f32x4) reg_di;
+            let v_ea_next = v_ea * v_da;
+            let v_ei = *cast(*f32x4)(p_b + 80);
+            let v_ei_next = v_ei * v_di;
+            *cast(*f32x4)(p_b + 64) <- v_ea_next;
+            *cast(*f32x4)(p_b + 80) <- v_ei_next;
+
+            _ => NextBlock;
+        }
+
+        NextBlock: {
+            _ => BlockLoop [ cur_block <= cur_block + 1 ];
+        }
+
+        // --------------------------------------------------------------------
+        // Pyramid Tournament Reduction (f32x4 In-Place Tree Reduction)
+        // --------------------------------------------------------------------
+        StartPyramid: {
+            _ => PyramidCheckLevel [ pyr_len <= reg_blocks ];
+        }
+
+        PyramidCheckLevel: {
+            pyr_len <= 1 => HorizontalCollapse;
+            _ => PyramidStartLevel;
+        }
+
+        PyramidStartLevel: {
+            let num_pairs = pyr_len / 2;
+            _ => PyramidPairLoop [ pyr_pair <= 0, pyr_num_pairs <= num_pairs ];
+        }
+
+        PyramidPairLoop: {
+            pyr_pair >= pyr_num_pairs => PyramidCheckOdd;
+            _ => PyramidAddPair;
+        }
+
+        PyramidAddPair: {
+            let idx_a = pyr_pair * 2;
+            let idx_b = idx_a + 1;
+            let p_pyr = cast(*f32x4) reg_pyr;
+            let va = *(p_pyr + idx_a);
+            let vb = *(p_pyr + idx_b);
+            let vsum = va + vb;
+            *(p_pyr + pyr_pair) <- vsum;
+            _ => PyramidPairLoop [ pyr_pair <= pyr_pair + 1 ];
+        }
+
+        PyramidCheckOdd: {
+            let is_odd = pyr_len & 1;
+            is_odd != 0 => PyramidCopyOdd;
+            _ => PyramidCheckLevel [ pyr_len <= pyr_num_pairs ];
+        }
+
+        PyramidCopyOdd: {
+            let last_idx = pyr_len - 1;
+            let p_pyr = cast(*f32x4) reg_pyr;
+            let v_odd = *(p_pyr + last_idx);
+            *(p_pyr + pyr_num_pairs) <- v_odd;
+            let next_len = pyr_num_pairs + 1;
+            _ => PyramidCheckLevel [ pyr_len <= next_len ];
+        }
+
+        // --------------------------------------------------------------------
+        // Horizontal Collapse & PCM Clamp
+        // --------------------------------------------------------------------
+        HorizontalCollapse: {
+            let p_root = cast(*f32) reg_pyr;
+            let s0 = *p_root;
+            let s1 = *(p_root + 1);
+            let s2 = *(p_root + 2);
+            let s3 = *(p_root + 3);
+            let mix01 = s0 + s1;
+            let mix23 = s2 + s3;
+            let raw_mix = mix01 + mix23;
+
+            apply_window != 0 => WindowCheck [ r_mix <= raw_mix ];
+            _ => ScaleAndClampPCM [ r_mix <= raw_mix ];
+        }
+
+        WindowCheck: {
+            cur_sample < 30 => WindowAttack;
+            let decay_start = num_samples - 30;
+            cur_sample >= decay_start => WindowDecay;
+            _ => ScaleAndClampPCM;
+        }
+
+        WindowAttack: {
+            let ramp = cast(f32) cur_sample / cast(f32) 30.0;
+            let w_mix = r_mix * ramp;
+            _ => ScaleAndClampPCM [ r_mix <= w_mix ];
+        }
+
+        WindowDecay: {
+            let rem = num_samples - cur_sample;
+            let ramp = cast(f32) rem / cast(f32) 30.0;
+            let w_mix = r_mix * ramp;
+            _ => ScaleAndClampPCM [ r_mix <= w_mix ];
+        }
+
+        ScaleAndClampPCM: {
+            let pcm_f = r_mix * cast(f32) 5000.0;
+            let pcm_i = cast(i32) pcm_f;
+
+            pcm_i > 32767 => StoreClampHigh;
+            pcm_i < -32768 => StoreClampLow;
+            _ => StoreNormalPCM [ r_pcm_i <= pcm_i ];
+        }
+
+        StoreClampHigh: {
+            *(out_pcm + cur_sample) <- cast(i16) 32767;
+            _ => SampleAdvance;
+        }
+
+        StoreClampLow: {
+            *(out_pcm + cur_sample) <- cast(i16) -32767;
+            _ => SampleAdvance;
+        }
+
+        StoreNormalPCM: {
+            *(out_pcm + cur_sample) <- cast(i16) r_pcm_i;
+            _ => SampleAdvance;
+        }
+
+        SampleAdvance: {
+            _ => SampleLoop [ cur_sample <= cur_sample + 1 ];
+        }
+
+        RenderStepDone: {
+            _ => return;
+        }
+    }
+}

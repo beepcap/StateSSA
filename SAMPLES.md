@@ -18,12 +18,13 @@ StateSSA に同梱されているサンプルプログラムは、すべて C �
    - [05. io_uring Web Server (`samples/05_web_server/`)](#05-io_uring-web-server-samples05_web_server)
    - [06. Fixed-Point Math (`samples/06_fixed_math/`)](#06-fixed-point-math-samples06_fixed_math)
    - [07. SIMD Vivaldi Winter (`samples/07_simd_vivaldi_winter/`)](#07-simd-vivaldi-winter-samples07_simd_vivaldi_winter)
+   - [08. FM MIDI Player (`samples/08_midi_player/`)](#08-fm-midi-player-samples08_midi_player)
 
 ---
 
 ## 1. 全サンプルの一括ビルドと自動検証 (`make test`)
 
-リポジトリルートで以下のコマンドを実行すると、全 7 サンプルのコンパイルと自己検証テストが一括で実行されます：
+リポジトリルートで以下のコマンドを実行すると、全 8 サンプルのコンパイルと自己検証テストが一括で実行されます：
 
 ```sh
 make test
@@ -34,26 +35,26 @@ make test
 ============================================================
 Running All StateSSA Sample Verifications
 ============================================================
---- [Test 1/7] 01_hello_world ---
+--- [Test 1/8] 01_hello_world ---
 Hello, StateSSA World!
 
---- [Test 2/7] 02_simple_loop ---
+--- [Test 2/8] 02_simple_loop ---
 simple_loop(10) = 45: SUCCESS!
 
---- [Test 3/7] 03_parallel_sum ---
+--- [Test 3/8] 03_parallel_sum ---
 ParallelSum([1..8]) = 36: SUCCESS!
 
---- [Test 4/7] 04_xz ---
+--- [Test 4/8] 04_xz ---
 XZ Clone (Compress -> Decompress Roundtrip): 100% SUCCESS!
 
---- [Test 5/7] 05_web_server (Self-Test) ---
+--- [Test 5/8] 05_web_server (Self-Test) ---
 StateSSA io_uring Web Server listening on 0.0.0.0:18080...
 GET / -> 200 OK & Hello verified!
 GET /baseline11 -> 200 OK & Sum 100 verified!
 POST /echo -> 200 OK & Echo verified!
 web_server verification passed.
 
---- [Test 6/7] 06_fixed_math ---
+--- [Test 6/8] 06_fixed_math ---
 === StateSSA Sample 06: Deterministic Math (q64) ===
 a + b (expected 3.500000): 3.500000
 b - a (expected 0.500000): 0.500000
@@ -64,11 +65,22 @@ sin(0.0) (expected 0.000000): 0.000000
 cos(0.0) (expected 1.000000): 1.000000
 sqrt(4.0) (expected 2.000000): 2.000000
 
---- [Test 7/7] 07_simd_vivaldi_winter ---
+--- [Test 7/8] 07_simd_vivaldi_winter ---
 StateSSA SIMD 4-Voice FM Synthesizer: Vivaldi Winter RV297
 Rendering 704 measures/steps (~71.4s) using f32x4 SIMD...
 Vivaldi Winter rendered successfully to WAV file.
 WAV audio output generated successfully!
+
+--- [Test 8/8] 08_midi_player ---
+StateSSA Multi-Track MIDI Synthesizer Player
+Starting multi-track timeline synthesis...
+MIDI stereo synthesis complete! WAV rendered successfully.
+08_midi_player Stereo WAV generated successfully!
+[Mode] Mono Output Selected
+StateSSA Multi-Track MIDI Synthesizer Player
+Starting multi-track timeline synthesis...
+MIDI mono synthesis complete! WAV rendered successfully.
+08_midi_player Mono WAV generated successfully!
 
 ============================================================
 >>> ALL SAMPLES PASSED 100% ON STAGE-3 BINARY COMPILER! <<<
@@ -88,6 +100,7 @@ WAV audio output generated successfully!
 | **05** | **io_uring Web Server** | `samples/05_web_server/` | Linux `io_uring` 非同期システムコール直結、Zero-copy HTTP Web サーバー |
 | **06** | **Fixed-Point Math** | `samples/06_fixed_math/` | `q64` (Q32.32) 固定小数点実数計算、C 数学ライブラリ（`libm`）境界自動変換 |
 | **07** | **SIMD Vivaldi Winter** | `samples/07_simd_vivaldi_winter/` | `f32x4` SIMD 演算、4ボイス FM 弦楽合奏音響合成、44.1kHz 16bit WAV 出力 |
+| **08** | **FM MIDI Player** | `samples/08_midi_player/` | SMF Format 0/1 並行パース、事前スキャン動的ポリフォニー、純粋FM合成、リアルタイムUNIXパイプ再生 |
 
 ---
 
@@ -211,3 +224,43 @@ make 07_simd_vivaldi_winter
 ./build/07/simd_vivaldi_winter vivaldi_winter.wav
 ```
 生成された `vivaldi_winter.wav` は、標準的なメディアプレイヤー（`aplay`, `vlc`, `ffplay` 等）で再生可能です。
+
+---
+
+### 08. FM MIDI Player (`samples/08_midi_player/`)
+スタンダード MIDI ファイル（SMF Format 0 および Format 1）を直接パースし、80年代〜90年代の黄金期を彷彿とさせる純粋な FM 音響合成によってリアルタイム再生・WAV 書き出しを行うフルスペック・シンセサイザープレイヤーです。
+外部の波形テーブルや SoundFont、C 言語中間ライブラリを一切使わず、**100% 純粋な StateSSA（`.ssa`）** のみで実装されています。
+
+#### 主なアーキテクチャと特徴
+1. **ストリーミング型 Multi-Track FSM パーサー (`midi_parser.ssa`)**:
+   - 7-bit 可変長数値（VLQ）、デルタタイム、ランニングステータス、テンポ変更（Set-Tempo）、トラック末尾イベントを有限状態機械で逐次デコード。
+2. **高速事前スキャンと決定論的無制限ポリフォニー**:
+   - ファイルロード直後にオーディオ合成なしの高速ドライラン（事前解析）を実行し、曲全体の最大同時発音数 $N_{peak}$ を数ミリ秒で確定。
+   - 演奏ループ中の動的再確保（`realloc`）を完全排除し、必要な SIMD アリーナ（$K = \lceil N_{peak}/4 \rceil$ ブロック）を 1 回だけジャストサイズ確保。小編成（8ボイス）から大編成オーケストラ（44ボイス以上）までボイス落ち 0 で決定論的に再生。
+3. **3D 空間音響ステージ (`spatial_stage.ssa`)**:
+   - トラック・チャンネルごとの幾何学的空間配置に基づき、左右の到達時間差・距離減衰・空気による高域吸収（変調指数の距離減衰）をリアルタイム計算。
+4. **デュアル FM 合成パイプライン (`synth_pipeline.ssa`, `poly_fm_engine.ssa`)**:
+   - 左右独立のステレオパイプライン。7次 Minimax 多項式による正確な正弦波発振と、In-Place ツリー縮約（ピラミッドトーナメント加算）による低ジッターなベクトルミキシング。
+5. **8KB 逐次ストリーミングと UNIX パイプライン即時再生**:
+   - 16MB などの巨大バッファを廃止し、8KB（2048 サンプル）の安全な作業チャンクで逐次出力。
+   - 長大な大曲（10分〜1時間以上）でもメモリ数十 KB のまま完走可能。
+   - 標準出力モード（`"-"`）により、UNIX パイプを通じてサウンドデバイスへ即時ストリーミング再生。
+
+#### ビルドと実行
+
+```sh
+# 1. ビルド
+make 08_midi_player
+
+# 2. リアルタイム・ストリーミング再生 (UNIX パイプライン)
+./build/08/midi_player your_song.mid - | aplay -f cd
+
+# 3. ステレオ WAV ファイルへの高速レンダリング
+./build/08/midi_player your_song.mid output_stereo.wav
+
+# 4. モノラル WAV ファイルへのレンダリング (--mono)
+./build/08/midi_player your_song.mid output_mono.wav --mono
+```
+
+> [!NOTE]
+> 生成されるバイナリは strip 適用時で **わずか 23KB**。外部ライブラリ（`libc`, `libm` 以外）への依存は一切ありません。

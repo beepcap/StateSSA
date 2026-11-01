@@ -124,9 +124,9 @@ SSAC ?= $(CURDIR)/bin/ssac
 CLANG ?= clang
 PYTHON ?= python3
 
-.PHONY: all test clean 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math 07_simd_vivaldi_winter
+.PHONY: all test clean 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math 07_simd_vivaldi_winter 08_midi_player
 
-all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math 07_simd_vivaldi_winter
+all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math 07_simd_vivaldi_winter 08_midi_player
 	@echo "All samples built successfully."
 
 01_hello_world:
@@ -164,24 +164,29 @@ all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_
 	$(SSAC) samples/07_simd_vivaldi_winter/simd_vivaldi_winter.ssa -o build/07/simd_vivaldi_winter.o
 	$(CLANG) -no-pie build/07/simd_vivaldi_winter.o -lm -o build/07/simd_vivaldi_winter
 
+08_midi_player:
+	@mkdir -p build/08
+	$(SSAC) samples/08_midi_player/midi_player.ssa -o build/08/midi_player.ll
+	$(CLANG) -O3 build/08/midi_player.ll -lm -o build/08/midi_player
+
 test: all
 	@echo ""
 	@echo "============================================================"
 	@echo "Running All StateSSA Sample Verifications"
 	@echo "============================================================"
-	@echo "--- [Test 1/7] 01_hello_world ---"
+	@echo "--- [Test 1/8] 01_hello_world ---"
 	@./build/01/hello
 	@echo ""
-	@echo "--- [Test 2/7] 02_simple_loop ---"
+	@echo "--- [Test 2/8] 02_simple_loop ---"
 	@./build/02/simple_loop
 	@echo ""
-	@echo "--- [Test 3/7] 03_parallel_sum ---"
+	@echo "--- [Test 3/8] 03_parallel_sum ---"
 	@./build/03/parallel_sum
 	@echo ""
-	@echo "--- [Test 4/7] 04_xz ---"
+	@echo "--- [Test 4/8] 04_xz ---"
 	@./build/04/xz_sample
 	@echo ""
-	@echo "--- [Test 5/7] 05_web_server (Self-Test) ---"
+	@echo "--- [Test 5/8] 05_web_server (Self-Test) ---"
 	@./build/05/web_server & \
 	PID=$$!; \
 	sleep 0.3; \
@@ -192,12 +197,18 @@ test: all
 	wait $$PID 2>/dev/null || true; \
 	echo "web_server verification passed."
 	@echo ""
-	@echo "--- [Test 6/7] 06_fixed_math ---"
+	@echo "--- [Test 6/8] 06_fixed_math ---"
 	@./build/06/fixed_math
 	@echo ""
-	@echo "--- [Test 7/7] 07_simd_vivaldi_winter ---"
+	@echo "--- [Test 7/8] 07_simd_vivaldi_winter ---"
 	@./build/07/simd_vivaldi_winter build/07/vivaldi_winter.wav
 	@test -s build/07/vivaldi_winter.wav && echo "WAV audio output generated successfully!"
+	@echo ""
+	@echo "--- [Test 8/8] 08_midi_player ---"
+	@./build/08/midi_player samples/08_midi_player/test_c_major.mid build/08/test_stereo.wav
+	@test -s build/08/test_stereo.wav && echo "08_midi_player Stereo WAV generated successfully!"
+	@./build/08/midi_player samples/08_midi_player/test_c_major.mid build/08/test_mono.wav --mono
+	@test -s build/08/test_mono.wav && echo "08_midi_player Mono WAV generated successfully!"
 	@echo ""
 	@echo "============================================================"
 	@echo ">>> ALL SAMPLES PASSED 100% ON STAGE-3 BINARY COMPILER! <<<"

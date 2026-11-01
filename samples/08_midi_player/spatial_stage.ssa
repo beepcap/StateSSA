@@ -1,0 +1,230 @@
+// ============================================================================
+// StateSSA 08_midi_player: spatial_stage.ssa
+// 2D Acoustic Stage Design & Physical Parameter Mapping
+// Orchestral Stage Seating, Constant-Power Panning, Spatial Detune, Air Damping
+// ============================================================================
+
+include "midi_types.ssa";
+
+extern "C" {
+    fn malloc(sz: u32) -> *u8;
+    fn free(p: *u8) -> void;
+}
+
+// ----------------------------------------------------------------------------
+// Machine: SpatialStage_DecodeDphiTable
+// Decodes 128 MIDI note frequency phase increments (44.1kHz standard)
+// ----------------------------------------------------------------------------
+machine SpatialStage_DecodeDphiTable(hex_str: *u8, out_table: *f32) -> void {
+    flow {
+        reg hex_idx:  i32 = 0;
+        reg byte_idx: i32 = 0;
+        reg dec_c0:   i32 = 0;
+        reg dec_c1:   i32 = 0;
+        reg dec_v0:   i32 = 0;
+        reg dec_v1:   i32 = 0;
+    }
+    states {
+        Entry: {
+            _ => Loop [ hex_idx <= 0, byte_idx <= 0 ];
+        }
+
+        Loop: {
+            byte_idx >= 512 => Done;
+            _ => GetC0;
+        }
+
+        GetC0: {
+            let h_ptr = hex_str + hex_idx;
+            let c0 = cast(i32) *h_ptr;
+            let c1 = cast(i32) *(h_ptr + 1);
+            c0 <= 57 => C0Num [ dec_c0 <= c0, dec_c1 <= c1 ];
+            _        => C0Alpha [ dec_c0 <= c0, dec_c1 <= c1 ];
+        }
+
+        C0Num: {
+            let v0 = dec_c0 - 48;
+            dec_c1 <= 57 => C1Num [ dec_v0 <= v0 ];
+            _            => C1Alpha [ dec_v0 <= v0 ];
+        }
+
+        C0Alpha: {
+            let v0 = dec_c0 - 55;
+            dec_c1 <= 57 => C1Num [ dec_v0 <= v0 ];
+            _            => C1Alpha [ dec_v0 <= v0 ];
+        }
+
+        C1Num: {
+            let v1 = dec_c1 - 48;
+            _ => WriteByte [ dec_v1 <= v1 ];
+        }
+
+        C1Alpha: {
+            let v1 = dec_c1 - 55;
+            _ => WriteByte [ dec_v1 <= v1 ];
+        }
+
+        WriteByte: {
+            let b_hi = dec_v0 << 4;
+            let byte_val = b_hi | dec_v1;
+            let p_dest = cast(*u8) out_table + byte_idx;
+            *p_dest <- cast(u8) byte_val;
+            _ => Loop [ hex_idx <= hex_idx + 2, byte_idx <= byte_idx + 1 ];
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Machine: SpatialStage_ComputeParams
+// Computes 3D acoustic parameters for a given note on a given track
+// ----------------------------------------------------------------------------
+machine SpatialStage_ComputeParams(
+    track_id: u32,
+    note: u32,
+    vel: u32,
+    is_stereo: i1,
+    dphi_table: *f32,
+    out_params: *SpatialVoiceParams
+) -> void {
+    flow {
+        reg base_dphi: f32;
+        reg stage_x:   f32;
+        reg stage_y:   f32;
+        reg g_l:       f32;
+        reg g_r:       f32;
+        reg v_scale:   f32;
+    }
+    states {
+        Entry: {
+            let n_clamped = note & 127;
+            let d_val = *(dphi_table + n_clamped);
+            let vf = cast(f32) vel / cast(f32) 127.0;
+
+            _ => CalcStageCoords [
+                base_dphi <= d_val,
+                v_scale <= vf
+            ];
+        }
+
+        // --------------------------------------------------------------------
+        // Stage Coordinates (X: Pan, Y: Depth) based on Track ID
+        // --------------------------------------------------------------------
+        CalcStageCoords: {
+            // Track 0 (Solo/Conductor): Front-Left-Center (X = -0.25, Y = 0.15)
+            track_id == 0 => PosSolo;
+            track_id == 1 => PosTrk1;
+            track_id == 2 => PosTrk2;
+            track_id == 3 => PosTrk3;
+            track_id == 4 => PosTrk4;
+            track_id == 5 => PosTrk5;
+            track_id == 6 => PosTrk6;
+            _ => PosGeneral;
+        }
+
+        PosSolo: {
+            _ => CalcPanning [ stage_x <= cast(f32) -0.25, stage_y <= cast(f32) 0.15 ];
+        }
+        PosTrk1: {
+            _ => CalcPanning [ stage_x <= cast(f32) -0.65, stage_y <= cast(f32) 0.35 ];
+        }
+        PosTrk2: {
+            _ => CalcPanning [ stage_x <= cast(f32) 0.65,  stage_y <= cast(f32) 0.35 ];
+        }
+        PosTrk3: {
+            _ => CalcPanning [ stage_x <= cast(f32) -0.40, stage_y <= cast(f32) 0.50 ];
+        }
+        PosTrk4: {
+            _ => CalcPanning [ stage_x <= cast(f32) 0.40,  stage_y <= cast(f32) 0.50 ];
+        }
+        PosTrk5: {
+            _ => CalcPanning [ stage_x <= cast(f32) 0.75,  stage_y <= cast(f32) 0.65 ];
+        }
+        PosTrk6: {
+            _ => CalcPanning [ stage_x <= cast(f32) 0.10,  stage_y <= cast(f32) 0.45 ];
+        }
+        PosGeneral: {
+            // Alternating Left / Right for higher track numbers
+            let is_even = (track_id & 1) == 0;
+            is_even != 0 => PosEven;
+            _ => PosOdd;
+        }
+        PosEven: {
+            _ => CalcPanning [ stage_x <= cast(f32) -0.50, stage_y <= cast(f32) 0.55 ];
+        }
+        PosOdd: {
+            _ => CalcPanning [ stage_x <= cast(f32) 0.50,  stage_y <= cast(f32) 0.55 ];
+        }
+
+        // --------------------------------------------------------------------
+        // Panning Gains (L / R)
+        // --------------------------------------------------------------------
+        CalcPanning: {
+            let half = cast(f32) 0.5;
+            let pan_l = half - (half * stage_x);
+            let pan_r = half + (half * stage_x);
+
+            let gain_l = pan_l * v_scale;
+            let gain_r = pan_r * v_scale;
+
+            _ => CalcDetuneAndAir [ g_l <= gain_l, g_r <= gain_r ];
+        }
+
+        // --------------------------------------------------------------------
+        // Spatial Detune & Air Absorption
+        // --------------------------------------------------------------------
+        CalcDetuneAndAir: {
+            // Distance HF Air Damping: mod_index decreases with depth Y
+            // base_mod = 1.5 * (1.0 - 0.3 * Y)
+            let one = cast(f32) 1.0;
+            let damp = one - (cast(f32) 0.3 * stage_y);
+            let base_mod = cast(f32) 1.5 * damp;
+
+            is_stereo != 0 => StereoDetune [ base_dphi <= base_dphi ];
+            _ => MonoNoDetune [ base_dphi <= base_dphi ];
+        }
+
+        StereoDetune: {
+            // Binaural Spatial Detune: L is -3.5 cents, R is +3.5 cents
+            let d_flat  = cast(f32) 0.99798;
+            let d_sharp = cast(f32) 1.00202;
+
+            let dphi_l = base_dphi * d_flat;
+            let dphi_r = base_dphi * d_sharp;
+
+            let cm = cast(f32) 1.0;
+            let damp = cast(f32) 1.0 - (cast(f32) 0.3 * stage_y);
+            let bmod = cast(f32) 1.5 * damp;
+
+            out_params.dphi_L    <- dphi_l;
+            out_params.dphi_R    <- dphi_r;
+            out_params.cm_ratio  <- cm;
+            out_params.base_mod  <- bmod;
+            out_params.gain_L    <- g_l;
+            out_params.gain_R    <- g_r;
+            out_params.gain_mono <- v_scale;
+
+            _ => return;
+        }
+
+        MonoNoDetune: {
+            // Mono Mode: Exactly fundamental frequency on both, folded gain
+            out_params.dphi_L    <- base_dphi;
+            out_params.dphi_R    <- base_dphi;
+            out_params.cm_ratio  <- cast(f32) 1.0;
+
+            let damp = cast(f32) 1.0 - (cast(f32) 0.3 * stage_y);
+            let bmod = cast(f32) 1.5 * damp;
+            out_params.base_mod  <- bmod;
+
+            out_params.gain_L    <- v_scale;
+            out_params.gain_R    <- v_scale;
+            out_params.gain_mono <- v_scale;
+
+            _ => return;
+        }
+    }
+}

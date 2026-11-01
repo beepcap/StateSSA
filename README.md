@@ -41,7 +41,8 @@ StateSSA/
     ├── 04_xz/          # LZMA2 ＆ XZ コンテナの圧縮・解凍ラウンドトリップ
     ├── 05_web_server/  # Linux io_uring による非同期 Web サーバー
     ├── 06_fixed_math/  # q64 固定小数点数による実数計算と C-ABI 境界自動変換
-    └── 07_simd_vivaldi_winter/ # f32x4 SIMD 4ボイス FM 弦楽合奏音響合成 (ヴィヴァルディ「冬」)
+    ├── 07_simd_vivaldi_winter/ # f32x4 SIMD 4ボイス FM 弦楽合奏音響合成 (ヴィヴァルディ「冬」)
+    └── 08_midi_player/ # SMF Format 0/1 マルチトラック FM 音響合成プレイヤー
 ```
 
 ---
@@ -77,7 +78,7 @@ StateSSA に同梱されているサンプルプログラムは、すべて C �
 
 ### ① 全サンプルの一括ビルド＆自動検証 (`make test`)
 
-リポジトリルートで以下のコマンドを実行すると、全 7 サンプルのコンパイルと自己検証テストが一括で実行されます：
+リポジトリルートで以下のコマンドを実行すると、全 8 サンプルのコンパイルと自己検証テストが一括で実行されます：
 
 ```sh
 make test
@@ -88,26 +89,26 @@ make test
 ============================================================
 Running All StateSSA Sample Verifications
 ============================================================
---- [Test 1/7] 01_hello_world ---
+--- [Test 1/8] 01_hello_world ---
 Hello, StateSSA World!
 
---- [Test 2/7] 02_simple_loop ---
+--- [Test 2/8] 02_simple_loop ---
 simple_loop(10) = 45: SUCCESS!
 
---- [Test 3/7] 03_parallel_sum ---
+--- [Test 3/8] 03_parallel_sum ---
 ParallelSum([1..8]) = 36: SUCCESS!
 
---- [Test 4/7] 04_xz ---
+--- [Test 4/8] 04_xz ---
 XZ Clone (Compress -> Decompress Roundtrip): 100% SUCCESS!
 
---- [Test 5/7] 05_web_server (Self-Test) ---
+--- [Test 5/8] 05_web_server (Self-Test) ---
 StateSSA io_uring Web Server listening on 0.0.0.0:18080...
 GET / -> 200 OK & Hello verified!
 GET /baseline11 -> 200 OK & Sum 100 verified!
 POST /echo -> 200 OK & Echo verified!
 web_server verification passed.
 
---- [Test 6/7] 06_fixed_math ---
+--- [Test 6/8] 06_fixed_math ---
 === StateSSA Sample 06: Deterministic Math (q64) ===
 a + b (expected 3.500000): 3.500000
 b - a (expected 0.500000): 0.500000
@@ -118,11 +119,22 @@ sin(0.0) (expected 0.000000): 0.000000
 cos(0.0) (expected 1.000000): 1.000000
 sqrt(4.0) (expected 2.000000): 2.000000
 
---- [Test 7/7] 07_simd_vivaldi_winter ---
+--- [Test 7/8] 07_simd_vivaldi_winter ---
 StateSSA SIMD 4-Voice FM Synthesizer: Vivaldi Winter RV297
 Rendering 704 measures/steps (~71.4s) using f32x4 SIMD...
 Vivaldi Winter rendered successfully to WAV file.
 WAV audio output generated successfully!
+
+--- [Test 8/8] 08_midi_player ---
+StateSSA Multi-Track MIDI Synthesizer Player
+Starting multi-track timeline synthesis...
+MIDI stereo synthesis complete! WAV rendered successfully.
+08_midi_player Stereo WAV generated successfully!
+[Mode] Mono Output Selected
+StateSSA Multi-Track MIDI Synthesizer Player
+Starting multi-track timeline synthesis...
+MIDI mono synthesis complete! WAV rendered successfully.
+08_midi_player Mono WAV generated successfully!
 
 ============================================================
 >>> ALL SAMPLES PASSED 100% ON STAGE-3 BINARY COMPILER! <<<
@@ -140,6 +152,7 @@ WAV audio output generated successfully!
 | **05** | **io_uring Web Server** | `samples/05_web_server/` | Linux `io_uring` 非同期システムコール直結、Zero-copy HTTP Web サーバー |
 | **06** | **Fixed-Point Math** | `samples/06_fixed_math/` | `q64` (Q32.32) 固定小数点実数計算、C 数学ライブラリ（`libm`）境界自動変換 |
 | **07** | **SIMD Vivaldi Winter** | `samples/07_simd_vivaldi_winter/` | `f32x4` SIMD 演算、4ボイス FM 弦楽合奏音響合成、44.1kHz 16bit WAV 出力 |
+| **08** | **FM MIDI Player** | `samples/08_midi_player/` | SMF Format 0/1 並行パース、事前スキャン動的ポリフォニー、純粋FM合成、リアルタイムUNIXパイプ再生 |
 
 > [!TIP]
 > 各サンプルの詳細な解説、ソースコードの設計思想、および個別手動ビルド・実行手順については、**[SAMPLES.md](SAMPLES.md)** を参照してください。
