@@ -252,14 +252,17 @@ make 07_simd_vivaldi_winter
 # 1. ビルド
 make 08_midi_player
 
-# 2. リアルタイム・ストリーミング再生 (UNIX パイプライン)
-./build/08/midi_player your_song.mid - | aplay -f cd
+# 2. リアルタイム・ストリーミング再生 (UNIX パイプライン、デフォルト stdout)
+./build/08/midi_player your_song.mid | aplay -f cd
 
-# 3. ステレオ WAV ファイルへの高速レンダリング
-./build/08/midi_player your_song.mid output_stereo.wav
+# 3. 複数曲の連続ジュークボックス再生 (ワイルドカード対応)
+./build/08/midi_player *.mid | aplay -f cd
 
-# 4. モノラル WAV ファイルへのレンダリング (--mono)
-./build/08/midi_player your_song.mid output_mono.wav --mono
+# 4. ステレオ WAV ファイルへの高速レンダリング (-o オプション)
+./build/08/midi_player your_song.mid -o output_stereo.wav
+
+# 5. モノラル WAV ファイルへのレンダリング (--mono)
+./build/08/midi_player your_song.mid -o output_mono.wav --mono
 ```
 
 > [!NOTE]

@@ -205,9 +205,9 @@ test: all
 	@test -s build/07/vivaldi_winter.wav && echo "WAV audio output generated successfully!"
 	@echo ""
 	@echo "--- [Test 8/8] 08_midi_player ---"
-	@./build/08/midi_player samples/08_midi_player/test_c_major.mid build/08/test_stereo.wav
+	@./build/08/midi_player samples/08_midi_player/test_c_major.mid -o build/08/test_stereo.wav
 	@test -s build/08/test_stereo.wav && echo "08_midi_player Stereo WAV generated successfully!"
-	@./build/08/midi_player samples/08_midi_player/test_c_major.mid build/08/test_mono.wav --mono
+	@./build/08/midi_player samples/08_midi_player/test_c_major.mid -o build/08/test_mono.wav --mono
 	@test -s build/08/test_mono.wav && echo "08_midi_player Mono WAV generated successfully!"
 	@echo ""
 	@echo "============================================================"

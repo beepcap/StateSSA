@@ -647,67 +647,143 @@ machine midi_player_run(mid_path: *u8, out_wav_path: *u8, is_stereo: i1) -> i32 
 }
 
 // ----------------------------------------------------------------------------
-// CLI Entry Point
+// CLI Entry Point (UNIX-Standard: Default Stdout Stream, -o for File Output)
+// Supports multi-file sequential streaming (e.g. *.mid | aplay -f cd)
 // ----------------------------------------------------------------------------
 machine main(argc: i32, argv: *u64) -> i32 {
     flow {
-        reg in_mid:   *u8 = null;
-        reg out_wav:  *u8 = null;
-        reg is_st:    i1  = 1;
+        reg arg_i:       u32 = 1;
+        reg num_files:   u32 = 0;
+        reg cur_file_i:  u32 = 0;
+        reg out_path:    *u8 = "-";
+        reg is_stereo:   i1  = 1;
+        reg files_buf:   *u64 = null;
     }
     states {
         Entry: {
-            argc < 2 => DefaultArgs;
-            _ => ParseCliArgs;
+            argc < 2 => ShowHelp;
+            let max_f = cast(u32) argc;
+            let mem = call malloc(max_f * 8);
+            _ => ParseLoop [
+                arg_i <= 1,
+                num_files <= 0,
+                cur_file_i <= 0,
+                out_path <= "-",
+                is_stereo <= 1,
+                files_buf <= cast(*u64) mem
+            ];
         }
 
-        DefaultArgs: {
-            let def_in  = "tmp/midi/vivaldi_winter.mid";
-            let def_out = "winter_stereo.wav";
-            _ => RunPlayer [ in_mid <= def_in, out_wav <= def_out, is_st <= 1 ];
+        ParseLoop: {
+            let max_args = cast(u32) argc;
+            arg_i >= max_args => CheckExecution;
+            _ => InspectArg;
         }
 
-        ParseCliArgs: {
-            let p1 = cast(*u8) *(argv + 1);
-            argc < 3 => DefaultOutPath [ in_mid <= p1 ];
-            _ => ReadOutPath [ in_mid <= p1 ];
+        InspectArg: {
+            let arg = cast(*u8) *(argv + arg_i);
+            let c0 = cast(i32) *arg;
+            let is_dash = c0 == 45; // '-'
+            is_dash != 0 => ParseOption;
+            _ => AddInputFile;
         }
 
-        DefaultOutPath: {
-            let def_out = "output.wav";
-            _ => CheckMonoFlag [ out_wav <= def_out ];
+        ParseOption: {
+            let arg = cast(*u8) *(argv + arg_i);
+            let c1 = cast(i32) *(arg + 1);
+            let c2 = cast(i32) *(arg + 2);
+
+            // Match "-o"
+            let is_o = (c1 == 111) && (c2 == 0);
+            is_o != 0 => HandleOptionO;
+
+            // Match "--mono" (starts with '-', '-', 'm')
+            let is_mono = (c1 == 45) && (c2 == 109);
+            is_mono != 0 => HandleOptionMono;
+
+            // Match "-h" or "--help"
+            let is_h = (c1 == 104) && (c2 == 0);
+            let is_help = (c1 == 45) && (c2 == 104);
+            let is_help_opt = is_h | is_help;
+            is_help_opt != 0 => ShowHelp;
+
+            // Unknown option: treat as positional input or ignore
+            _ => AddInputFile;
         }
 
-        ReadOutPath: {
-            let p2 = cast(*u8) *(argv + 2);
-            _ => CheckMonoFlag [ out_wav <= p2 ];
+        HandleOptionO: {
+            let max_args = cast(u32) argc;
+            let next_i = arg_i + 1;
+            next_i >= max_args => MissingArgVal;
+            let next_arg = cast(*u8) *(argv + next_i);
+            _ => ParseLoop [ out_path <= next_arg, arg_i <= arg_i + 2 ];
         }
 
-        CheckMonoFlag: {
-            argc >= 4 => CheckArg3;
-            _ => RunPlayer [ is_st <= 1 ];
+        HandleOptionMono: {
+            _ => ParseLoop [ is_stereo <= 0, arg_i <= arg_i + 1 ];
         }
 
-        CheckArg3: {
-            let p3 = cast(*u8) *(argv + 3);
-            // Check if p3 == "--mono" (starts with '-', '-')
-            let c0 = cast(i32) *p3;
-            let c1 = cast(i32) *(p3 + 1);
-            let c2 = cast(i32) *(p3 + 2);
-            let is_dash = (c0 == 45) && (c1 == 45);
-            let is_m = is_dash && (c2 == 109); // "--m"
-            is_m != 0 => SetMonoMode;
-            _ => RunPlayer [ is_st <= 1 ];
+        AddInputFile: {
+            let arg = cast(*u8) *(argv + arg_i);
+            let p_slot = files_buf + num_files;
+            *p_slot <- cast(u64) arg;
+            _ => ParseLoop [ num_files <= num_files + 1, arg_i <= arg_i + 1 ];
         }
 
-        SetMonoMode: {
-            let _ = call puts("[Mode] Mono Output Selected");
-            _ => RunPlayer [ is_st <= 0 ];
+        CheckExecution: {
+            num_files == 0 => ShowHelp;
+
+            // Check if -o was used with multiple input files
+            let c0 = cast(i32) *out_path;
+            let c1 = cast(i32) *(out_path + 1);
+            let is_stdout = (c0 == 45) && (c1 == 0);
+            let is_multi = num_files > 1;
+            let bad_multi = (is_stdout == 0) & is_multi;
+            bad_multi != 0 => ErrorMultiOutput;
+
+            _ => PlayLoop [ cur_file_i <= 0 ];
         }
 
-        RunPlayer: {
-            let res = call midi_player_run(in_mid, out_wav, is_st);
-            _ => return res;
+        PlayLoop: {
+            cur_file_i >= num_files => AllDone;
+            _ => PlayCurrent;
+        }
+
+        PlayCurrent: {
+            let cur_file = cast(*u8) *(files_buf + cur_file_i);
+            let _ = call midi_player_run(cur_file, out_path, is_stereo);
+            _ => PlayLoop [ cur_file_i <= cur_file_i + 1 ];
+        }
+
+        AllDone: {
+            let _ = call free(cast(*u8) files_buf);
+            _ => return 0;
+        }
+
+        ShowHelp: {
+            let _ = call puts("Usage: midi_player [options] <song1.mid> [song2.mid ...]");
+            let _ = call puts("Options:");
+            let _ = call puts("  -o <file.wav>   Render to WAV file (default: stdout streaming)");
+            let _ = call puts("  --mono          Synthesize mono audio (default: 3D stereo)");
+            let _ = call puts("  -h, --help      Display this help message");
+            let _ = call puts("");
+            let _ = call puts("Examples:");
+            let _ = call puts("  midi_player song.mid | aplay -f cd");
+            let _ = call puts("  midi_player *.mid | aplay -f cd");
+            let _ = call puts("  midi_player song.mid -o output.wav");
+            _ => return 1;
+        }
+
+        ErrorMultiOutput: {
+            let _ = call puts("Error: -o option can only be used with a single input file.");
+            let _ = call free(cast(*u8) files_buf);
+            _ => return 1;
+        }
+
+        MissingArgVal: {
+            let _ = call puts("Error: -o requires an output WAV filename argument.");
+            let _ = call free(cast(*u8) files_buf);
+            _ => return 1;
         }
     }
 }
