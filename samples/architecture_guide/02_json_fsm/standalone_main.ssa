@@ -1,0 +1,82 @@
+// ============================================================================
+// StateSSA Architecture Guide - Chapter 2 Sample
+// File: standalone_main.ssa
+//
+// Standalone Deterministic Test Harness for json_tokenizer.ssa
+// ============================================================================
+
+include "json_tokenizer.ssa";
+
+extern {
+    fn puts(s: *u8) -> i32;
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8) -> i32;
+}
+
+machine main() -> i32 {
+    flow {}
+
+    states {
+        Entry: {
+            let buf = call malloc(64);
+
+            // Test 1: {"a": 123} -> 5 tokens
+            *(buf + 0) <- cast(u8) 123; // '{'
+            *(buf + 1) <- cast(u8) 34;  // '"'
+            *(buf + 2) <- cast(u8) 97;  // 'a'
+            *(buf + 3) <- cast(u8) 34;  // '"'
+            *(buf + 4) <- cast(u8) 58;  // ':'
+            *(buf + 5) <- cast(u8) 32;  // ' '
+            *(buf + 6) <- cast(u8) 49;  // '1'
+            *(buf + 7) <- cast(u8) 50;  // '2'
+            *(buf + 8) <- cast(u8) 51;  // '3'
+            *(buf + 9) <- cast(u8) 125; // '}'
+
+            let count = call tokenize_json(buf, 10);
+            let _ = call free(buf);
+
+            count == 5 => TestEscape;
+            _ => Fail;
+        }
+
+        TestEscape: {
+            // Test 2: Valid Escape Sequence ("\"") -> 1 token inside string
+            // JSON: ["\""] -> 3 tokens: '[', '"\""', ']'
+            let buf2 = call malloc(16);
+            *(buf2 + 0) <- cast(u8) 91;  // '['
+            *(buf2 + 1) <- cast(u8) 34;  // '"'
+            *(buf2 + 2) <- cast(u8) 92;  // '\'
+            *(buf2 + 3) <- cast(u8) 34;  // '"'
+            *(buf2 + 4) <- cast(u8) 34;  // '"'
+            *(buf2 + 5) <- cast(u8) 93;  // ']'
+
+            let count2 = call tokenize_json(buf2, 6);
+            let _ = call free(buf2);
+
+            count2 == 3 => TestDepthError;
+            _ => Fail;
+        }
+
+        TestDepthError: {
+            // Test 3: Unexpected close bracket "}" on empty depth -> -5 (UNEXPECTED_CLOSE)
+            let buf3 = call malloc(8);
+            *(buf3 + 0) <- cast(u8) 125; // '}'
+
+            let err = call tokenize_json(buf3, 1);
+            let _ = call free(buf3);
+
+            err == -5 => Success;
+            _ => Fail;
+        }
+
+        Success: {
+            let _ = call puts("[PASS: standalone] Pure StateSSA JSON Tokenizer verified successfully.");
+            _ => return 0;
+        }
+
+        Fail: {
+            let _ = call puts("[FAIL: standalone] JSON Tokenizer verification failed!");
+            _ => return 1;
+        }
+    }
+}
