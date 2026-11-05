@@ -1,0 +1,219 @@
+// ============================================================================
+// StateSSA Architecture Guide - Chapter 3 Sample
+// File: json_tokenizer_fast.ssa
+//
+// RFC 8259 Streaming JSON Tokenizer with 16-byte SWAR Fast-Path
+// Minimal-Diff Optimization: Zero-Copy, Non-Destructive, Guard-Page Verified
+// ============================================================================
+
+machine tokenize_json(buf: *u8, len: i32) -> i32 {
+    flow {
+        reg cursor: i32 = 0;
+        reg tokens: i32 = 0;
+        reg depth: i32 = 0;
+        reg err: i32 = 0;
+
+        wire safe_len = len - 16;
+    }
+
+    states {
+        Entry: {
+            len < 0 => ExitError [ err <= -1 ];
+            buf == null => ExitError [ err <= -1 ];
+            _ => WaitToken [ cursor <= 0, tokens <= 0, depth <= 0, err <= 0 ];
+        }
+
+        WaitToken: {
+            cursor >= len => CheckFinalDepth;
+            let b = cast(i32) *(buf + cursor);
+
+            // 1. Whitespace Skip (Space, Tab, LF, CR)
+            b == 32 => WaitToken [ cursor <= cursor + 1 ];
+            b == 9  => WaitToken [ cursor <= cursor + 1 ];
+            b == 10 => WaitToken [ cursor <= cursor + 1 ];
+            b == 13 => WaitToken [ cursor <= cursor + 1 ];
+
+            // 2. Open Brackets ('{' = 123, '[' = 91)
+            let next_depth = depth + 1;
+            let is_open1 = b == 123;
+            let is_open2 = b == 91;
+            let is_open = is_open1 || is_open2;
+            let depth_exceeded = is_open && (next_depth > 64);
+            depth_exceeded => ExitError [ err <= -3 ];
+            is_open => WaitToken [ cursor <= cursor + 1, tokens <= tokens + 1, depth <= next_depth ];
+
+            // 3. Close Brackets ('}' = 125, ']' = 93)
+            let is_close1 = b == 125;
+            let is_close2 = b == 93;
+            let is_close = is_close1 || is_close2;
+            let underflow = is_close && (depth <= 0);
+            underflow => ExitError [ err <= -5 ];
+            is_close => WaitToken [ cursor <= cursor + 1, tokens <= tokens + 1, depth <= depth - 1 ];
+
+            // 4. Punctuation Delimiters (':' = 58, ',' = 44)
+            b == 58 => WaitToken [ cursor <= cursor + 1, tokens <= tokens + 1 ];
+            b == 44 => WaitToken [ cursor <= cursor + 1, tokens <= tokens + 1 ];
+
+            // 5. String Literal Start ('"' = 34)
+            let next_cursor = cursor + 1;
+            let can_fast = next_cursor < safe_len;
+            let is_quote = b == 34;
+            let start_fast = is_quote && can_fast;
+            start_fast => InStringFast [ cursor <= next_cursor ];
+            is_quote   => InString     [ cursor <= next_cursor ];
+
+            // 6. Value Literal Start: Number ('-' = 45, '0'..'9' = 48..57) or Literal ('t'=116, 'f'=102, 'n'=110)
+            b == 45 => InNumber [ cursor <= cursor + 1 ];
+            let is_ge0 = b >= 48;
+            let is_le9 = b <= 57;
+            let is_digit = is_ge0 && is_le9;
+            is_digit => InNumber [ cursor <= cursor + 1 ];
+            b == 116 => InNumber [ cursor <= cursor + 1 ];
+            b == 102 => InNumber [ cursor <= cursor + 1 ];
+            b == 110 => InNumber [ cursor <= cursor + 1 ];
+
+            // 7. Any other character outside tokens is invalid
+            _ => ExitError [ err <= -1 ];
+        }
+
+        InStringFast: {
+            let p0 = buf + cursor;
+            let p1 = p0 + 8;
+            let p64_0 = cast(*u64) p0;
+            let p64_1 = cast(*u64) p1;
+            let v0 = *p64_0;
+            let v1 = *p64_1;
+
+            // SWAR check v0 (Control < 32, Quote == 34, Slash == 92)
+            let sub_ctrl0 = v0 - 0x2020202020202020;
+            let not_v0 = v0 ^ 0xFFFFFFFFFFFFFFFF;
+            let ctrl0 = sub_ctrl0 & not_v0;
+
+            let q0 = v0 ^ 0x2222222222222222;
+            let sub_q0 = q0 - 0x0101010101010101;
+            let not_q0 = q0 ^ 0xFFFFFFFFFFFFFFFF;
+            let quote0 = sub_q0 & not_q0;
+
+            let s0 = v0 ^ 0x5C5C5C5C5C5C5C5C;
+            let sub_s0 = s0 - 0x0101010101010101;
+            let not_s0 = s0 ^ 0xFFFFFFFFFFFFFFFF;
+            let slash0 = sub_s0 & not_s0;
+
+            let spec0 = ctrl0 | quote0;
+            let spec0_all = spec0 | slash0;
+
+            // SWAR check v1
+            let sub_ctrl1 = v1 - 0x2020202020202020;
+            let not_v1 = v1 ^ 0xFFFFFFFFFFFFFFFF;
+            let ctrl1 = sub_ctrl1 & not_v1;
+
+            let q1 = v1 ^ 0x2222222222222222;
+            let sub_q1 = q1 - 0x0101010101010101;
+            let not_q1 = q1 ^ 0xFFFFFFFFFFFFFFFF;
+            let quote1 = sub_q1 & not_q1;
+
+            let s1 = v1 ^ 0x5C5C5C5C5C5C5C5C;
+            let sub_s1 = s1 - 0x0101010101010101;
+            let not_s1 = s1 ^ 0xFFFFFFFFFFFFFFFF;
+            let slash1 = sub_s1 & not_s1;
+
+            let spec1 = ctrl1 | quote1;
+            let spec1_all = spec1 | slash1;
+
+            let spec_both = spec0_all | spec1_all;
+            let spec_masked = spec_both & 0x8080808080808080;
+            let has_special = spec_masked != 0;
+
+            let skip_cursor = cursor + 16;
+            let next_can_fast = skip_cursor < safe_len;
+            let loop_fast = next_can_fast && (has_special == 0);
+            let no_special = has_special == 0;
+
+            loop_fast  => InStringFast [ cursor <= skip_cursor ];
+            no_special => InString     [ cursor <= skip_cursor ];
+            _          => InString     [ cursor <= cursor ];
+        }
+
+        InString: {
+            cursor >= len => ExitError [ err <= -2 ];
+            let b = cast(i32) *(buf + cursor);
+
+            // String Terminated ('"' = 34)
+            b == 34 => WaitToken [ cursor <= cursor + 1, tokens <= tokens + 1 ];
+
+            // Escape Sequence Start ('\' = 92)
+            b == 92 => InEscape [ cursor <= cursor + 1 ];
+
+            // Control characters (< 32) are strictly prohibited in RFC 8259 strings
+            b < 32 => ExitError [ err <= -1 ];
+
+            // Normal String Character: 1-byte fallback scan until token end
+            _ => InString [ cursor <= cursor + 1 ];
+        }
+
+        InEscape: {
+            cursor >= len => ExitError [ err <= -2 ];
+            let b = cast(i32) *(buf + cursor);
+
+            // RFC 8259 Valid Escape Characters: ", \, /, b, f, n, r, t, u
+            b == 34  => InString [ cursor <= cursor + 1 ];
+            b == 92  => InString [ cursor <= cursor + 1 ];
+            b == 47  => InString [ cursor <= cursor + 1 ];
+            b == 98  => InString [ cursor <= cursor + 1 ];
+            b == 102 => InString [ cursor <= cursor + 1 ];
+            b == 110 => InString [ cursor <= cursor + 1 ];
+            b == 114 => InString [ cursor <= cursor + 1 ];
+            b == 116 => InString [ cursor <= cursor + 1 ];
+            b == 117 => InString [ cursor <= cursor + 1 ];
+
+            _ => ExitError [ err <= -4 ];
+        }
+
+        InNumber: {
+            cursor >= len => CheckFinalDepth [ tokens <= tokens + 1 ];
+            let b = cast(i32) *(buf + cursor);
+
+            // Token boundary reached upon whitespace or structural punctuation
+            b == 32  => WaitToken [ tokens <= tokens + 1 ];
+            b == 9   => WaitToken [ tokens <= tokens + 1 ];
+            b == 10  => WaitToken [ tokens <= tokens + 1 ];
+            b == 13  => WaitToken [ tokens <= tokens + 1 ];
+            b == 44  => WaitToken [ tokens <= tokens + 1 ];
+            b == 58  => WaitToken [ tokens <= tokens + 1 ];
+            b == 125 => WaitToken [ tokens <= tokens + 1 ];
+            b == 93  => WaitToken [ tokens <= tokens + 1 ];
+
+            // Valid Number & Identifier payload characters: 0-9, ., +, -, e, E, a-z
+            let is_ge0 = b >= 48;
+            let is_le9 = b <= 57;
+            let is_digit = is_ge0 && is_le9;
+            is_digit => InNumber [ cursor <= cursor + 1 ];
+
+            b == 46  => InNumber [ cursor <= cursor + 1 ];
+            b == 43  => InNumber [ cursor <= cursor + 1 ];
+            b == 45  => InNumber [ cursor <= cursor + 1 ];
+            b == 101 => InNumber [ cursor <= cursor + 1 ];
+            b == 69  => InNumber [ cursor <= cursor + 1 ];
+
+            let is_gea = b >= 97;
+            let is_lez = b <= 122;
+            let is_alpha = is_gea && is_lez;
+            is_alpha => InNumber [ cursor <= cursor + 1 ];
+
+            _ => ExitError [ err <= -1 ];
+        }
+
+        CheckFinalDepth: {
+            depth == 0 => ExitSuccess;
+            _ => ExitError [ err <= -6 ];
+        }
+
+        ExitSuccess: {
+            _ => return tokens;
+        }
+
+        ExitError: {
+            _ => return err;
+        }
+    }
+}
