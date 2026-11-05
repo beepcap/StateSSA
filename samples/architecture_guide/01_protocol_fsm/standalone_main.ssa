@@ -1,0 +1,72 @@
+// ============================================================================
+// StateSSA Architecture Guide - Chapter 1 Sample
+// File: standalone_main.ssa
+//
+// Standalone Deterministic Test Harness for protocol_decoder.ssa
+// ============================================================================
+
+include "protocol_decoder.ssa";
+
+extern {
+    fn puts(s: *u8) -> i32;
+    fn malloc(size: i32) -> *u8;
+    fn free(ptr: *u8) -> i32;
+}
+
+machine main() -> i32 {
+    flow {}
+
+    states {
+        Entry: {
+            let buf = call malloc(22);
+
+            // Packet 1: Valid Packet (Payload Length = 3, XOR: 3 ^ 10 ^ 20 ^ 30 = 3)
+            *(buf + 0) <- cast(u8) 0xAA;
+            *(buf + 1) <- cast(u8) 3;
+            *(buf + 2) <- cast(u8) 10;
+            *(buf + 3) <- cast(u8) 20;
+            *(buf + 4) <- cast(u8) 30;
+            *(buf + 5) <- cast(u8) 3;
+
+            // Noise sequence: 3 corrupt bytes
+            *(buf + 6) <- cast(u8) 0x12;
+            *(buf + 7) <- cast(u8) 0xFF;
+            *(buf + 8) <- cast(u8) 0x00;
+
+            // Packet 2: Valid Packet (Payload Length = 2, XOR: 2 ^ 5 ^ 9 = 14)
+            *(buf + 9)  <- cast(u8) 0xAA;
+            *(buf + 10) <- cast(u8) 2;
+            *(buf + 11) <- cast(u8) 5;
+            *(buf + 12) <- cast(u8) 9;
+            *(buf + 13) <- cast(u8) 14;
+
+            // Packet 3: Corrupt Checksum (Expected: 1 ^ 7 = 6, Actual: 99)
+            *(buf + 14) <- cast(u8) 0xAA;
+            *(buf + 15) <- cast(u8) 1;
+            *(buf + 16) <- cast(u8) 7;
+            *(buf + 17) <- cast(u8) 99;
+
+            // Packet 4: Valid Packet (Payload Length = 1, XOR: 1 ^ 42 = 43)
+            *(buf + 18) <- cast(u8) 0xAA;
+            *(buf + 19) <- cast(u8) 1;
+            *(buf + 20) <- cast(u8) 42;
+            *(buf + 21) <- cast(u8) 43;
+
+            let count = call decode_stream(buf, 22);
+            let _ = call free(buf);
+
+            count == 3 => Success;
+            _ => Fail;
+        }
+
+        Success: {
+            let _ = call puts("[PASS: standalone] Decoded exactly 3 valid packets from stream.");
+            _ => return 0;
+        }
+
+        Fail: {
+            let _ = call puts("[FAIL: standalone] Packet count mismatch!");
+            _ => return 1;
+        }
+    }
+}

@@ -1,0 +1,59 @@
+// ============================================================================
+// StateSSA Architecture Guide - Chapter 1 Sample
+// File: protocol_decoder.ssa
+//
+// Binary Framed Packet Decoder (Finite State Machine)
+// Frame Format:
+//   [SYNC: 0xAA] [LEN: 1..64] [PAYLOAD: LEN bytes] [CHKSUM: 1 byte (XOR sum)]
+// ============================================================================
+
+machine decode_stream(buf: *u8, len: i32) -> i32 {
+    flow {
+        reg cursor: i32 = 0;
+        reg valid_packets: i32 = 0;
+        reg chk_calc: i32 = 0;
+        reg pkt_len: i32 = 0;
+        reg payload_read: i32 = 0;
+    }
+
+    states {
+        Entry: {
+            _ => WaitSync [ cursor <= 0, valid_packets <= 0, chk_calc <= 0, pkt_len <= 0, payload_read <= 0 ];
+        }
+
+        WaitSync: {
+            cursor >= len => Exit;
+            let b = cast(i32) *(buf + cursor);
+            b == 0xAA => ReadLength [ cursor <= cursor + 1, chk_calc <= 0 ];
+            _ => WaitSync [ cursor <= cursor + 1 ];
+        }
+
+        ReadLength: {
+            cursor >= len => Exit;
+            let b = cast(i32) *(buf + cursor);
+            b == 0 => WaitSync [ cursor <= cursor + 1 ];
+            b > 64 => WaitSync [ cursor <= cursor + 1 ];
+            _ => ReadPayload [ cursor <= cursor + 1, pkt_len <= b, payload_read <= 0, chk_calc <= b ];
+        }
+
+        ReadPayload: {
+            cursor >= len => Exit;
+            let b = cast(i32) *(buf + cursor);
+            let next_chk = chk_calc ^ b;
+            let next_read = payload_read + 1;
+            next_read == pkt_len => ReadChecksum [ cursor <= cursor + 1, chk_calc <= next_chk ];
+            _ => ReadPayload [ cursor <= cursor + 1, payload_read <= next_read, chk_calc <= next_chk ];
+        }
+
+        ReadChecksum: {
+            cursor >= len => Exit;
+            let b = cast(i32) *(buf + cursor);
+            b == chk_calc => WaitSync [ cursor <= cursor + 1, valid_packets <= valid_packets + 1 ];
+            _ => WaitSync [ cursor <= cursor + 1 ];
+        }
+
+        Exit: {
+            _ => return valid_packets;
+        }
+    }
+}
