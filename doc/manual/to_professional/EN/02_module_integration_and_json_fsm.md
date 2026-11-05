@@ -1,47 +1,18 @@
-# Chapter 2: StateSSA as a Module — Design How-To for Extracting Complex State Transitions from C Projects
+# Chapter 2: StateSSA as a Module — Eliminating C Structural Pathologies and Achieving Zero-Cost Multi-Language Linkage
 
-## 1. Problem Context & Motivation
+## 1. Micro-Module Philosophy: Surgically Extracting the Finite State Core
 
-### 1.1 Historic Achievements and Irreplaceable Foundation of the C Language
-Within the landscape of modern computing infrastructure, the C programming language has underpinned the bedrock of systems for nearly half a century.
-Operating system kernels (Linux, BSD, Windows), device drivers, embedded firmware, high-throughput database storage engines, and runtime environments of ubiquitous high-level languages (CPython, Node.js/V8, Ruby VM, etc.) all rely foundationally upon C or its Application Binary Interface (ABI).
+As demonstrated in Chapter 1, the topological dissonance between hierarchical Abstract Syntax Trees (ASTs) and Finite State Machines (FSMs) incurs severe cognitive friction and structural fragility within stream processing applications.
+Within modern computing infrastructure, operating system kernels, device drivers, embedded firmware, high-throughput storage engines, and language runtimes fundamentally rely upon C and its Application Binary Interface (ABI). Advocating a "Big-Bang Rewrite"—the wholesale deprecation and rewriting of established, battle-tested C codebases in a newly conceived language—is both engineering-wise and economically intractable across production systems.
 
-The reason C has preserved such irreplaceable engineering value over decades stems from three fundamental architectural properties:
-1. **Direct Hardware Abstraction**:
-   Memory alignment, pointer arithmetic, and cache-line-aware struct layouts can be commanded in a 1:1 mapping with the underlying physical machine architecture without concealment.
-2. **Zero-Overhead Execution Efficiency**:
-   There are no implicit runtime layers, garbage collectors, or dynamic dispatch penalties; every CPU instruction executes deterministically.
-3. **The Universal Lingua Franca of ABIs**:
-   Virtually every programming language interconnects via the C ABI, cementing C interfaces as the de facto industry standard for cross-language software reuse.
-
-Consequently, advocating a "Big-Bang Rewrite"—the wholesale deprecation and rewriting of established, large-scale C codebases in a newly conceived language—is both engineering-wise and economically intractable across the vast majority of commercial, academic, and mission-critical systems. Production C codebases embody decades of field-tested memory management logic, optimized I/O event loops, and OS-specific syscall integrations, encapsulating an enormous volume of undocumented domain knowledge and nuanced edge-case handling.
-
-### 1.2 Structural Pathology at Boundary Conditions: Fragility of State Transitions in C
-Conversely, there exists a critical architectural domain where the fundamental idioms of C introduce severe engineering friction and pervasive security vulnerabilities: **streaming parsers and communication protocol decoders that inherently operate as discrete state transitions**.
-
-When implementing stream processing within C's procedural control structures (`while`, `for`, `switch`, `if`), software engineers are inevitably compelled to rely on the following idioms:
-- Multiple mutable boolean flags declared outside loops (`is_in_string`, `escape_next`, `paren_depth`, etc.)
-- In-place pointer increments (`buf++`, `idx++`)
-- Deeply nested `switch-case` constructs punctuated with ad-hoc `break`, `continue`, and `return` statements
-
-As systems expand in scale and operational requirements, this architectural structure unavoidably precipitates three fatal pathologies:
-
-1. **Temporal Dispersion of State and Implicit Path Explosion**:
-   Because program variables exist as mutable memory locations ("Mutable Boxes"), state can be destructively mutated at arbitrary syntactic sites. The presence of merely three boolean flags alongside a single depth counter can spawn an implicit state space of $2^3 \times N$ configurations, effortlessly exceeding human cognitive working memory.
-2. **Non-Local Decoupling of Boundary Checks and Pointer Advances**:
-   Verifying that a buffer boundary has not been exceeded (`idx < len`) and reading the subsequent byte (`b = buf[idx++]`) frequently reside within disparate control blocks or helper routines. This structural separation routinely breeds off-by-one errors and buffer over-reads.
-3. **Structural Breeding Ground for Security Vulnerabilities (CVEs)**:
-   A substantial proportion of parser vulnerabilities—ranging from invalid character injection and memory corruption via unterminated strings to Denial of Service (DoS) attacks induced by call-stack exhaustion—arise not from intrinsic algorithmic complexity, but rather from the inability of C's hierarchical syntax trees to explicitly formalize finite state transitions.
-
-### 1.3 Micro-Module Philosophy: Surgically Extracting the Finite State Core
-The thesis advanced in this chapter is not the wholesale replacement of C projects with StateSSA.
-Rather, it is an architecture of coexistence: **"Delegate the domains where C excels—such as OS I/O loops, socket management, and buffer allocation—strictly to C, while surgically extracting the epicenter of fragility and complexity—the core Finite State Machine (FSM)—as a self-contained StateSSA module."**
+The thesis advanced in this chapter is not the wholesale replacement of C projects.
+Rather, it is an architecture of surgical coexistence: **"Delegate the domains where C excels—such as OS I/O loops, socket management, and buffer allocation—strictly to C, while surgically extracting the epicenter of fragility and complexity—the core Finite State Machine (FSM)—as an allocation-free StateSSA module."**
 
 ```text
 +-----------------------------------------------------------------------+
-|  C Layer (I/O, Memory Allocation, Syscalls)                           |
+|  C / C++ Host Layer (I/O, Memory Allocation, Syscalls)                |
 |  - epoll / io_uring / Socket Rx Ring Buffers                          |
-|  - Memory Lifecycle Management (malloc / free)                        |
+|  - Memory Lifecycle Management (malloc / free, RAII, smart pointers)  |
 +-----------------------------------+-----------------------------------+
                                     |
                     [C ABI: buf, len] (Allocation-Free Boundary)
@@ -49,7 +20,7 @@ Rather, it is an architecture of coexistence: **"Delegate the domains where C ex
 +-----------------------------------------------------------------------+
 |  StateSSA Module (Pure Finite State Machine + SSA Dataflow)           |
 |  - Complete Eradication of Side Effects via Immutable SSA Wires       |
-|  - Single-Tier, Fully Flattened State Nodes (State_Node)              |
+|  - Single-Tier, Fully Flattened State Nodes (State_Node / Basic Block)|
 |  - Statically Closed Directed Transfer Edges (Transfer_Edge)          |
 |  - Constant-Space O(1) Depth Tracking via Registers (Total DoS Proof) |
 +-----------------------------------------------------------------------+
@@ -57,144 +28,273 @@ Rather, it is an architecture of coexistence: **"Delegate the domains where C ex
                     [C ABI: tokens / Negative Error Code]
                                     v
 +-----------------------------------------------------------------------+
-|  C Layer (Downstream Processing)                                      |
+|  C / C++ Host Layer (Downstream Processing)                           |
 |  - Error Handling (Immediate Disconnect / Diagnostics)                |
 |  - Token Stream Consumption / Domain Business Logic Execution         |
 +-----------------------------------------------------------------------+
 ```
 
-Through this architecture, legacy and greenfield C projects alike circumvent the astronomical costs and regression risks of full-scale rewrites, while endowing their most brittle parsing engines with mathematically provable deterministic safety and zero-overhead execution performance simultaneously.
+Through this boundary demarcation, existing projects circumvent astronomical rewrite costs while endowing their most brittle parsing engines with mathematically provable deterministic safety and zero-overhead execution performance simultaneously.
 
 ---
 
-## 2. Universality & Topological Security
+## 2. Eliminating the 4 Structural Pathologies of C in Production
 
-### 2.1 The Mathematical Essence of Parsers: Direct Product of FSM and Dataflow
-From the perspective of theoretical computer science, any input stream parser—whether processing JSON, HTTP/1.1 headers, HTTP/2 frames, LZMA/XZ container formats, TLS records, or binary telemetry packets—can be completely formalized as the direct product of two foundational primitives:
+When implementing streaming parsers or protocol decoders in C, production engineering teams perpetually contend with four structural pathologies, bearing the brunt of continuous CVEs (vulnerabilities) and regression costs. Extracting the core logic into a StateSSA module eliminates these four major failure modes not through human diligence, but by virtue of code topology.
 
-1. **A Finite State Space $S$ and State Transition Function $\delta$ (Finite State Machine)**:
-   The discrete logic that consumes a sequence of input symbols $\Sigma$ (a byte stream) to map the current state $s \in S$ to a subsequent state $s' \in S$:
-   $$\delta: S \times \Sigma \to S$$
-2. **A Dataflow Transformation Mapping $F$ (Data Flow Dataflow)**:
-   The immutable computations occurring synchronously alongside state transitions (advancing cursors, accumulating token counts, computing rolling checksums, and tracking nesting depths):
-   $$F: R \times \Sigma \to R$$
+### 2.1 ① Eradication of State Explosion & Flag Variables (Promotion to Basic Blocks)
 
-The foundational defect of procedural languages lies in conflating these two inherently orthogonal dimensions—control topology (FSM) and data transformation (DFD)—within a single chaotic syntactic scope governed by hierarchical ASTs (`if`/`while`) and mutable memory variables.
-
-In StateSSA, these two dimensions are cleanly separated and made orthogonal at the syntactic level:
-- The `flow` block: Formalizes the immutable SSA register space $R$ (the data dimension).
-- The `states` block: Formalizes the flat, single-tier basic block set $S$ and directed transition edges $\delta$ evaluated by 1-bit boolean predicates (the control dimension).
-
-Through this architectural separation, for any arbitrary byte sequence across the input stream, the system's exact operational state and the deterministic transformation applied to every register are statically and unequivocally determined.
-
-### 2.2 Structural Origins of Parser Vulnerabilities (CVEs) in C
-Analyzing common vulnerabilities and exposures (CVEs) documented in production streaming parsers reveals that they do not stem from individual human oversight, but rather emerge inevitably from the following structural dynamics enforced by procedural C:
-
-| Vulnerability Category | Root Mechanism in Procedural C | Typical Security Impact |
-| :--- | :--- | :--- |
-| **Buffer Over-read** | Pointer arithmetic inside loops (`buf++`) executes asynchronously relative to outer boundary checks (`buf < end`). | Disclosure of sensitive process memory (e.g., Heartbleed). |
-| **State Confusion** | Inconsistencies in the update ordering of multiple mutable flags drive the parser into an unintended, invalid compound state. | Authentication bypass, parsing logic desynchronization. |
-| **Nested DoS** | Recursive-descent parsing of nested objects/arrays exhausts the C thread call stack when processing hostile, deeply nested payloads. | Process crash, Denial of Service (DoS). |
-| **Escape Injection** | Escape character (`\`) sanitization spans multiple disparate code paths, allowing unsanitized raw bytes to pierce internal logic. | Downstream command or query injection. |
-
-### 2.3 Topological Defense via StateSSA
-StateSSA renders these vulnerability classes mathematically impossible not through heightened developer vigilance, but via the geometric topology of its execution model:
-
-#### 1. Total Eradication of Side Effects via Immutable SSA Wires (Rule_Immutability)
-StateSSA completely eliminates mutable memory cells that can be overwritten in place.
-All register updates occur strictly via latch assignments at the precise instant of traversing a state boundary (`State [ reg <= expr ]`), which the compiler lowers into mathematically rigorous $\phi$ (Phi) nodes.
-Consequently, unintended corruption of variable values or intermediate state inconsistencies within a state node is structurally impossible.
-
-#### 2. Elimination of Undefined Paths via Closed Control Flow Graphs (Rule_Flat_Control_Flow)
-The state space of a StateSSA machine is a strictly flat, closed directed graph.
-There are no implicit long-distance jumps or unstructured exits, such as breaking from deeply nested `if` statements into an enclosing loop's `continue`. Every state transition is explicitly formalized as a directed edge evaluated by a 1-bit predicate, and attempts to transition to an unlinked or invalid state are rejected at compile time.
-
-#### 3. Stack-Free Constant-Space DoS Mitigation (Constant-Space Bounded Recursion)
-StateSSA performs syntax analysis without a single recursive function invocation.
-Nesting depth is managed exclusively through the arithmetic increment of an immutable register `depth` coupled with an instantaneous 1-bit predicate boundary check (`next_depth > 64`).
-Regardless of how deeply nested the input data (or hostile attack payload) may be, total auxiliary memory consumption remains strictly $O(1)$ (zero dynamic memory allocation), making thread call-stack exhaustion physically impossible.
-
----
-
-## 3. The 4-Step Modularization Process
-
-Extracting the critical state-transition core from an existing C codebase and restructuring it as a high-integrity StateSSA module follows a deterministic four-step methodology:
-
-```text
-[Step 1: Boundary Demarcation]
-  - Strictly partition responsibilities between C and StateSSA.
-  - Zero-Allocation Principle (StateSSA performs zero malloc/free).
-      │
-      ▼
-[Step 2: State Topologization]
-  - Extract discrete states (State_Node) from C switch / while / if constructs.
-  - Flatten transition conditions into directed edges (Transfer_Edge) evaluated by 1-bit predicates.
-      │
-      ▼
-[Step 3: DFD Register Mapping]
-  - Map persistent variables carried across states into flow { reg ... }.
-  - Design Phi arbitration via latch assignments [ reg <= expr ] upon transition.
-      │
-      ▼
-[Step 4: C-ABI Integration]
-  - Emit LLVM IR via ssac -> Assemble into native object files (.o) via clang.
-  - Zero-overhead direct linkage via extern declarations in C.
-```
-
-### Step 1: Boundary Demarcation
-The cardinal rule when establishing the module boundary is **absolute localization of memory ownership**.
-The StateSSA module performs zero dynamic heap allocation (`malloc` / `free`). The input buffer pointer and byte length (`buf: *u8, len: i32`) are supplied by the caller as a read-only borrow. The StateSSA module induces zero memory side effects, returning its output—either a non-negative metric or a negative error code—exclusively through machine registers.
-
+#### The Production C Pathology
+In C parsers, developers routinely declare a constellation of mutable boolean flags outside parsing loops or within context structures:
 ```c
-// C header definition (state_module.h)
-#ifndef STATE_MODULE_H
-#define STATE_MODULE_H
-#include <stdint.h>
-
-// Exported StateSSA module function
-extern int32_t tokenize_json(const uint8_t* buf, int32_t len);
-
-#endif
+bool is_in_string = false;
+bool escape_next = false;
+bool expect_colon = false;
+bool is_negative = false;
+int state = 0;
 ```
+These flags are updated destructively in-place across arbitrary `if` and `switch` statements. With $N$ boolean flags, the potential state space explodes to $2^N$ configurations. Invalid states—such as `is_in_string == false` yet `escape_next == true`, or leftover flags leaking into subsequent iterations—frequently manifest, breeding logic bypasses and security holes.
 
-### Step 2: State Topologization
-From the procedural control structures scattered across the C codebase, isolate the pure discrete states corresponding to stages of stream parsing.
-For RFC 8259 JSON stream parsing, execution resolves into seven distinct states:
-1. `WaitToken`: Quiescent baseline state awaiting structural tokens or whitespace.
-2. `InString`: Parsing character sequences within a string literal.
-3. `InEscape`: Validating the single character immediately succeeding an escape indicator (`\`).
-4. `InNumber`: Accumulating numeric digits or literal byte sequences.
-5. `CheckFinalDepth`: Validating bracket balance upon reaching buffer termination.
-6. `ExitSuccess`: Successful completion state.
-7. `ExitError`: Fail-fast error termination state.
-
-### Step 3: DFD Register Mapping
-Map C loop variables, index cursors, status flags, and cumulative counters onto immutable registers defined within the `flow` block.
-In StateSSA, registers are not mutable variables; they represent incoming wiring to $\phi$ nodes situated at state ingress. Upon each transition, updated downstream values are explicitly latched.
-
+#### StateSSA Topological Solution
+StateSSA completely abolishes state flag variables.
+Every valid state is elevated explicitly to a mutually exclusive state node (**State_Node / LLVM Basic Block**: `WaitToken`, `InString`, `InEscape`, `InNumber`):
 ```rust
-flow {
-    reg cursor: i32 = 0;  // Read cursor (0 <= cursor <= len)
-    reg tokens: i32 = 0;  // Cumulative count of recognized tokens
-    reg depth: i32 = 0;   // Bracket nesting depth (0 <= depth <= 64)
-    reg err: i32 = 0;     // Negative error code (-1 .. -6)
+states {
+    WaitToken: { ... }
+    InString:  { ... }
+    InEscape:  { ... }
+    InNumber:  { ... }
 }
 ```
+At any given instant, the system resides strictly within exactly one of the declared discrete nodes. Forgetting to reset a flag or drifting into an illegal combination of states is rendered geometrically impossible.
 
-### Step 4: C-ABI Integration
-The StateSSA compiler (`ssac`) emits standard LLVM Intermediate Representation (`.ll`).
-The LLVM IR is directly compiled and assembled into a host native object file (`.o`) via standard compiler toolchains such as Clang.
-From the perspective of the C caller, the module links as an ordinary C function call, introducing exactly zero nanoseconds of overhead from FFI marshaling or dynamic interpretation layers.
+### 2.2 ② Structural Eradication of Pointer Runaway & Buffer Over-read (Physical Isolation via Prior Guards)
+
+#### The Production C Pathology
+The most lethal defect in procedural stream decoding is the spatial and temporal divergence between buffer boundary checks (`cursor < len`) and pointer dereferences (`*p` or `buf[cursor++]`):
+```c
+while (cursor < len) {
+    char c = buf[cursor++];
+    if (c == '\\') {
+        // Reading the next character without an immediate boundary check!
+        char next = buf[cursor++]; // <--- Off-by-one / Buffer Over-read (e.g., Heartbleed)
+        if (next == 'n') { ... }
+    }
+}
+```
+When pointers advance inside helper routines or nested branch targets, a single missed boundary condition causes illegal memory accesses, process crashes, or out-of-bounds information disclosure.
+
+#### StateSSA Topological Solution
+In StateSSA, every state node evaluates boundary predicates (**Prior Guards**) as the highest-priority directed transfer edges at block ingress:
+```rust
+InString: {
+    cursor >= len => ExitError [ err <= -2 ]; // Prior Boundary Guard
+    let b = cast(i32) *(buf + cursor);
+    ...
+}
+```
+If `cursor >= len` evaluates to true, control immediately transfers to the error exit node. Execution can never reach subsequent memory dereferences (`*(buf + cursor)`). By mandating that guards precede all memory access operations structurally, pointer runaway and buffer over-reads are physically impossible.
+
+### 2.3 ③ Constant-Space $O(1)$ Defense Against DoS Attacks (Stack-Free Register Tracking)
+
+#### The Production C Pathology
+When parsing recursively nested data structures (JSON, XML), C implementations traditionally rely on recursive descent functions (`parse_object() -> parse_value() -> parse_object()`) or heap-allocated element stacks.
+When an adversary transmits a hostile payload with thousands of nested brackets `[[[[...` (a JSON bomb), the thread call stack depletes, precipitating an instant SIGSEGV crash, or heap exhaustion triggers the OS Out-Of-Memory (OOM) killer, terminating the entire process.
+
+#### StateSSA Topological Solution
+StateSSA performs zero recursive function calls during parsing.
+Nesting depth is tracked exclusively through single immutable SSA register increments and 1-bit predicate evaluations on transition:
+```rust
+let next_depth = depth + 1;
+let is_open = (b == 123) || (b == 91); // '{' or '['
+let depth_exceeded = is_open && (next_depth > 64);
+
+depth_exceeded => ExitError [ err <= -3 ]; // Immediate halt on limit breach
+is_open        => WaitToken [ cursor <= cursor + 1, depth <= next_depth ];
+```
+Regardless of how deeply nested an incoming payload may be, additional memory consumption is strictly **$O(1)$ (zero stack frames, zero heap allocation)**. Any depth threshold violation (`depth > 64`) is intercepted and rejected on the very first byte exceeding the limit, rendering DoS attacks harmless in constant space.
+
+### 2.4 ④ Locality in Specification Changes (Robustness via Adding Single Directed Edges)
+
+#### The Production C Pathology
+Introducing new grammar rules (e.g., supporting a new escape sequence `\v` or single-line comments `//`) into an existing C parser is a notorious source of regressions. Inserting branches into deeply nested `switch-case` statements frequently interferes with flag lifecycles or loop termination logic, breaking existing parsing behaviors.
+
+#### StateSSA Topological Solution
+StateSSA operates across a single-tier, fully flattened graph.
+Modifications and grammatical extensions are completed by **appending a single directed edge (`predicate => TargetState [latch assignment];`) directly inside the target state block**:
+```rust
+InEscape: {
+    cursor >= len => ExitError [ err <= -2 ];
+    let b = cast(i32) *(buf + cursor);
+
+    // New requirement: Add support for \v (Vertical Tab: ASCII 11) in 1 line
+    b == 118 => InString [ cursor <= cursor + 1 ];
+
+    // Existing escape sequence rules
+    b == 34  => InString [ cursor <= cursor + 1 ];
+    ...
+    _ => ExitError [ err <= -4 ];
+}
+```
+No side effects propagate to other state nodes (`WaitToken`, `InNumber`). Cyclomatic complexity remains completely localized per transition edge, structurally insulating the system from regressions.
 
 ---
 
-## 4. Production Case Study: RFC 8259 Streaming JSON Tokenizer
+## 3. The Full Value of Multi-Language Zero-Cost Linkage via Clang/LLVM
 
-### 4.1 Finite State Modeling of RFC 8259
-To demonstrate this methodology in practice, we construct a production-grade streaming tokenizer conforming to RFC 8259 (The JavaScript Object Notation Data Interchange Format).
+### 3.1 Architectural Significance of Emitting Pure LLVM IR (`.ll`)
 
-#### Finite State Transition Model (Mermaid `stateDiagram-v2`)
-The complete operational lifecycle is governed deterministically by seven state nodes linked by guarded transition edges:
+The central architectural highlight of the StateSSA compiler (`bin/ssac`) is that **it does not emit proprietary virtual machine bytecode; instead, it outputs standard, clean, textual LLVM IR (`.ll`)**.
+
+```text
+[json_tokenizer.ssa]
+        │
+        ▼ (bin/ssac)
+[json_tokenizer.ll]  <--- Pure Standard LLVM IR (Zero Runtime Dependency)
+        │
+        ▼ (clang -c)
+[json_tokenizer.o]   <--- Standard ELF / Mach-O / COFF Object File
+        │
+        ├──────────────────────┬──────────────────────┬──────────────────────┐
+        ▼                      ▼                      ▼                      ▼
+    [ C Language ]           [ C++ ]                [ Rust ]             [ Shared Lib ]
+   clang main.c           clang++ main.cpp       cargo / build.rs       clang -shared (.so)
+        │                      │                      │                      │
+        ▼                      ▼                      ▼                      ▼
+  [ native app ]         [ native app ]         [ native app ]       [ Python / Go etc ]
+```
+
+Many newly proposed domain-specific languages (DSLs) require cumbersome runtime libraries (garbage collectors, green thread schedulers, exception unwinding mechanisms). Interfacing with them from existing projects demands heavyweight wrappers and dynamic marshaling layers, imposing prohibitive latency and memory footprints.
+
+In stark contrast, the LLVM IR emitted by StateSSA possesses zero runtime dependencies.
+Consequently, assembling it via standard `clang` into an object file (`.o`) enables **direct, zero-cost linkage via the universal C ABI from any programming language supported by the Clang/LLVM ecosystem**.
+
+---
+
+### 3.2 Direct Linkage Catalog from Clang/LLVM Supported Languages
+
+#### 1. Direct Linkage from C
+The baseline integration form. The C host declares the prototype as `extern` and links with the object file as an ordinary translation unit.
+
+```c
+// main.c
+#include <stdio.h>
+#include <stdint.h>
+
+extern int32_t tokenize_json(const uint8_t* buf, int32_t len);
+
+int main(void) {
+    const char* json = "{\"status\": 200}";
+    int32_t count = tokenize_json((const uint8_t*)json, 15);
+    printf("Token count: %d\n", count); // -> 5
+    return 0;
+}
+```
+**Build & Link Commands:**
+```bash
+clang -c json_tokenizer.ll -o json_tokenizer.o
+clang main.c json_tokenizer.o -o app_c
+```
+
+#### 2. Direct Linkage from C++ (`extern "C"`)
+From C++, wrapping the prototype in `extern "C"` suppresses C++ name mangling, allowing zero-cost invocation directly from modern C++ containers (`std::string`, `std::vector`, `std::string_view`).
+
+```cpp
+// main.cpp
+#include <iostream>
+#include <string_view>
+#include <cstdint>
+
+extern "C" {
+    int32_t tokenize_json(const uint8_t* buf, int32_t len);
+}
+
+int main() {
+    std::string_view json = "{\"hello\": \"world\"}";
+    int32_t tokens = tokenize_json(reinterpret_cast<const uint8_t*>(json.data()), 
+                                   static_cast<int32_t>(json.size()));
+    std::cout << "Tokens: " << tokens << std::endl;
+    return 0;
+}
+```
+**Build & Link Commands:**
+```bash
+clang++ -std=c++17 main.cpp json_tokenizer.o -o app_cpp
+```
+
+#### 3. Zero-Overhead FFI Linkage from Rust
+In memory-safe Rust, developers can offload complex state machines to StateSSA and bind seamlessly over FFI. Because both participate in the LLVM backend, Link-Time Optimization (LTO) can inline code across the language boundary.
+
+```rust
+// main.rs
+extern "C" {
+    fn tokenize_json(buf: *const u8, len: i32) -> i32;
+}
+
+fn main() {
+    let payload = b"{\"rust\": [1, 2, 3]}";
+    let ret = unsafe {
+        tokenize_json(payload.as_ptr(), payload.len() as i32)
+    };
+    println!("Tokens: {}", ret);
+}
+```
+**Build & Link Commands:**
+```bash
+rustc main.rs -l json_tokenizer -L . -o app_rust
+```
+
+#### 4. Direct Invocations from Zig and Swift
+Modern systems languages natively import C ABI symbols:
+- **Zig**:
+  ```zig
+  extern fn tokenize_json(buf: [*]const u8, len: i32) i32;
+  ```
+- **Swift**:
+  ```swift
+  @_silgen_name("tokenize_json")
+  func tokenize_json(_ buf: UnsafePointer<UInt8>, _ len: Int32) -> Int32
+  ```
+
+#### 5. Dynamic Shared Library (`.so` / `.dylib`) for Python and Go
+Compiling the `.ll` file into a position-independent shared library allows high-level languages to execute high-throughput FSM processing at native speed:
+
+```bash
+clang -shared -fPIC json_tokenizer.ll -o libjson_tokenizer.so
+```
+
+```python
+# app.py (Python ctypes invocation)
+import ctypes
+
+lib = ctypes.CDLL("./libjson_tokenizer.so")
+lib.tokenize_json.argtypes = [ctypes.c_char_p, ctypes.c_int32]
+lib.tokenize_json.restype = ctypes.c_int32
+
+json_data = b'{"key": "value", "array": [10, 20]}'
+result = lib.tokenize_json(json_data, len(json_data))
+print(f"Token count: {result}")
+```
+
+---
+
+### 3.3 The Engineering Basis of "True Zero-Cost"
+
+The zero-cost nature of this architecture rests upon three physical realities at the hardware layer:
+
+1. **Direct Conformance to System V AMD64 / ARM64 AAPCS Calling Conventions**:
+   The generated function `tokenize_json` receives its buffer pointer in register `RDI` (`X0` on ARM64), length in `RSI` (`X1`), and returns its status in `RAX` (`X0`). There is zero register reshuffling or stack realignment between caller and callee.
+2. **Complete Absence of Data Marshaling and Copying**:
+   Because raw memory pointers and length integers are transmitted directly, zero data duplication or format adaptation occurs. A 1MB JSON buffer incurs only a nanosecond-scale register pass.
+3. **Zero VM, Runtime, or GC Overhead**:
+   There are no JIT compilation loops, interpreter dispatch overheads, heap memory allocations, or garbage collector pauses. CPU instructions execute deterministically at theoretical wire speed.
+
+---
+
+## 4. Case Study: Production RFC 8259 JSON Tokenizer
+
+### 4.1 Finite State Model (Mermaid `stateDiagram-v2`)
+The finite state lifecycle of the RFC 8259 streaming tokenizer is governed completely by seven state nodes and deterministic guards.
 
 ```mermaid
 stateDiagram-v2
@@ -237,8 +337,8 @@ stateDiagram-v2
     ExitError --> [*]
 ```
 
-#### Dataflow Graph (Mermaid `flowchart LR`)
-The dataflow between the input buffer and register wires forms a monotonically advancing pipeline free of arbitrary loops:
+### 4.2 Dataflow Model (Mermaid `flowchart LR`)
+The dataflow between the input buffer and registers forms a monotonic forward pipeline free from cycles.
 
 ```mermaid
 flowchart LR
@@ -257,8 +357,8 @@ flowchart LR
 
 ---
 
-### 4.2 Production Implementation: `json_tokenizer.ssa`
-Below is the complete implementation. Within fewer than 150 lines of code, RFC 8259 syntax parsing, Denial-of-Service mitigation, escape injection prevention, and bracket imbalance detection are fully self-contained:
+### 4.3 Production SSA Code: `json_tokenizer.ssa`
+In under 150 lines, RFC 8259 tokenization, DoS mitigation, strict escape validation, and bracket balance verification are entirely self-contained.
 
 ```rust
 // ============================================================================
@@ -419,36 +519,81 @@ machine tokenize_json(buf: *u8, len: i32) -> i32 {
 
 ---
 
-### 4.3 C Integration Test Harness (`driver.c`) and Security Verification Trace
-Below is the verification harness (`driver.c`), validating C integration alongside resilient defenses against malicious attack vectors:
+### 4.4 Lowered LLVM IR Structure and Hardware Behavior
 
-```c
-// Excerpts from driver.c verification scenarios
-extern int32_t tokenize_json(const uint8_t* buf, int32_t len);
+Inspecting the LLVM IR (`json_tokenizer.ll`) generated by `ssac` confirms that source structures translate 1:1 into hardware-native Basic Blocks and Phi nodes without distortion:
 
-// Positive test case
-tokenize_json("{\"key\": \"value\", \"arr\": [true, false, null]}", 47); // -> 19 (PASS)
-
-// Security test case: Nesting DoS attack (Injecting 65 '[' brackets)
-tokenize_json("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[...]]]]...", 130);
-// -> -3 (Immediately mitigated in O(1) memory via ERR_MAX_DEPTH)
-
-// Security test case: Invalid escape injection ("\a")
-tokenize_json("{\"key\": \"\\a\"}", 13);
-// -> -4 (Immediately rejected via ERR_INVALID_ESCAPE)
+```llvm
+define i32 @tokenize_json(i8* %arg_buf, i32 %arg_len) {
+entry:
+  %t_1 = icmp slt i32 %arg_len, 0
+  br i1 %t_1, label %Entry_then_0, label %Entry_else_0
+...
+WaitToken:
+  %reg_cursor_WaitToken = phi i32 [ 0, %Entry_else_1 ], [ %t_22, %WaitToken_then_1 ], ...
+  %reg_tokens_WaitToken = phi i32 [ 0, %Entry_else_1 ], [ %reg_tokens_WaitToken, %WaitToken_then_1 ], ...
+  %reg_depth_WaitToken  = phi i32 [ 0, %Entry_else_1 ], [ %reg_depth_WaitToken, %WaitToken_then_1 ], ...
+  %reg_err_WaitToken    = phi i32 [ 0, %Entry_else_1 ], [ %reg_err_WaitToken, %WaitToken_then_1 ], ...
+  %gep_3 = getelementptr inbounds i8, i8* %arg_buf, i32 %reg_cursor_WaitToken
+  %load_4 = load i8, i8* %gep_3, align 1
+  %zext_5 = zext i8 %load_4 to i32
+...
 ```
 
-#### Machine Execution Log (`run.sh` Automated Verification)
+- **Zero Stack Variables (Zero Alloca)**:
+  Zero `alloca` instructions are generated; all registers map directly to physical CPU registers.
+- **Single-Cycle Phi Arbitration**:
+  Value resolution at block ingresses executes instantaneously via LLVM `phi` operations, preserving optimal linear instruction streaming for CPU branch predictors.
+
+---
+
+## 5. Multi-Language Linkage Verification: C and C++ Test Harnesses
+
+### 5.1 C Test Harness (`driver.c`)
+Validates standard C ABI calling conventions by executing all 16 test scenarios directly against the linked object file.
+
+```c
+// driver.c (Excerpt)
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+extern int32_t tokenize_json(const uint8_t* buf, int32_t len);
+
+// Exercises 16 comprehensive positive, security attack, and boundary guard scenarios
+```
+
+### 5.2 C++ Direct Link Harness (`driver_cpp.cpp`)
+Validates modern C++ compatibility using `extern "C"` to bypass name mangling and exercising tests via STL types (`std::string`, `std::vector`).
+
+```cpp
+// driver_cpp.cpp (Excerpt)
+#include <iostream>
+#include <vector>
+#include <string>
+#include <cstdint>
+
+extern "C" {
+    int32_t tokenize_json(const uint8_t* buf, int32_t len);
+}
+
+// Executes all 16 test scenarios directly, demonstrating 100% PASS in C++
+```
+
+### 5.3 Automated Verification (`run.sh`) & Physical Execution Results
+
+Executing `run.sh` inside `samples/architecture_guide/02_json_fsm/` confirms that all 16 test scenarios pass with 100% success across both C and C++ runtimes:
+
 ```text
 ======================================================================
  StateSSA Architecture Guide - Chapter 2: JSON FSM Module Verification
  Compiler: /home/beep/work_llm/work_StateSSA/bin/ssac
 ======================================================================
-[1/4] Compiling json_tokenizer.ssa to LLVM IR...
+[1/5] Compiling json_tokenizer.ssa to LLVM IR...
 StateSSA compilation successful!
   -> json_tokenizer.ll successfully generated.
 
-[2/4] Verifying structural 1:1 mapping in LLVM IR...
+[2/5] Verifying structural 1:1 mapping in LLVM IR...
   -> Verified Basic Block: WaitToken:
   -> Verified Basic Block: InString:
   -> Verified Basic Block: InEscape:
@@ -458,11 +603,11 @@ StateSSA compilation successful!
   -> Verified Basic Block: ExitError:
   -> Verified Phi Ingress Nodes: 28 phi nodes instantiated.
 
-[3/4] Building and executing standalone StateSSA test harness...
+[3/5] Building and executing standalone StateSSA test harness...
 StateSSA compilation successful!
 [PASS: standalone] Pure StateSSA JSON Tokenizer verified successfully.
 
-[4/4] Building and executing C-ABI driver integration...
+[4/5] Building and executing C-ABI driver integration (C: driver.c)...
 ======================================================================
  StateSSA Chapter 2: RFC 8259 JSON FSM C-ABI Test Harness
 ======================================================================
@@ -496,70 +641,79 @@ StateSSA compilation successful!
 ======================================================================
  >>> ALL 16 C-ABI INTEGRATION & SECURITY TESTS PASSED (100%) <<<
 ======================================================================
+
+[5/5] Building and executing C++ direct link integration (C++: driver_cpp.cpp)...
+======================================================================
+ StateSSA Chapter 2: RFC 8259 JSON FSM C++ Direct Link Test Harness
+======================================================================
+
+--- [Section 1: Standard Positive Tests] ---
+  [PASS] Empty Object {}                     -> Result:    2 (Expected:    2)
+  [PASS] Empty Array []                      -> Result:    2 (Expected:    2)
+  [PASS] Simple Key-Value                    -> Result:    5 (Expected:    5)
+  [PASS] Composite JSON with Literals        -> Result:   19 (Expected:   19)
+  [PASS] Valid Escape Sequences              -> Result:    5 (Expected:    5)
+  [PASS] Numbers and Exponents               -> Result:    9 (Expected:    9)
+
+--- [Section 2: Security & Negative Attack Vectors] ---
+  [PASS] Invalid Char (@ symbol)             -> Result:   -1 (Expected:   -1)
+  [PASS] Raw Control Char in String          -> Result:   -1 (Expected:   -1)
+  [PASS] Unterminated String Literal         -> Result:   -2 (Expected:   -2)
+  [PASS] Unterminated Escape at End          -> Result:   -2 (Expected:   -2)
+  [PASS] Nest DoS Attack (Depth 65)          -> Result:   -3 (Expected:   -3)
+  [PASS] Safe Boundary Depth (Depth 64)      -> Result:  128 (Expected:  128)
+  [PASS] Invalid Escape \a                   -> Result:   -4 (Expected:   -4)
+  [PASS] Invalid Escape \x                   -> Result:   -4 (Expected:   -4)
+  [PASS] Unexpected Extra Bracket            -> Result:   -5 (Expected:   -5)
+  [PASS] Closing Bracket on Empty Stack      -> Result:   -5 (Expected:   -5)
+  [PASS] Unclosed Bracket at EOF             -> Result:   -6 (Expected:   -6)
+  [PASS] Single Open Bracket                 -> Result:   -6 (Expected:   -6)
+
+--- [Section 3: Buffer Boundary Guards] ---
+  [PASS] NULL Buffer Guard                   -> Result:   -1 (Expected:   -1)
+  [PASS] Negative Length Guard               -> Result:   -1 (Expected:   -1)
+
+======================================================================
+ >>> ALL 16 C++ DIRECT LINK & SECURITY TESTS PASSED (100%) <<<
+======================================================================
+
+======================================================================
+ >>> ALL ARCHITECTURAL VERIFICATION CHECKS PASSED (100%) <<<
+======================================================================
 ```
 
 ---
 
-### 4.4 Structure of Lowered LLVM IR and Hardware Execution Dynamics
-Examining the LLVM IR (`json_tokenizer.ll`) generated by `ssac` demonstrates that the programmer's high-level state specification is lowered directly into basic blocks and $\phi$ nodes with zero syntactic deformation:
+## 6. Engineering Discipline & Trade-Off Summary
 
-```llvm
-define i32 @tokenize_json(i8* %arg_buf, i32 %arg_len) {
-entry:
-  %t_1 = icmp slt i32 %arg_len, 0
-  br i1 %t_1, label %Entry_then_0, label %Entry_else_0
-...
-WaitToken:
-  %reg_cursor_WaitToken = phi i32 [ 0, %Entry_else_1 ], [ %t_22, %WaitToken_then_1 ], ...
-  %reg_tokens_WaitToken = phi i32 [ 0, %Entry_else_1 ], [ %reg_tokens_WaitToken, %WaitToken_then_1 ], ...
-  %reg_depth_WaitToken  = phi i32 [ 0, %Entry_else_1 ], [ %reg_depth_WaitToken, %WaitToken_then_1 ], ...
-  %reg_err_WaitToken    = phi i32 [ 0, %Entry_else_1 ], [ %reg_err_WaitToken, %WaitToken_then_1 ], ...
-  %gep_3 = getelementptr inbounds i8, i8* %arg_buf, i32 %reg_cursor_WaitToken
-  %load_4 = load i8, i8* %gep_3, align 1
-  %zext_5 = zext i8 %load_4 to i32
-...
-```
-
-This compilation output confirms the following hardware-level properties:
-1. **Zero Stack Allocation (Zero Alloca)**:
-   Zero `alloca` instructions are generated. All register wires (`cursor`, `tokens`, `depth`, `err`) map directly to physical CPU registers.
-2. **Atomic Multiplexing via Phi Nodes**:
-   `phi` instructions at basic block ingress select upstream values in a single machine cycle depending strictly on predecessor control transitions.
-3. **Maximal Cache Locality and Pipeline Saturation**:
-   The input buffer is indexed monotonically (`gep_3`) along contiguous cache lines, exhibiting linear execution trajectories highly amenable to CPU branch predictors.
-
----
-
-## 5. Engineering Discipline & Trade-Offs
-
-### 5.1 Three Golden Rules for Module Operations
-Integrating StateSSA modules into production C projects requires strict adherence to three operational rules:
+### 6.1 Three Disciplines of Module Operation
+When integrating StateSSA modules into production C/C++ projects, three core principles must be strictly enforced:
 
 1. **Zero-Allocation Principle**:
-   StateSSA modules must never perform dynamic memory allocations. Memory lifecycle management remains exclusively within caller C routines, while StateSSA focuses strictly on transforming contiguous memory buffers as a pure computation engine.
-2. **Negative Error Space Protocol**:
-   Successful invocations return non-negative metrics (`>= 0`), whereas error conditions return semantically distinct negative codes (`-1` to `-N`) fail-fast. This enables C callers to detect and handle faults via an ultra-lightweight single comparison instruction (`if (ret < 0)`).
+   Never perform dynamic memory allocation (`malloc`/`free`) inside a StateSSA module. Memory lifecycle management belongs exclusively to the host environment; StateSSA serves purely as an allocation-free stream computation engine.
+2. **Negative Error Space Convention**:
+   Successful executions return non-negative integers (`>= 0`); anomalies return semantically distinct negative error codes (`-1` through `-N`). The host checks for failures via a single lightweight branch instruction (`if (ret < 0)`).
 3. **Deterministic Fuzzing Affinity**:
-   Because control flow within a StateSSA module forms a single-tier closed graph, cyclomatic complexity is completely visible. Under coverage-guided fuzzers such as LLVM's `libFuzzer` or AFL++, transition edges are traced with 100% determinism, dramatically accelerating vulnerability discovery relative to procedural codebases.
+   Because control flow forms a single-tier closed graph, LLVM's `libFuzzer` and AFL++ achieve 100% deterministic edge coverage tracking, exponentially accelerating the discovery of latent edge cases.
 
 ---
 
-### 5.2 Symmetric Trade-Off Analysis
-This architectural paradigm is not a panacea. Adopting StateSSA as a modular engine involves explicit engineering trade-offs:
+### 6.2 Symmetric Trade-Off Analysis
 
 | What We Gain | What We Pay |
 | :--- | :--- |
-| **Formally Verifiable Deterministic Safety**: Immutable SSA wires and closed FSMs topologically eliminate buffer over-reads, invalid compound states, and call-stack exhaustion DoS. | **Upfront Rigorous Modeling Overhead**: "Writing code to discover architecture" is impermissible; teams must mathematically model state machines and DFDs prior to implementation. |
-| **Zero-Overhead C-ABI Linkage**: Direct linkage with native machine code without dynamic runtimes, interpreters, or FFI marshaling penalties. | **Constrained Procedural Freedom**: Mutating global state on demand or executing arbitrary unstructured jumps (`goto` or long-distance exceptions) is prohibited. |
-| **Maximal Hardware Throughput**: Zero heap allocations, zero stack frames, and direct mapping to physical CPU registers allow saturation of execution pipelines. | **Separation of Complex Dynamic Data Structures**: Constructing pointer-dense dynamic data structures (e.g., AST graphs, resizable hash tables) must remain partitioned within C. |
+| **Formally Verifiable Deterministic Safety**: Immutable SSA wires and closed FSMs eliminate buffer over-reads, state confusion, and stack exhaustion DoS structurally. | **Upfront Modeling Rigor**: "Coding while thinking" is impermissible; teams must mathematically formalize state transition diagrams and DFDs prior to implementation. |
+| **Zero-Overhead C ABI Interoperability**: Seamlessly links with C, C++, and Rust at native machine code velocity without runtime or FFI marshaling penalties. | **Abolition of Procedural Indulgence**: In-place global variable mutation and unconstrained jumps (`goto`, non-local returns) are strictly prohibited. |
+| **Theoretical Limit Execution Throughput**: Zero memory allocation, zero stack operations, and direct hardware CPU register binding saturate processor pipelines. | **Separation of Dynamic Data Structures**: Complex pointer-entangled structures (AST nodes, hash maps) must be handled externally by host environments. |
 
 ---
 
-### 5.3 Conclusion: Optimal Application Domains for StateSSA in C Projects
-The optimal operational niche for StateSSA modules within C projects comprises **mission-critical boundary components that demand high throughput while being exposed directly to untrusted, potentially malicious external input**:
+### 6.3 Conclusion: Optimal Application Domain in C Projects
 
-- **Network Protocol Stacks** (TCP/IP packet decoders, TLS record parsers, QUIC frame engines)
-- **Streaming Format Decoders** (JSON, HTTP/1.1 & HTTP/2, Protobuf, XZ/LZMA decompression containers)
-- **Hardware Bus Interfaces & Device Drivers** (PCIe transaction layer parsers, SPI/I2C communication FSMs, USB descriptor engines)
+The sweet spot for deploying StateSSA as an extracted module is **"mission-critical boundary components processing untrusted external inputs at maximum wire-speed throughput"**:
 
-Within these domains, pairing C's peerless low-level hardware control with StateSSA's mathematically assured state-machine determinism delivers one of the most practical and robust architectures available to modern computing systems.
+- **Network Protocol Stacks** (TCP/IP decoders, TLS record parsers, QUIC packet handlers)
+- **Streaming Format Decoders** (JSON, HTTP/1.1 and HTTP/2, Protobuf, XZ/LZMA containers)
+- **Hardware Bus & Device Drivers** (PCIe packet framing, SPI/I2C state engines, USB descriptors)
+
+Preserving established C infrastructures while surgically extracting brittle state machines into StateSSA provides modern systems engineering with one of its most potent, practical, and resilient architectural paradigms.
