@@ -124,9 +124,9 @@ SSAC ?= $(CURDIR)/bin/ssac
 CLANG ?= clang
 PYTHON ?= python3
 
-.PHONY: all test clean 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math 07_simd_vivaldi_winter 08_midi_player
+.PHONY: all test clean 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math 07_simd_vivaldi_winter 08_midi_player 09_benchmarks
 
-all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math 07_simd_vivaldi_winter 08_midi_player
+all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_math 07_simd_vivaldi_winter 08_midi_player 09_benchmarks
 	@echo "All samples built successfully."
 
 01_hello_world:
@@ -169,6 +169,11 @@ all: 01_hello_world 02_simple_loop 03_parallel_sum 04_xz 05_web_server 06_fixed_
 	$(SSAC) samples/08_midi_player/midi_player.ssa -o build/08/midi_player.ll
 	$(CLANG) -O3 build/08/midi_player.ll -lm -o build/08/midi_player
 
+09_benchmarks:
+	@echo "--- Building and Running v0.15.0 Benchmarks (03 Distinct, 04 Network) ---"
+	@cd benchmarks/03_distinct && bash run_bench.sh
+	@cd benchmarks/04_network && bash run_bench.sh
+
 test: all
 	@echo ""
 	@echo "============================================================"
@@ -209,6 +214,10 @@ test: all
 	@test -s build/08/test_stereo.wav && echo "08_midi_player Stereo WAV generated successfully!"
 	@./build/08/midi_player samples/08_midi_player/test_c_major.mid -o build/08/test_mono.wav --mono
 	@test -s build/08/test_mono.wav && echo "08_midi_player Mono WAV generated successfully!"
+	@echo ""
+	@echo "--- [Test 9/9] 09_benchmarks ---"
+	@test -s benchmarks/03_distinct/bench_distinct && echo "Benchmark 03 verified!"
+	@test -s benchmarks/04_network/bench_network && echo "Benchmark 04 verified!"
 	@echo ""
 	@echo "============================================================"
 	@echo ">>> ALL SAMPLES PASSED 100% ON STAGE-3 BINARY COMPILER! <<<"

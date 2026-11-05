@@ -94,25 +94,35 @@ type StateDef = {
 // 7. マシン引数 & マシン定義 (MachineDef)
 // ----------------------------------------------------------------------------
 type MachineParam = {
-    name_ptr: *u8,
-    name_len: u32,
-    type_ptr: *u8,
-    type_len: u32
+    name_ptr:    *u8,
+    name_len:    u32,
+    pad0:        u32,
+    type_ptr:    *u8,
+    type_len:    u32,
+    is_distinct: u32
 };
 
 type MachineDef = {
     name_ptr:     *u8,
     name_len:     u32,
+    pad0:         u32,
     params:       *MachineParam,
     param_count:  u32,
+    pad1:         u32,
     ret_type_ptr: *u8,
     ret_type_len: u32,
+    pad2:         u32,
     regs:         *RegDef,
     reg_count:    u32,
+    pad3:         u32,
     wires:        *WireDef,
     wire_count:   u32,
+    pad4:         u32,
     state_defs:   *StateDef,
-    state_count:  u32
+    state_count:  u32,
+    is_sealed:    u32,
+    pad5:         u32,
+    pad6:         u32
 };
 
 // ----------------------------------------------------------------------------
@@ -128,8 +138,43 @@ type TypeField = {
 type TypeDef = {
     name_ptr:    *u8,
     name_len:    u32,
+    pad0:        u32,
     fields:      *TypeField,
-    field_count: u32
+    field_count: u32,
+    kind:        u32,       // 0: STRUCT, 1: NEWTYPE, 2: BOUNDED, 3: PTR_ALIAS
+    has_bounds:  u32,       // 1: bounded, 0: normal
+    base_len:    u32,
+    base_ptr:    *u8,
+    min_len:     u32,
+    max_len:     u32,
+    min_ptr:     *u8,
+    max_ptr:     *u8
+};
+
+// ----------------------------------------------------------------------------
+// 8.5 ネットワーク定義 (NetworkDef & NetworkNode)
+// ----------------------------------------------------------------------------
+type NetworkNode = {
+    node_id_p:   *u8,
+    node_id_l:   u32,
+    pad0:        u32,
+    mach_name_p: *u8,
+    mach_name_l: u32,
+    pad1:        u32
+};
+
+type NetworkDef = {
+    name_ptr:       *u8,
+    name_len:       u32,
+    param_count:    u32,
+    params:         *MachineParam,
+    ret_type_ptr:   *u8,
+    ret_type_len:   u32,
+    node_count:     u32,
+    nodes:          *NetworkNode,
+    pipeline_elems: *MemSlice,
+    pipeline_count: u32,
+    pad:            u32
 };
 
 // ----------------------------------------------------------------------------
@@ -150,10 +195,14 @@ type ExternFn = {
 type ProgramDef = {
     types:         *TypeDef,
     type_count:    u32,
+    pad0:          u32,
     externs:       *ExternFn,
     extern_count:  u32,
+    pad1:          u32,
     machines:      *MachineDef,
-    machine_count: u32
+    machine_count: u32,
+    network_count: u32,
+    networks:      *NetworkDef
 };
 
 // ----------------------------------------------------------------------------
@@ -739,6 +788,7 @@ machine parse_atom(ctx: *ParseContext) -> *ExprNode {
             kind == 33 => HandleQ64;    // Q64_LIT
             kind == 32 => HandleStr;    // STRING_LIT
             kind == 30 => HandleIdent;  // IDENT
+            kind == 25 => HandleIdent;  // 'node' (TOK_NODE = 25: Contextual identifier)
             kind == 16 => HandleCall;   // CALL
             kind == 70 => HandleDeref;  // '*'
             kind == 62 => HandleAddr;   // '&'
@@ -1734,111 +1784,200 @@ machine parse_states(ctx: *ParseContext, m: *MachineDef) -> i32 {
 // Type 定義パースマシン (parse_type)
 // ============================================================================
 
-machine parse_type(ctx: *ParseContext, out_t: *TypeDef) -> i32 {
+machine is_simd_type(s: *u8, len: u32) -> u32 {
     flow {
-        reg field_cnt:  u32 = 0;
-        reg cur_name_p: *u8 = null;
-        reg cur_name_l: u32 = 0;
+        reg i: u32 = 0;
+        wire has_more = i < len;
+        wire p = s + i;
+        wire c = *p;
+    }
+    states {
+        Entry: { _ => Loop [ i <= 0 ]; }
+        Loop: {
+            has_more == 0 => No;
+            c == 120      => Yes; // 'x'
+            _             => Loop [ i <= i + 1 ];
+        }
+        Yes: { _ => return 1; }
+        No:  { _ => return 0; }
+    }
+}
 
-        wire alloc = ctx.alloc;
+machine parse_bound_val(ctx: *ParseContext, out_slice: *TypeSlice) -> i32 {
+    flow {
         wire kind = call ctx_peek_kind(ctx);
-        wire is_rbrace = kind == 77; // '}'
-        wire is_star = kind == 70;   // '*'
+        wire is_minus = kind == 72; // '-'
     }
     states {
         Entry: {
-            let _ = call ctx_consume(ctx); // consume 'type' (18)
-            let name_tok = call ctx_consume(ctx); // IDENT
-            out_t.name_ptr <- name_tok.val_ptr;
-            out_t.name_len <- name_tok.val_len;
-
-            let ok_eq = call ctx_match(ctx, 69); // '='
-            ok_eq == 0 => ErrorType;
-
-            let cur_mf = ctx.max_fields;
-            let f_alloc_cnt = cur_mf + 64;
-            let f_alloc_bytes = f_alloc_cnt * 32;
-
-            let fields_mem = call bump_alloc(alloc, f_alloc_bytes, 8);
-            out_t.fields <- fields_mem;
-
-            // Check if alias pointer type: type Name = *Target;
-            is_star != 0 => ParsePointerAlias;
-            _            => StartStruct;
+            is_minus != 0 => ParseNegative;
+            _             => ParsePositive;
         }
-
-        ParsePointerAlias: {
-            let star_tok = call ctx_consume(ctx); // consume '*'
-            let target_tok = call ctx_consume(ctx); // Target IDENT
-            let ok_semi = call ctx_match(ctx, 66); // ';'
-            ok_semi == 0 => ErrorType;
-
-            let f0 = out_t.fields;
-            let target_p = target_tok.val_ptr;
-            let star_p = star_tok.val_ptr;
-            let target_l = target_tok.val_len;
-            let full_len = target_l + 1;
-            f0.name_ptr <- target_p;
-            f0.name_len <- 0;
-            f0.type_ptr <- star_p; // '*' から開始
-            f0.type_len <- full_len;
-            out_t.field_count <- 1;
+        ParseNegative: {
+            let m_tok = call ctx_consume(ctx);   // '-'
+            let num_tok = call ctx_consume(ctx); // INT_LIT or FLOAT_LIT
+            let num_len = num_tok.val_len;
+            out_slice.ptr <- m_tok.val_ptr;
+            out_slice.len <- num_len + 1;
             _ => return 0;
         }
-
-        StartStruct: {
-            let ok_lbrace = call ctx_match(ctx, 76); // '{'
-            ok_lbrace == 0 => ErrorType;
-            _ => FieldLoop [ field_cnt <= 0 ];
-        }
-
-        FieldLoop: {
-            is_rbrace != 0 => FinishFields;
-            _              => ParseField;
-        }
-
-        ParseField: {
-            let fname_tok = call ctx_consume(ctx); // fname IDENT
-            let ok_colon = call ctx_match(ctx, 65); // ':'
-            ok_colon == 0 => ErrorType;
-
-            let fn_p = fname_tok.val_ptr;
-            let fn_l = fname_tok.val_len;
-            _ => ParseFieldType [
-                cur_name_p <= fn_p,
-                cur_name_l <= fn_l
-            ];
-        }
-
-        ParseFieldType: {
-            let ts = call parse_type_slice(ctx);
-            let _ = call ctx_match(ctx, 67); // optional ','
-
-            let t_fields = out_t.fields;
-            let cur_f = t_fields + field_cnt;
-            let ts_p = ts.ptr;
-            let ts_l = ts.len;
-            cur_f.name_ptr <- cur_name_p;
-            cur_f.name_len <- cur_name_l;
-            cur_f.type_ptr <- ts_p;
-            cur_f.type_len <- ts_l;
-
-            let next_fc = field_cnt + 1;
-            _ => FieldLoop [ field_cnt <= next_fc ];
-        }
-
-        FinishFields: {
-            let _ = call ctx_consume(ctx); // consume '}'
-            let ok_semi = call ctx_match(ctx, 66); // ';'
-            ok_semi == 0 => ErrorType;
-            out_t.field_count <- field_cnt;
+        ParsePositive: {
+            let num_tok = call ctx_consume(ctx);
+            out_slice.ptr <- num_tok.val_ptr;
+            out_slice.len <- num_tok.val_len;
             _ => return 0;
         }
+    }
+}
 
-        ErrorType: {
+machine parse_bound_range(ctx: *ParseContext, out_t: *TypeDef) -> i32 {
+    flow {
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            let ok_lb = call ctx_match(ctx, 78); // '['
+            ok_lb == 0 => ErrorBound;
+
+            let s_min = call alloc_type_slice(alloc);
+            let ret_min = call parse_bound_val(ctx, s_min);
+            ret_min != 0 => ErrorBound;
+
+            let ok_dd = call ctx_match(ctx, 51); // '..' (DOTDOT)
+            ok_dd == 0 => ErrorBound;
+
+            let s_max = call alloc_type_slice(alloc);
+            let ret_max = call parse_bound_val(ctx, s_max);
+            ret_max != 0 => ErrorBound;
+
+            let ok_rb = call ctx_match(ctx, 79); // ']'
+            ok_rb == 0 => ErrorBound;
+
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorBound;
+
+            out_t.kind        <- 2; // BOUNDED
+            out_t.has_bounds  <- 1;
+            out_t.min_ptr     <- s_min.ptr;
+            out_t.min_len     <- s_min.len;
+            out_t.max_ptr     <- s_max.ptr;
+            out_t.max_len     <- s_max.len;
+            out_t.fields      <- null;
+            out_t.field_count <- 0;
+            _ => return 0;
+        }
+        ErrorBound: {
             ctx.error_code <- -26;
             _ => return -26;
         }
+    }
+}
+
+machine parse_struct_fields(ctx: *ParseContext, out_t: *TypeDef) -> i32 {
+    flow {
+        reg fc: u32 = 0;
+        reg fn_p: *u8 = null;
+        reg fn_l: u32 = 0;
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            let f_alloc_bytes = (ctx.max_fields + 64) * 32;
+            let fields_mem = call bump_alloc(alloc, f_alloc_bytes, 8);
+            out_t.fields     <- fields_mem;
+            out_t.kind       <- 0;
+            out_t.has_bounds <- 0;
+            out_t.base_ptr   <- null;
+            out_t.base_len   <- 0;
+            out_t.min_ptr    <- null;
+            out_t.min_len    <- 0;
+            out_t.max_ptr    <- null;
+            out_t.max_len    <- 0;
+            _ => CheckLoop [ fc <= 0 ];
+        }
+        CheckLoop: {
+            let k = call ctx_peek_kind(ctx);
+            k == 77 => Finish; // '}'
+            _       => ParseField;
+        }
+        ParseField: {
+            let fname = call ctx_consume(ctx);
+            let ok_c = call ctx_match(ctx, 65); // ':'
+            ok_c == 0 => Error;
+            _ => ParseType [ fn_p <= fname.val_ptr, fn_l <= fname.val_len ];
+        }
+        ParseType: {
+            let ts = call parse_type_slice(ctx);
+            let _ = call ctx_match(ctx, 67); // optional ','
+            let f = out_t.fields + fc;
+            f.name_ptr <- fn_p;
+            f.name_len <- fn_l;
+            f.type_ptr <- ts.ptr;
+            f.type_len <- ts.len;
+            _ => CheckLoop [ fc <= fc + 1 ];
+        }
+        Finish: {
+            let _ = call ctx_consume(ctx); // '}'
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => Error;
+            out_t.field_count <- fc;
+            _ => return 0;
+        }
+        Error: {
+            ctx.error_code <- -26;
+            _ => return -26;
+        }
+    }
+}
+
+machine parse_type(ctx: *ParseContext, out_t: *TypeDef) -> i32 {
+    flow {}
+    states {
+        Entry: {
+            let _ = call ctx_consume(ctx); // 'type' (18)
+            let name_tok = call ctx_consume(ctx);
+            out_t.name_ptr <- name_tok.val_ptr;
+            out_t.name_len <- name_tok.val_len;
+            let ok_eq = call ctx_match(ctx, 69); // '='
+            ok_eq == 0 => ErrorType;
+            let k = call ctx_peek_kind(ctx);
+            k == 76 => StartStruct;
+            _       => ParseSingleType;
+        }
+        StartStruct: {
+            let _ = call ctx_consume(ctx); // '{'
+            let ret_s = call parse_struct_fields(ctx, out_t);
+            _ => return ret_s;
+        }
+        ParseSingleType: {
+            let ts = call parse_type_slice(ctx);
+            out_t.base_ptr <- ts.ptr;
+            out_t.base_len <- ts.len;
+            let next_k = call ctx_peek_kind(ctx);
+            next_k == 78 => CheckBounded;
+            next_k == 66 => FinishNewtype;
+            _            => ErrorType;
+        }
+        CheckBounded: {
+            let is_simd = call is_simd_type(out_t.base_ptr, out_t.base_len);
+            is_simd != 0 => ErrorSimd;
+            let ret_b = call parse_bound_range(ctx, out_t);
+            _ => return ret_b;
+        }
+        FinishNewtype: {
+            let _ = call ctx_consume(ctx); // ';'
+            out_t.kind        <- 1;
+            out_t.has_bounds  <- 0;
+            out_t.min_ptr     <- null;
+            out_t.min_len     <- 0;
+            out_t.max_ptr     <- null;
+            out_t.max_len     <- 0;
+            out_t.fields      <- null;
+            out_t.field_count <- 0;
+            _ => return 0;
+        }
+        ErrorSimd: { ctx.error_code <- -34; _ => return -34; }
+        ErrorType: { ctx.error_code <- -26; _ => return -26; }
     }
 }
 
@@ -1917,10 +2056,33 @@ machine parse_extern(ctx: *ParseContext, out_externs: *ExternFn, base_idx: u32) 
 
             let pname_p = pname_tok.val_ptr;
             let pname_l = pname_tok.val_len;
-            _ => ParseParamType [
+
+            // [Shield 2]: 明示的ゼロ初期化
+            let fn_idx = base_idx + fn_cnt;
+            let cur_fn = out_externs + fn_idx;
+            let fn_params = cur_fn.params;
+            let p_slot = fn_params + param_cnt;
+            p_slot.is_distinct <- 0;
+
+            let next_k = call ctx_peek_kind(ctx);
+            next_k == 23 => ConsumeExternDistinct [
                 cur_pname_p <= pname_p,
                 cur_pname_l <= pname_l
             ];
+            _            => ParseParamType [
+                cur_pname_p <= pname_p,
+                cur_pname_l <= pname_l
+            ];
+        }
+
+        ConsumeExternDistinct: {
+            let _ = call ctx_consume(ctx); // consume 'distinct'
+            let fn_idx = base_idx + fn_cnt;
+            let cur_fn = out_externs + fn_idx;
+            let fn_params = cur_fn.params;
+            let p_slot = fn_params + param_cnt;
+            p_slot.is_distinct <- 1;
+            _ => ParseParamType;
         }
 
         ParseParamType: {
@@ -1946,6 +2108,10 @@ machine parse_extern(ctx: *ParseContext, out_externs: *ExternFn, base_idx: u32) 
             let _ = call ctx_consume(ctx); // consume ')'
             let ok_arrow = call ctx_match(ctx, 42); // '->'
             ok_arrow == 0 => ErrorExtern;
+
+            // 戻り値型での distinct は禁止
+            let ret_k = call ctx_peek_kind(ctx);
+            ret_k == 23 => ErrorExtern;
 
             let ts_ret = call parse_type_slice(ctx);
             let ok_semi = call ctx_match(ctx, 66); // ';'
@@ -2018,6 +2184,7 @@ machine parse_machine(ctx: *ParseContext, out_m: *MachineDef) -> i32 {
             let name_tok = call ctx_consume(ctx); // IDENT
             out_m.name_ptr <- name_tok.val_ptr;
             out_m.name_len <- name_tok.val_len;
+            out_m.is_sealed <- 0; // 初期状態は非封印
 
             let ok_lparen = call ctx_match(ctx, 74); // '('
             ok_lparen == 0 => ErrorMachine;
@@ -2040,10 +2207,29 @@ machine parse_machine(ctx: *ParseContext, out_m: *MachineDef) -> i32 {
 
             let pname_p = pname_tok.val_ptr;
             let pname_l = pname_tok.val_len;
-            _ => ParseParamType [
+
+            // [Shield 2]: 明示的ゼロ初期化
+            let m_params = out_m.params;
+            let p_slot = m_params + param_cnt;
+            p_slot.is_distinct <- 0;
+
+            let next_k = call ctx_peek_kind(ctx);
+            next_k == 23 => ConsumeParamDistinct [
                 cur_pname_p <= pname_p,
                 cur_pname_l <= pname_l
             ];
+            _            => ParseParamType [
+                cur_pname_p <= pname_p,
+                cur_pname_l <= pname_l
+            ];
+        }
+
+        ConsumeParamDistinct: {
+            let _ = call ctx_consume(ctx); // consume 'distinct'
+            let m_params = out_m.params;
+            let p_slot = m_params + param_cnt;
+            p_slot.is_distinct <- 1;
+            _ => ParseParamType;
         }
 
         ParseParamType: {
@@ -2054,6 +2240,13 @@ machine parse_machine(ctx: *ParseContext, out_m: *MachineDef) -> i32 {
             let p_slot = m_params + param_cnt;
             let ts_p = ts.ptr;
             let ts_l = ts.len;
+
+            // distinct が指定された場合、ポインタ型であることを検証
+            let dist_flag = p_slot.is_distinct;
+            let first_ch = *ts_p;
+            let is_not_ptr = (dist_flag != 0) & (first_ch != 42); // 42 == '*'
+            is_not_ptr != 0 => ErrorMachine;
+
             p_slot.name_ptr <- cur_pname_p;
             p_slot.name_len <- cur_pname_l;
             p_slot.type_ptr <- ts_p;
@@ -2069,6 +2262,10 @@ machine parse_machine(ctx: *ParseContext, out_m: *MachineDef) -> i32 {
 
             let ok_arrow = call ctx_match(ctx, 42); // '->'
             ok_arrow == 0 => ErrorMachine;
+
+            // 戻り値型での distinct は禁止
+            let ret_k = call ctx_peek_kind(ctx);
+            ret_k == 23 => ErrorMachine;
 
             let ts_ret = call parse_type_slice(ctx);
             let ts_ret_p = ts_ret.ptr;
@@ -2145,68 +2342,46 @@ machine is_fn_token(tok: *Token) -> u32 {
     }
 }
 
-machine count_program_entities(tokens: *Token, tok_cnt: u32, out_types: *u32, out_externs: *u32, out_machines: *u32) -> u32 {
+machine count_program_entities(tokens: *Token, tok_cnt: u32, out_t: *u32, out_e: *u32, out_m: *u32, out_net: *u32) -> u32 {
     flow {
-        reg i:         u32 = 0;
-        reg typ_cnt:   u32 = 0;
-        reg ext_cnt:   u32 = 0;
-        reg mac_cnt:   u32 = 0;
-        reg in_extern: u32 = 0;
-
-        wire has_more   = i < tok_cnt;
-        wire tok_ptr    = tokens + i;
-        wire kind       = tok_ptr.kind;
-
-        wire is_typ     = kind == 18; // TokenType.TYPE
-        wire is_ext     = kind == 17; // TokenType.EXTERN
-        wire is_mac     = kind == 10; // TokenType.MACHINE
-        wire is_rbrace  = kind == 77; // '}'
-
-        wire next_i   = i + 1;
-        wire next_typ = typ_cnt + 1;
-        wire next_ext = ext_cnt + 1;
-        wire next_mac = mac_cnt + 1;
+        reg i: u32 = 0;
+        reg tc: u32 = 0;
+        reg ec: u32 = 0;
+        reg mc: u32 = 0;
+        reg nc: u32 = 0;
+        reg in_ext: u32 = 0;
+        wire has_more  = i < tok_cnt;
+        wire tok_ptr   = tokens + i;
+        wire kind      = tok_ptr.kind;
+        wire is_typ    = kind == 18; // TokenType.TYPE
+        wire is_ext    = kind == 17; // TokenType.EXTERN
+        wire is_mac    = kind == 10; // TokenType.MACHINE
+        wire is_net    = kind == 24; // TokenType.NETWORK
+        wire is_rbrace = kind == 77; // '}'
+        wire next_i    = i + 1;
     }
     states {
-        Entry: {
-            _ => Loop [ i <= 0, typ_cnt <= 0, ext_cnt <= 0, mac_cnt <= 0, in_extern <= 0 ];
-        }
+        Entry: { _ => Loop [ i <= 0, tc <= 0, ec <= 0, mc <= 0, nc <= 0, in_ext <= 0 ]; }
         Loop: {
-            has_more == 0  => Finish;
-            is_ext != 0    => StartExtern;
-            is_typ != 0    => IncType;
-            is_mac != 0    => IncMac;
-            in_extern != 0 => CheckInExtern;
-            _              => Next;
+            has_more == 0 => Finish;
+            is_ext != 0   => Loop [ in_ext <= 1, i <= next_i ];
+            is_typ != 0   => Loop [ tc <= tc + 1, i <= next_i ];
+            is_mac != 0   => Loop [ mc <= mc + 1, i <= next_i ];
+            is_net != 0   => Loop [ nc <= nc + 1, i <= next_i ];
+            in_ext != 0   => CheckInExtern;
+            _             => Loop [ i <= next_i ];
         }
         CheckInExtern: {
-            is_rbrace != 0 => EndExtern;
+            is_rbrace != 0 => Loop [ in_ext <= 0, i <= next_i ];
             let is_fn = call is_fn_token(tok_ptr);
-            is_fn != 0     => IncExt;
-            _              => Next;
-        }
-        StartExtern: {
-            _ => Loop [ in_extern <= 1, i <= next_i ];
-        }
-        EndExtern: {
-            _ => Loop [ in_extern <= 0, i <= next_i ];
-        }
-        IncType: {
-            _ => Loop [ typ_cnt <= next_typ, i <= next_i ];
-        }
-        IncExt: {
-            _ => Loop [ ext_cnt <= next_ext, i <= next_i ];
-        }
-        IncMac: {
-            _ => Loop [ mac_cnt <= next_mac, i <= next_i ];
-        }
-        Next: {
-            _ => Loop [ i <= next_i ];
+            is_fn != 0     => Loop [ ec <= ec + 1, i <= next_i ];
+            _              => Loop [ i <= next_i ];
         }
         Finish: {
-            *out_types    <- typ_cnt;
-            *out_externs  <- ext_cnt;
-            *out_machines <- mac_cnt;
+            *out_t   <- tc;
+            *out_e   <- ec;
+            *out_m   <- mc;
+            *out_net <- nc;
             _ => return 0;
         }
     }
@@ -2457,38 +2632,260 @@ machine enqueue_include_path(ctx: *ParseContext, p_str: *u8, l_str: u32) -> u32 
 // ============================================================================
 // ProgramDef 初期化マシン (init_program_storage)
 // ============================================================================
-machine init_program_storage(prog: *ProgramDef, alloc: *BumpAlloc, max_types: u32, max_externs: u32, max_machines: u32) -> void {
+machine init_program_storage(
+    prog: *ProgramDef,
+    alloc: *BumpAlloc,
+    max_types: u32,
+    max_externs: u32,
+    max_machines: u32,
+    max_networks: u32
+) -> void {
     flow {
-        wire bytes_t = max_types * 32;
-        wire bytes_e = max_externs * 48;
-        wire bytes_m = max_machines * 96;
+        wire bytes_t   = max_types * 72;    // TypeDef: 72 bytes
+        wire bytes_e   = max_externs * 48;  // ExternFn: 48 bytes
+        wire bytes_m   = max_machines * 104;// MachineDef: 104 bytes
+        wire bytes_net = max_networks * 64; // NetworkDef: 64 bytes
     }
     states {
         Entry: {
-            let types_mem    = call bump_alloc(alloc, bytes_t, 8);
-            let externs_mem  = call bump_alloc(alloc, bytes_e, 8);
-            let machines_mem = call bump_alloc(alloc, bytes_m, 8);
+            let mem_t   = call bump_alloc(alloc, bytes_t, 8);
+            let mem_e   = call bump_alloc(alloc, bytes_e, 8);
+            let mem_m   = call bump_alloc(alloc, bytes_m, 8);
+            let mem_net = call bump_alloc(alloc, bytes_net, 8);
 
-            prog.types         <- types_mem;
-            prog.externs       <- externs_mem;
-            prog.machines      <- machines_mem;
+            prog.types         <- mem_t;
+            prog.externs       <- mem_e;
+            prog.machines      <- mem_m;
+            prog.networks      <- mem_net;
             prog.type_count    <- 0;
             prog.extern_count  <- 0;
             prog.machine_count <- 0;
+            prog.network_count <- 0;
             _ => return;
+        }
+    }
+}
+
+machine parser_find_network(nets: *NetworkDef, count: u32, name_p: *u8, name_l: u32) -> *NetworkDef {
+    flow {
+        reg i: u32 = 0;
+        wire has_more = i < count;
+        wire cur_n = nets + i;
+        wire match = call parser_str_eq(cur_n.name_ptr, cur_n.name_len, name_p, name_l);
+    }
+    states {
+        Entry: { _ => Loop [ i <= 0 ]; }
+        Loop: {
+            has_more == 0 => NotFound;
+            match != 0    => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found:    { _ => return cur_n; }
+        NotFound: { _ => return null; }
+    }
+}
+
+machine parse_network_nodes(ctx: *ParseContext, out_net: *NetworkDef) -> i32 {
+    flow {
+        reg node_cnt: u32 = 0;
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            let nodes_mem = call bump_alloc(alloc, 1024, 8);
+            out_net.nodes <- cast(*NetworkNode) nodes_mem;
+            _ => Loop [ node_cnt <= 0 ];
+        }
+        Loop: {
+            let k = call ctx_peek_kind(ctx);
+            k == 25 => ParseOneNode; // 'node'
+            _       => Finish;
+        }
+        ParseOneNode: {
+            let _ = call ctx_consume(ctx); // 'node'
+            let id_tok = call ctx_consume(ctx);
+            let ok_colon = call ctx_match(ctx, 65); // ':'
+            ok_colon == 0 => ErrorNode;
+
+            let m_tok = call ctx_consume(ctx);
+            let ok_semi = call ctx_match(ctx, 66); // ';'
+            ok_semi == 0 => ErrorNode;
+
+            let n_list = out_net.nodes;
+            let n_slot = n_list + node_cnt;
+            n_slot.node_id_p   <- id_tok.val_ptr;
+            n_slot.node_id_l   <- id_tok.val_len;
+            n_slot.mach_name_p <- m_tok.val_ptr;
+            n_slot.mach_name_l <- m_tok.val_len;
+            n_slot.pad0 <- 0;
+            n_slot.pad1 <- 0;
+
+            _ => Loop [ node_cnt <= node_cnt + 1 ];
+        }
+        Finish: {
+            out_net.node_count <- node_cnt;
+            _ => return 0;
+        }
+        ErrorNode: {
+            ctx.error_code <- -35;
+            _ => return -35;
+        }
+    }
+}
+
+machine parse_network_connect(ctx: *ParseContext, out_net: *NetworkDef) -> i32 {
+    flow {
+        reg elem_cnt: u32 = 0;
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            let ok_conn = call ctx_match(ctx, 26); // 'connect'
+            ok_conn == 0 => ErrorConnect;
+            let ok_lb = call ctx_match(ctx, 76); // '{'
+            ok_lb == 0 => ErrorConnect;
+
+            let elems_mem = call bump_alloc(alloc, 512, 8);
+            out_net.pipeline_elems <- cast(*MemSlice) elems_mem;
+            _ => Loop [ elem_cnt <= 0 ];
+        }
+        Loop: {
+            let id_tok = call ctx_consume(ctx);
+            let el_list = out_net.pipeline_elems;
+            let el_slot = el_list + elem_cnt;
+            el_slot.ptr <- id_tok.val_ptr;
+            el_slot.len <- id_tok.val_len;
+
+            let next_ec = elem_cnt + 1;
+            let k = call ctx_peek_kind(ctx);
+            k == 41 => ContinuePipe [ elem_cnt <= next_ec ]; // '>>'
+            k == 66 => FinishPipe   [ elem_cnt <= next_ec ]; // ';'
+            _       => ErrorConnect;
+        }
+        ContinuePipe: {
+            let _ = call ctx_consume(ctx); // '>>'
+            _ => Loop;
+        }
+        FinishPipe: {
+            let _ = call ctx_consume(ctx); // ';'
+            let ok_rb = call ctx_match(ctx, 77); // '}'
+            ok_rb == 0 => ErrorConnect;
+            out_net.pipeline_count <- elem_cnt;
+            _ => return 0;
+        }
+        ErrorConnect: {
+            ctx.error_code <- -36;
+            _ => return -36;
+        }
+    }
+}
+
+machine parse_network_params(ctx: *ParseContext, out_net: *NetworkDef) -> i32 {
+    flow {
+        reg pc: u32 = 0;
+        reg pn_p: *u8 = null;
+        reg pn_l: u32 = 0;
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            let mem = call bump_alloc(alloc, 512, 8);
+            out_net.params <- cast(*MachineParam) mem;
+            _ => CheckLoop [ pc <= 0 ];
+        }
+        CheckLoop: {
+            let k = call ctx_peek_kind(ctx);
+            k == 75 => Finish; // ')'
+            _       => ParseParam;
+        }
+        ParseParam: {
+            let pname = call ctx_consume(ctx);
+            let ok_c = call ctx_match(ctx, 65); // ':'
+            ok_c == 0 => Error;
+            _ => ParseType [ pn_p <= pname.val_ptr, pn_l <= pname.val_len ];
+        }
+        ParseType: {
+            let ts = call parse_type_slice(ctx);
+            let _ = call ctx_match(ctx, 67); // optional ','
+            let p_slot = out_net.params + pc;
+            p_slot.name_ptr <- pn_p;
+            p_slot.name_len <- pn_l;
+            p_slot.type_ptr <- ts.ptr;
+            p_slot.type_len <- ts.len;
+            p_slot.is_distinct <- 0;
+            p_slot.pad0 <- 0;
+            _ => CheckLoop [ pc <= pc + 1 ];
+        }
+        Finish: {
+            let _ = call ctx_consume(ctx); // ')'
+            out_net.param_count <- pc;
+            _ => return 0;
+        }
+        Error: {
+            ctx.error_code <- -37;
+            _ => return -37;
+        }
+    }
+}
+
+machine parse_network(ctx: *ParseContext, out_net: *NetworkDef) -> i32 {
+    flow {}
+    states {
+        Entry: {
+            let _ = call ctx_consume(ctx); // 'network' (24)
+            let name_tok = call ctx_consume(ctx);
+            out_net.name_ptr <- name_tok.val_ptr;
+            out_net.name_len <- name_tok.val_len;
+            let ok_lp = call ctx_match(ctx, 74); // '('
+            ok_lp == 0 => ErrorNet;
+            _ => ParseParams;
+        }
+        ParseParams: {
+            let ret_p = call parse_network_params(ctx, out_net);
+            ret_p != 0 => ForwardError;
+            let ok_arrow = call ctx_match(ctx, 42); // '->'
+            ok_arrow == 0 => ErrorNet;
+            let ts_ret = call parse_type_slice(ctx);
+            out_net.ret_type_ptr <- ts_ret.ptr;
+            out_net.ret_type_len <- ts_ret.len;
+            let ok_lb = call ctx_match(ctx, 76); // '{'
+            ok_lb == 0 => ErrorNet;
+            _ => ParseNodes;
+        }
+        ParseNodes: {
+            let ret_nodes = call parse_network_nodes(ctx, out_net);
+            ret_nodes != 0 => ForwardError;
+            _ => ParseConnect;
+        }
+        ParseConnect: {
+            let ret_conn = call parse_network_connect(ctx, out_net);
+            ret_conn != 0 => ForwardError;
+            _ => FinishNet;
+        }
+        FinishNet: {
+            let ok_rb = call ctx_match(ctx, 77); // '}'
+            ok_rb == 0 => ErrorNet;
+            _ => return 0;
+        }
+        ForwardError: {
+            _ => return ctx.error_code;
+        }
+        ErrorNet: {
+            ctx.error_code <- -37;
+            _ => return -37;
         }
     }
 }
 
 // ============================================================================
 // 追記型ファイル宣言パーサ (parse_file_declarations)
-// 既存の out_prog に追記し、二重定義を厳格に検査する
 // ============================================================================
 machine parse_file_declarations(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
     flow {
         reg typ_cnt: u32 = 0;
         reg ext_cnt: u32 = 0;
         reg mac_cnt: u32 = 0;
+        reg net_cnt: u32 = 0;
 
         wire kind = call ctx_peek_kind(ctx);
         wire is_eof = kind == 99; // EOF
@@ -2496,13 +2893,15 @@ machine parse_file_declarations(ctx: *ParseContext, out_prog: *ProgramDef) -> i3
         wire is_typ = kind == 18; // TYPE
         wire is_ext = kind == 17; // EXTERN
         wire is_mac = kind == 10; // MACHINE
+        wire is_net = kind == 24; // NETWORK
     }
     states {
         Entry: {
             let tc = out_prog.type_count;
             let ec = out_prog.extern_count;
             let mc = out_prog.machine_count;
-            _ => TopLoop [ typ_cnt <= tc, ext_cnt <= ec, mac_cnt <= mc ];
+            let nc = out_prog.network_count;
+            _ => TopLoop [ typ_cnt <= tc, ext_cnt <= ec, mac_cnt <= mc, net_cnt <= nc ];
         }
 
         TopLoop: {
@@ -2511,15 +2910,16 @@ machine parse_file_declarations(ctx: *ParseContext, out_prog: *ProgramDef) -> i3
             is_typ != 0 => HandleType;
             is_ext != 0 => HandleExtern;
             is_mac != 0 => HandleMachine;
+            is_net != 0 => HandleNetwork;
             _           => ErrorTopLevel;
         }
 
         HandleInclude: {
-            let _ = call ctx_consume(ctx); // consume 'include' (21)
-            let tok = call ctx_peek_tok(ctx); // STRING_LIT
+            let _ = call ctx_consume(ctx); // 'include'
+            let tok = call ctx_peek_tok(ctx);
             let p_str = tok.val_ptr;
             let l_str = tok.val_len;
-            let _ = call ctx_consume(ctx); // consume STRING_LIT
+            let _ = call ctx_consume(ctx);
             let ok_semi = call ctx_match(ctx, 66); // ';'
             ok_semi == 0 => ErrorTopLevel;
 
@@ -2533,7 +2933,6 @@ machine parse_file_declarations(ctx: *ParseContext, out_prog: *ProgramDef) -> i3
             let ret_t = call parse_type(ctx, cur_t);
             ret_t != 0 => ForwardError;
 
-            // 二重定義検査 (0 .. typ_cnt - 1)
             let exist_t = call parser_find_type(p_types, typ_cnt, cur_t.name_ptr, cur_t.name_len);
             exist_t != null => ErrorDuplicateType;
 
@@ -2555,7 +2954,6 @@ machine parse_file_declarations(ctx: *ParseContext, out_prog: *ProgramDef) -> i3
             let ret_m = call parse_machine(ctx, cur_m);
             ret_m != 0 => ForwardError;
 
-            // 二重定義検査 (0 .. mac_cnt - 1)
             let exist_m = call parser_find_machine(p_macs, mac_cnt, cur_m.name_ptr, cur_m.name_len);
             exist_m != null => ErrorDuplicateMachine;
 
@@ -2563,10 +2961,24 @@ machine parse_file_declarations(ctx: *ParseContext, out_prog: *ProgramDef) -> i3
             _ => TopLoop [ mac_cnt <= next_mc ];
         }
 
+        HandleNetwork: {
+            let p_nets = out_prog.networks;
+            let cur_net = p_nets + net_cnt;
+            let ret_net = call parse_network(ctx, cur_net);
+            ret_net != 0 => ForwardError;
+
+            let exist_n = call parser_find_network(p_nets, net_cnt, cur_net.name_ptr, cur_net.name_len);
+            exist_n != null => ErrorDuplicateNetwork;
+
+            let next_nc = net_cnt + 1;
+            _ => TopLoop [ net_cnt <= next_nc ];
+        }
+
         FinishFile: {
             out_prog.type_count <- typ_cnt;
             out_prog.extern_count <- ext_cnt;
             out_prog.machine_count <- mac_cnt;
+            out_prog.network_count <- net_cnt;
             _ => return 0;
         }
 
@@ -2583,6 +2995,11 @@ machine parse_file_declarations(ctx: *ParseContext, out_prog: *ProgramDef) -> i3
         ErrorDuplicateMachine: {
             ctx.error_code <- -32;
             _ => return -32;
+        }
+
+        ErrorDuplicateNetwork: {
+            ctx.error_code <- -38;
+            _ => return -38;
         }
 
         ErrorTopLevel: {
@@ -2606,17 +3023,20 @@ machine parse_program(ctx: *ParseContext, out_prog: *ProgramDef) -> i32 {
             let ptr_t = counts_buf + 0;
             let ptr_e = counts_buf + 4;
             let ptr_m = counts_buf + 8;
-            let _ = call count_program_entities(toks, cnt, ptr_t, ptr_e, ptr_m);
+            let ptr_net = counts_buf + 12;
+            let _ = call count_program_entities(toks, cnt, ptr_t, ptr_e, ptr_m, ptr_net);
 
             let num_t = *ptr_t;
             let num_e = *ptr_e;
             let num_m = *ptr_m;
+            let num_net = *ptr_net;
 
             let cap_t = num_t + 1;
             let cap_e = num_e + 1;
             let cap_m = num_m + 1;
+            let cap_net = num_net + 1;
 
-            let _ = call init_program_storage(out_prog, alloc, cap_t, cap_e, cap_m);
+            let _ = call init_program_storage(out_prog, alloc, cap_t, cap_e, cap_m, cap_net);
             let ret = call parse_file_declarations(ctx, out_prog);
             _ => return ret;
         }
@@ -2719,3 +3139,32 @@ machine ssac_get_machine_info(prog: *ProgramDef, mac_idx: u32, out_regs: *u32, o
         }
     }
 }
+
+// ssac_get_program_v15_info: C-ABI 境界テスト用アクセサ (v0.15.0 networks)
+machine ssac_get_program_v15_info(prog: *ProgramDef, out_networks: *u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            let nc = prog.network_count;
+            *out_networks <- nc;
+            _ => return 0;
+        }
+    }
+}
+
+// ssac_get_network_info: ネットワーク内部構成検証アクセサ
+machine ssac_get_network_info(prog: *ProgramDef, net_idx: u32, out_nodes: *u32, out_pipes: *u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            let p_nets = prog.networks;
+            let net = p_nets + net_idx;
+            let nc = net.node_count;
+            let pc = net.pipeline_count;
+            *out_nodes <- nc;
+            *out_pipes <- pc;
+            _ => return 0;
+        }
+    }
+}
+

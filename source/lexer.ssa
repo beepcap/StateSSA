@@ -18,12 +18,13 @@ type Token = {
 // Keywords: 10..29
 //   10: MACHINE, 11: FLOW, 12: STATES, 13: REG, 14: WIRE, 15: LET, 16: CALL
 //   17: EXTERN, 18: TYPE, 19: RETURN, 20: PANIC, 21: INCLUDE, 22: CAST
+//   23: DISTINCT, 24: NETWORK, 25: NODE, 26: CONNECT
 // Literals & Identifiers: 30..39
 //   30: IDENT, 31: INT_LIT, 32: STRING_LIT, 33: Q64_LIT
 // 2-character Symbols: 40..59
 //   40: SHL (<<), 41: SHR (>>), 42: ARROW (->), 43: FAT_ARROW (=>)
 //   44: LEQ (<=), 45: STORE (<-), 46: EQ (==), 47: NEQ (!=)
-//   48: GEQ (>=), 49: OR (||), 50: AND (&&)
+//   48: GEQ (>=), 49: OR (||), 50: AND (&&), 51: DOTDOT (..)
 // 1-character Symbols: 60..89
 //   60: LT (<), 61: GT (>), 62: BIT_AND (&), 63: BIT_OR (|), 64: BIT_XOR (^)
 //   65: COLON (:), 66: SEMICOLON (;), 67: COMMA (,), 68: DOT (.)
@@ -45,6 +46,7 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         wire c4 = *(p + 4);
         wire c5 = *(p + 5);
         wire c6 = *(p + 6);
+        wire c7 = *(p + 7);
     }
 
     states {
@@ -54,6 +56,7 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
             len == 5 => CheckLen5;
             len == 6 => CheckLen6;
             len == 7 => CheckLen7;
+            len == 8 => CheckLen8;
             _        => NotKeyword;
         }
 
@@ -80,14 +83,24 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
 
         MatchLet: { _ => return 15; } // TokenType.LET
 
-        // len == 4: flow, wire, call, type, cast
+        // len == 4: flow, wire, call, type, cast, node
         CheckLen4: {
             c0 == 102 => CheckFlow; // 'f'
             c0 == 119 => CheckWire; // 'w'
             c0 == 99  => CheckC4;   // 'c'
             c0 == 116 => CheckType; // 't'
+            c0 == 110 => CheckNode; // 'n'
             _         => NotKeyword;
         }
+
+        CheckNode: {
+            c1 != 111 => NotKeyword; // 'o'
+            c2 != 100 => NotKeyword; // 'd'
+            c3 == 101 => MatchNode;  // 'e'
+            _         => NotKeyword;
+        }
+
+        MatchNode: { _ => return 25; } // TokenType.NODE
 
         CheckFlow: {
             c1 != 108 => NotKeyword; // 'l'
@@ -190,10 +203,12 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
 
         MatchReturn: { _ => return 19; } // TokenType.RETURN
 
-        // len == 7: machine, include
+        // len == 7: machine, include, network, connect
         CheckLen7: {
             c0 == 109 => CheckMachine; // 'm'
             c0 == 105 => CheckInclude; // 'i'
+            c0 == 110 => CheckNetwork; // 'n'
+            c0 == 99  => CheckConnect; // 'c'
             _         => NotKeyword;
         }
 
@@ -220,6 +235,49 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         }
 
         MatchInclude: { _ => return 21; } // TokenType.INCLUDE
+
+        CheckNetwork: {
+            c1 != 101 => NotKeyword; // 'e'
+            c2 != 116 => NotKeyword; // 't'
+            c3 != 119 => NotKeyword; // 'w'
+            c4 != 111 => NotKeyword; // 'o'
+            c5 != 114 => NotKeyword; // 'r'
+            c6 == 107 => MatchNetwork; // 'k'
+            _         => NotKeyword;
+        }
+
+        MatchNetwork: { _ => return 24; } // TokenType.NETWORK
+
+        CheckConnect: {
+            c1 != 111 => NotKeyword; // 'o'
+            c2 != 110 => NotKeyword; // 'n'
+            c3 != 110 => NotKeyword; // 'n'
+            c4 != 101 => NotKeyword; // 'e'
+            c5 != 99  => NotKeyword; // 'c'
+            c6 == 116 => MatchConnect; // 't'
+            _         => NotKeyword;
+        }
+
+        MatchConnect: { _ => return 26; } // TokenType.CONNECT
+
+        // len == 8: distinct
+        CheckLen8: {
+            c0 == 100 => CheckDistinct; // 'd'
+            _         => NotKeyword;
+        }
+
+        CheckDistinct: {
+            c1 != 105 => NotKeyword; // 'i'
+            c2 != 115 => NotKeyword; // 's'
+            c3 != 116 => NotKeyword; // 't'
+            c4 != 105 => NotKeyword; // 'i'
+            c5 != 110 => NotKeyword; // 'n'
+            c6 != 99  => NotKeyword; // 'c'
+            c7 == 116 => MatchDistinct; // 't'
+            _         => NotKeyword;
+        }
+
+        MatchDistinct: { _ => return 23; } // TokenType.DISTINCT
 
         NotKeyword: {
             _ => return 30; // TokenType.IDENT
@@ -501,7 +559,13 @@ machine ssac_tokenize(src: *u8, src_len: u32, tokens: *Token, max_tokens: u32) -
             c0 == 33  => Check2CharBang;  // '!'
             c0 == 124 => Check2CharPipe;  // '|'
             c0 == 38  => Check2CharAmp;   // '&'
+            c0 == 46  => Check2CharDot;   // '.'
             _         => Check1CharSymbols;
+        }
+
+        Check2CharDot: {
+            c1 == 46 => Emit2Char [ cur_start <= 51 ]; // ".."
+            _        => Check1CharSymbols;
         }
 
         Check2CharLt: {

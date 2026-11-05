@@ -1,10 +1,17 @@
 import codecs
-from .ast_nodes import Program, Machine, State, Rule, Action, TypeDef, ExternFn
+import os
+from typing import Optional, Any
+from .ast_nodes import Program, Machine, State, Rule, Action, TypeDef, ExternFn, TypeKind, Reg
 from .expr_nodes import BinaryExpr, UnaryExpr, CallExpr, FieldExpr, StructLit, VarExpr, IntLit, StringLit, NullLit, CastExpr, Q64Lit, FloatLit
+from .types import BoundedType
+
+__path__ = [os.path.join(os.path.dirname(__file__), "codegen")]
+from .codegen.network_builder import NetworkBuilder
 
 class CodeGen:
-    def __init__(self, prog: Program):
+    def __init__(self, prog: Program, annotations: Optional[Any] = None):
         self.prog = prog
+        self.annotations = annotations
         self.tmp_id = 0
         self.str_id = 0
         self.string_constants: list[tuple[str, str, int]] = [] # (sym_name, str_val, byte_len)
@@ -60,20 +67,108 @@ class CodeGen:
             "*u8x64": "<64 x i8>*",
         }
         self.struct_def: dict[str, list[tuple[str, str]]] = {}
+        self.newtype_base_map: dict[str, str] = {}
+        self.bounded_types: dict[str, BoundedType] = {}
+        if annotations and hasattr(annotations, "type_registry") and annotations.type_registry:
+            for tname, tobj in annotations.type_registry.items():
+                if isinstance(tobj, BoundedType):
+                    self.bounded_types[tname] = tobj
+                    self.newtype_base_map[tname] = tobj.unwrap().to_str()
+
         for t in prog.types:
-            if t.fields and t.fields[0][0] == "__ptr__":
-                target = t.fields[0][1]
-                self.type_map[t.name] = self.map_type(target)
+            if hasattr(t, "kind") and t.kind in (TypeKind.NEWTYPE, TypeKind.BOUNDED):
+                self.newtype_base_map[t.name] = t.base_type
+            elif t.fields and t.fields[0][0] == "__ptr__":
+                self.newtype_base_map[t.name] = t.fields[0][1]
             else:
                 self.type_map[t.name] = f"%struct.{t.name}"
                 self.type_map[f"*{t.name}"] = f"%struct.{t.name}*"
                 self.struct_def[t.name] = t.fields
+
+    def resolve_base_primitive_name(self, tname: str) -> str:
+        curr = tname
+        visited = set()
+        while curr in self.newtype_base_map and curr not in visited:
+            visited.add(curr)
+            curr = self.newtype_base_map[curr]
+        return curr
+
+    def emit_reg_default_val(self, reg: Reg) -> str:
+        if reg.type_str in self.bounded_types:
+            btype = self.bounded_types[reg.type_str]
+            base = btype.unwrap().to_str()
+            min_v, max_v = btype.min_val, btype.max_val
+            if min_v <= 0 <= max_v:
+                return "0.0" if base in ("f32", "f64") else "0"
+            elif min_v > 0:
+                return str(float(min_v)) if base in ("f32", "f64") else str(int(min_v))
+            else:
+                return str(float(max_v)) if base in ("f32", "f64") else str(int(max_v))
+        base = self.resolve_base_primitive_name(reg.type_str)
+        if base.startswith("*"):
+            return "null"
+        elif base in ("f32", "f64"):
+            return "0.0"
+        elif base == "q64":
+            return "0"
+        else:
+            return "0"
+
+    def emit_clamp(self, val: str, btype: BoundedType, insts: list[str]) -> str:
+        base = btype.unwrap().to_str()
+        llvm_type = self.map_type(base)
+
+        if base in ("f32", "f64"):
+            intrin_max = f"@llvm.maxnum.{base}"
+            intrin_min = f"@llvm.minnum.{base}"
+            if base == "f32":
+                min_c = self.fresh_tmp("c_min")
+                max_c = self.fresh_tmp("c_max")
+                insts.append(f"{min_c} = fptrunc double {float(btype.min_val)} to float")
+                insts.append(f"{max_c} = fptrunc double {float(btype.max_val)} to float")
+                min_op, max_op = min_c, max_c
+                if not val.startswith("%"):
+                    c_val = self.fresh_tmp("c_val")
+                    insts.append(f"{c_val} = fptrunc double {float(val)} to float")
+                    val = c_val
+            else:
+                min_op = str(float(btype.min_val))
+                max_op = str(float(btype.max_val))
+
+            t1 = self.fresh_tmp("clamp_max")
+            insts.append(f"{t1} = call {llvm_type} {intrin_max}({llvm_type} {val}, {llvm_type} {min_op})")
+            t2 = self.fresh_tmp("clamped")
+            insts.append(f"{t2} = call {llvm_type} {intrin_min}({llvm_type} {t1}, {llvm_type} {max_op})")
+            return t2
+        else:
+            is_unsigned = base.startswith("u")
+            cmp_lt = "ult" if is_unsigned else "slt"
+            cmp_gt = "ugt" if is_unsigned else "sgt"
+            min_lit = str(int(btype.min_val))
+            max_lit = str(int(btype.max_val))
+
+            c1 = self.fresh_tmp("cmp_min")
+            insts.append(f"{c1} = icmp {cmp_lt} {llvm_type} {val}, {min_lit}")
+            s1 = self.fresh_tmp("val_min")
+            insts.append(f"{s1} = select i1 {c1}, {llvm_type} {min_lit}, {llvm_type} {val}")
+            c2 = self.fresh_tmp("cmp_max")
+            insts.append(f"{c2} = icmp {cmp_gt} {llvm_type} {s1}, {max_lit}")
+            s2 = self.fresh_tmp("clamped")
+            insts.append(f"{s2} = select i1 {c2}, {llvm_type} {max_lit}, {llvm_type} {s1}")
+            return s2
 
     def fresh_tmp(self, prefix: str = "t") -> str:
         self.tmp_id += 1
         return f"%{prefix}_{self.tmp_id}"
 
     def map_type(self, t: str) -> str:
+        if t in self.type_map:
+            return self.type_map[t]
+        if t.startswith("*"):
+            return self.map_type(t[1:]) + "*"
+        base = self.resolve_base_primitive_name(t)
+        if base != t:
+            return self.map_type(base)
         return self.type_map.get(t, t)
 
     def get_type_align(self, t: str) -> int:
@@ -90,9 +185,16 @@ class CodeGen:
 
     def generate(self) -> str:
         # First generate machines so string constants and types are collected
+        sealed_machines = {node.machine_name for net in self.prog.networks for node in net.nodes}
         machine_lines = []
         for m in self.prog.machines:
-            machine_lines.extend(self.gen_machine(m))
+            if m.name not in sealed_machines:
+                machine_lines.extend(self.gen_machine(m))
+
+        builder = NetworkBuilder(self)
+        machine_dict = {m.name: m for m in self.prog.machines}
+        for net in self.prog.networks:
+            machine_lines.extend(builder.build_network(net, machine_dict))
 
         lines = []
         lines.append("; Generated by StateSSA Compiler (ssac)")
@@ -116,18 +218,25 @@ class CodeGen:
         # 2. Extern Declarations
         for ext in self.prog.externs:
             ret = self.map_type(ext.ret_type)
-            params = ", ".join(self.map_type(pt) for _, pt in ext.params)
+            params = ", ".join(
+                f"{self.map_type(p.type_str)} noalias" if getattr(p, "is_distinct", False) else self.map_type(p.type_str if hasattr(p, "type_str") else p[1])
+                for p in ext.params
+            )
             lines.append(f"declare {ret} @{ext.name}({params})")
         if self.prog.externs: lines.append("")
 
-        lines.append("declare void @llvm.trap() cold noreturn nounwind\n")
+        lines.append("declare void @llvm.trap() cold noreturn nounwind")
+        lines.append("declare float @llvm.maxnum.f32(float, float)")
+        lines.append("declare float @llvm.minnum.f32(float, float)")
+        lines.append("declare double @llvm.maxnum.f64(double, double)")
+        lines.append("declare double @llvm.minnum.f64(double, double)\n")
 
         # 3. Machines
         lines.extend(machine_lines)
 
         return "\n".join(lines)
 
-    def gen_machine(self, m: Machine) -> list[str]:
+    def gen_machine(self, m: Machine, param_map: Optional[dict[str, str]] = None) -> list[str]:
         # Spec V0.8 Verification:
         # 1. First state must be named 'Entry'
         if not m.states or m.states[0].name != "Entry":
@@ -142,7 +251,12 @@ class CodeGen:
 
         lines = []
         ret_type = self.map_type(m.ret_type)
-        params = ", ".join(f"{self.map_type(pt)} %arg_{pn}" for pn, pt in m.params)
+        param_strs = []
+        for p in m.params:
+            pn, pt = p[0], p[1]
+            attr = " noalias" if getattr(p, "is_distinct", False) else ""
+            param_strs.append(f"{self.map_type(pt)}{attr} %arg_{pn}")
+        params = ", ".join(param_strs)
         lines.append(f"define {ret_type} @{m.name}({params}) {{")
 
         phi_incoming: dict[str, dict[str, list[tuple[str, str]]]] = {
@@ -165,14 +279,25 @@ class CodeGen:
         bb_insts[entry_bb] = []
         bb_env[entry_bb] = {}
 
+        self.param_bindings: dict[str, str] = {}
+        for pn, pt in m.params:
+            arg_src = param_map.get(pn, f"%arg_{pn}") if param_map else f"%arg_{pn}"
+            if pt in self.bounded_types:
+                clamped = self.emit_clamp(arg_src, self.bounded_types[pt], bb_insts[entry_bb])
+                self.param_bindings[pn] = clamped
+            else:
+                self.param_bindings[pn] = arg_src
+
         for reg in m.flow.regs:
             if reg.init_expr is not None:
                 if reg.type_str == "q64" and isinstance(reg.init_expr, FloatLit):
                     val = str(int(reg.init_expr.val * 4294967296))
                 else:
                     val = self.emit_expr(reg.init_expr, m, bb_env[entry_bb], bb_insts[entry_bb])
+                if reg.type_str in self.bounded_types:
+                    val = self.emit_clamp(val, self.bounded_types[reg.type_str], bb_insts[entry_bb])
             else:
-                val = "null" if reg.type_str.startswith("*") else ("0.0" if reg.type_str in ("f32", "f64") else "0")
+                val = self.emit_reg_default_val(reg)
             bb_env[entry_bb][reg.name] = val
 
         for s in m.states[1:]:
@@ -224,6 +349,8 @@ class CodeGen:
                                 bc_val = self.fresh_tmp("bitcast")
                                 bb_insts[curr_bb].append(f"{bc_val} = bitcast {actual_ret_llvm} {ret_val} to {expected_ret}")
                                 ret_val = bc_val
+                        if m.ret_type in self.bounded_types:
+                            ret_val = self.emit_clamp(ret_val, self.bounded_types[m.ret_type], bb_insts[curr_bb])
                         bb_insts[curr_bb].append(f"ret {expected_ret} {ret_val}")
                     break
                 elif r.is_panic:
@@ -291,7 +418,10 @@ class CodeGen:
                 default_val = "0"
             if reg.name in latch_map:
                 lexpr = latch_map[reg.name]
-                val = self.emit_expr(lexpr, m, bb_env[from_bb], bb_insts[from_bb])
+                if self.resolve_base_primitive_name(reg.type_str) == "q64" and isinstance(lexpr, FloatLit):
+                    val = str(int(lexpr.val * 4294967296))
+                else:
+                    val = self.emit_expr(lexpr, m, bb_env[from_bb], bb_insts[from_bb])
                 rtype = self.map_type(reg.type_str)
                 ltype = self.map_type(self.get_expr_type(lexpr, m))
                 if rtype != ltype:
@@ -307,6 +437,8 @@ class CodeGen:
                         bc_val = self.fresh_tmp("bitcast")
                         bb_insts[from_bb].append(f"{bc_val} = bitcast {ltype} {val} to {rtype}")
                         val = bc_val
+                if reg.type_str in self.bounded_types:
+                    val = self.emit_clamp(val, self.bounded_types[reg.type_str], bb_insts[from_bb])
             else:
                 val = bb_env[from_bb].get(reg.name, default_val)
             phi_incoming[target_s.name][reg.name].append((from_bb, val))
@@ -407,6 +539,9 @@ class CodeGen:
         return gep_res, field_ssa_type, field_llvm_type
 
     def get_expr_type(self, expr, m: Machine) -> str:
+        if self.annotations and id(expr) in self.annotations.expr_types:
+            resolved_t = self.annotations.expr_types[id(expr)]
+            return resolved_t.unwrap().to_str()
         if isinstance(expr, VarExpr):
             if expr.name == "null":
                 return "*void"
@@ -427,6 +562,9 @@ class CodeGen:
             for target_m in self.prog.machines:
                 if target_m.name == expr.func:
                     return target_m.ret_type
+            for net in self.prog.networks:
+                if net.name == expr.func:
+                    return net.ret_type
             for ext in self.prog.externs:
                 if ext.name == expr.func:
                     if ext.ret_type in ("f32", "f64"):
@@ -442,6 +580,7 @@ class CodeGen:
                 if fn == expr.field: return ft
             raise RuntimeError(f"Struct '{sname}' has no field '{expr.field}'")
         if isinstance(expr, UnaryExpr):
+            if expr.op == "-": return self.get_expr_type(expr.operand, m)
             if expr.op == "&": return f"*{self.get_expr_type(expr.operand, m)}"
             if expr.op == "*":
                 sub = self.get_expr_type(expr.operand, m)
@@ -466,24 +605,25 @@ class CodeGen:
         if isinstance(expr, BinaryExpr):
             lt = self.get_expr_type(expr.left, m)
             rt = self.get_expr_type(expr.right, m)
+            base_lt = self.resolve_base_primitive_name(lt)
+            base_rt = self.resolve_base_primitive_name(rt)
             if expr.op in ("==", "!=", "<", "<=", ">", ">=", "&&", "||"):
-                if self.is_vector_type(lt):
-                    num = lt.split('x')[1]
+                if self.is_vector_type(base_lt):
+                    num = base_lt.split('x')[1]
                     return f"<{num} x i1>"
                 return "i1"
-            if expr.op in ("&", "|", "^") and lt == "i1" and rt == "i1":
+            if expr.op in ("&", "|", "^") and base_lt == "i1" and base_rt == "i1":
                 return "i1"
             if expr.op == "+":
-                if lt.startswith("*"): return lt
-            if self.is_vector_type(lt): return lt
-            if self.is_vector_type(rt): return rt
-            if lt == "f64" or rt == "f64": return "f64"
-            if lt == "f32" or rt == "f32": return "f32"
-            if lt == "q64" or rt == "q64":
-                return "q64"
-            if lt in ("i64", "u64") or rt in ("i64", "u64"):
-                return "u64" if (lt == "u64" or rt == "u64") else "i64"
-            if lt in ("u32", "u16", "u8") or rt in ("u32", "u16", "u8"):
+                if base_lt.startswith("*"): return lt
+            if self.is_vector_type(base_lt): return base_lt
+            if self.is_vector_type(base_rt): return base_rt
+            if base_lt == "f64" or base_rt == "f64": return "f64"
+            if base_lt == "f32" or base_rt == "f32": return "f32"
+            if base_lt == "q64" or base_rt == "q64": return "q64"
+            if base_lt in ("i64", "u64") or base_rt in ("i64", "u64"):
+                return "u64" if (base_lt == "u64" or base_rt == "u64") else "i64"
+            if base_lt in ("u32", "u16", "u8") or base_rt in ("u32", "u16", "u8"):
                 return "u32"
             return "i32"
 
@@ -491,6 +631,8 @@ class CodeGen:
         if isinstance(expr, VarExpr):
             if expr.name == "null":
                 return "null"
+            if hasattr(self, "param_bindings") and expr.name in self.param_bindings:
+                return self.param_bindings[expr.name]
             for pn, _ in m.params:
                 if pn == expr.name:
                     return f"%arg_{pn}"
@@ -561,10 +703,12 @@ class CodeGen:
                 return res
 
             # Floating-point and SIMD vector operations
-            is_fp = left_type in ("f32", "f64") or right_type in ("f32", "f64")
-            is_vec = self.is_vector_type(left_type) or self.is_vector_type(right_type)
+            base_left = self.resolve_base_primitive_name(left_type)
+            base_right = self.resolve_base_primitive_name(right_type)
+            is_fp = base_left in ("f32", "f64") or base_right in ("f32", "f64")
+            is_vec = self.is_vector_type(base_left) or self.is_vector_type(base_right)
             if is_fp or is_vec:
-                target_type = left_type if (self.is_vector_type(left_type) or left_type in ("f32", "f64")) else right_type
+                target_type = left_type if (self.is_vector_type(base_left) or base_left in ("f32", "f64")) else right_type
                 llvm_t = self.map_type(target_type)
                 res = self.fresh_tmp("fop" if is_fp else "vop")
                 is_fp_elem = "float" in llvm_t or "double" in llvm_t
@@ -673,6 +817,19 @@ class CodeGen:
             return res
 
         if isinstance(expr, UnaryExpr):
+            if expr.op == "-":
+                sub = self.emit_expr(expr.operand, m, env, insts)
+                sub_type = self.get_expr_type(expr.operand, m)
+                base = self.resolve_base_primitive_name(sub_type)
+                llvm_t = self.map_type(sub_type)
+                if base in ("f32", "f64") or "float" in llvm_t or "double" in llvm_t:
+                    res = self.fresh_tmp("fneg")
+                    insts.append(f"{res} = fneg {llvm_t} {sub}")
+                    return res
+                else:
+                    res = self.fresh_tmp("neg")
+                    insts.append(f"{res} = sub {llvm_t} 0, {sub}")
+                    return res
             if expr.op == "*":
                 sub = self.emit_expr(expr.operand, m, env, insts)
                 ptr_type = self.get_expr_type(expr.operand, m)
@@ -736,20 +893,31 @@ class CodeGen:
         if isinstance(expr, CallExpr):
             ret_type = "void"
             param_types = []
+            raw_param_types = []
             for ext in self.prog.externs:
                 if ext.name == expr.func:
                     ret_type = self.map_type(ext.ret_type)
-                    param_types = [self.map_type(pt) for _, pt in ext.params]
+                    raw_param_types = [pt for _, pt in ext.params]
+                    param_types = [self.map_type(pt) for pt in raw_param_types]
                     break
             for mach in self.prog.machines:
                 if mach.name == expr.func:
                     ret_type = self.map_type(mach.ret_type)
-                    param_types = [self.map_type(pt) for _, pt in mach.params]
+                    raw_param_types = [pt for _, pt in mach.params]
+                    param_types = [self.map_type(pt) for pt in raw_param_types]
+                    break
+            for net in self.prog.networks:
+                if net.name == expr.func:
+                    ret_type = self.map_type(net.ret_type)
+                    raw_param_types = [p.type_str for p in net.params]
+                    param_types = [self.map_type(pt) for pt in raw_param_types]
                     break
 
             arg_vals = []
             for i, a in enumerate(expr.args):
                 av = self.emit_expr(a, m, env, insts)
+                if i < len(raw_param_types) and raw_param_types[i] in self.bounded_types:
+                    av = self.emit_clamp(av, self.bounded_types[raw_param_types[i]], insts)
                 if i < len(param_types):
                     expected_pt = param_types[i]
                     actual_ssa = self.get_expr_type(a, m)
@@ -815,128 +983,137 @@ class CodeGen:
                 return res
 
         if isinstance(expr, CastExpr):
-            # 定数リテラルのゼロコスト文脈直接展開
-            if isinstance(expr.expr, FloatLit):
-                if expr.target_type == "f64":
-                    return str(expr.expr.val)
-                elif expr.target_type == "f32":
-                    # LLVM IR 制約: LLVM IR テキスト形式では float への非正確 10進小数の直接記述が
-                    # 'floating point constant invalid for type' でエラーになるため、
-                    # double 経由で fptrunc 命令を発行してレジスタとして渡す。
-                    tmp_f = self.fresh_tmp("lit_f32")
-                    insts.append(f"{tmp_f} = fptrunc double {expr.expr.val} to float")
-                    return tmp_f
-                elif expr.target_type == "q64":
-                    return str(int(expr.expr.val * 4294967296))
+            raw_res = self._emit_cast_raw(expr, m, env, insts)
+            if expr.target_type in self.bounded_types:
+                return self.emit_clamp(raw_res, self.bounded_types[expr.target_type], insts)
+            return raw_res
 
-            val = self.emit_expr(expr.expr, m, env, insts)
-            from_type = self.get_expr_type(expr.expr, m)
-            to_type = expr.target_type
-            if from_type == to_type:
-                return val
+        return "0"
 
-            from_llvm = self.map_type(from_type)
-            to_llvm = self.map_type(to_type)
-            if from_llvm == to_llvm:
-                return val
+    def _emit_cast_raw(self, expr: CastExpr, m: Machine, env: dict[str, str], insts: list[str]) -> str:
+        # 定数リテラルのゼロコスト文脈直接展開
+        target_llvm = self.map_type(expr.target_type)
+        if isinstance(expr.expr, FloatLit):
+            if target_llvm == "float":
+                tmp_f = self.fresh_tmp("lit_f32")
+                insts.append(f"{tmp_f} = fptrunc double {expr.expr.val} to float")
+                return tmp_f
+            elif target_llvm == "double":
+                return str(expr.expr.val)
+            elif target_llvm == "i64" and self.resolve_base_primitive_name(expr.target_type) == "q64":
+                return str(int(expr.expr.val * 4294967296))
 
-            if to_type == "q64":
-                if from_type in ("f32", "f64"):
-                    fval = val
-                    if from_type == "f32":
-                        fpext = self.fresh_tmp("fpext")
-                        insts.append(f"{fpext} = fpext float {val} to double")
-                        fval = fpext
-                    fmul = self.fresh_tmp("fmul_q")
-                    insts.append(f"{fmul} = fmul double {fval}, 4294967296.0")
-                    q_res = self.fresh_tmp("fptosi_q")
-                    insts.append(f"{q_res} = fptosi double {fmul} to i64")
-                    return q_res
-                if from_llvm != "i64":
-                    ext = self.fresh_tmp("ext_q")
-                    op = "sext" if from_type in ("i8", "i16", "i32") else "zext"
-                    insts.append(f"{ext} = {op} {from_llvm} {val} to i64")
-                    val = ext
-                res = self.fresh_tmp("shl_q")
-                insts.append(f"{res} = shl i64 {val}, 32")
-                return res
+        val = self.emit_expr(expr.expr, m, env, insts)
+        from_type = self.get_expr_type(expr.expr, m)
+        to_type = expr.target_type
+        if from_type == to_type:
+            return val
 
-            if from_type == "q64":
-                if to_type in ("f32", "f64"):
-                    sitofp = self.fresh_tmp("q2fp")
-                    insts.append(f"{sitofp} = sitofp i64 {val} to double")
-                    q_div = self.fresh_tmp("q_div")
-                    insts.append(f"{q_div} = fdiv double {sitofp}, 4294967296.0")
-                    if to_type == "f32":
-                        res = self.fresh_tmp("fptrunc")
-                        insts.append(f"{res} = fptrunc double {q_div} to float")
-                        return res
-                    return q_div
-                shr = self.fresh_tmp("shr_q")
-                insts.append(f"{shr} = ashr i64 {val}, 32")
-                if to_llvm != "i64":
-                    res = self.fresh_tmp("trunc_q")
-                    insts.append(f"{res} = trunc i64 {shr} to {to_llvm}")
-                    return res
-                return shr
+        from_llvm = self.map_type(from_type)
+        to_llvm = self.map_type(to_type)
+        if from_llvm == to_llvm:
+            return val
 
-            is_from_ptr = from_type.startswith("*")
-            is_to_ptr = to_type.startswith("*")
+        from_base = self.resolve_base_primitive_name(from_type)
+        to_base = self.resolve_base_primitive_name(to_type)
 
-            # Float <-> Float
-            if from_type in ("f32", "f64") and to_type in ("f32", "f64"):
-                if from_type == "f32" and to_type == "f64":
-                    res = self.fresh_tmp("fpext")
-                    insts.append(f"{res} = fpext float {val} to double")
-                    return res
-                elif from_type == "f64" and to_type == "f32":
+        if to_base == "q64":
+            if from_base in ("f32", "f64"):
+                fval = val
+                if from_base == "f32":
+                    fpext = self.fresh_tmp("fpext")
+                    insts.append(f"{fpext} = fpext float {val} to double")
+                    fval = fpext
+                fmul = self.fresh_tmp("fmul_q")
+                insts.append(f"{fmul} = fmul double {fval}, 4294967296.0")
+                q_res = self.fresh_tmp("fptosi_q")
+                insts.append(f"{q_res} = fptosi double {fmul} to i64")
+                return q_res
+            if from_llvm != "i64":
+                ext = self.fresh_tmp("ext_q")
+                op = "sext" if from_base in ("i8", "i16", "i32") else "zext"
+                insts.append(f"{ext} = {op} {from_llvm} {val} to i64")
+                val = ext
+            res = self.fresh_tmp("shl_q")
+            insts.append(f"{res} = shl i64 {val}, 32")
+            return res
+
+        if from_base == "q64":
+            if to_base in ("f32", "f64"):
+                sitofp = self.fresh_tmp("q2fp")
+                insts.append(f"{sitofp} = sitofp i64 {val} to double")
+                q_div = self.fresh_tmp("q_div")
+                insts.append(f"{q_div} = fdiv double {sitofp}, 4294967296.0")
+                if to_base == "f32":
                     res = self.fresh_tmp("fptrunc")
-                    insts.append(f"{res} = fptrunc double {val} to float")
+                    insts.append(f"{res} = fptrunc double {q_div} to float")
                     return res
+                return q_div
+            shr = self.fresh_tmp("shr_q")
+            insts.append(f"{shr} = ashr i64 {val}, 32")
+            if to_llvm != "i64":
+                res = self.fresh_tmp("trunc_q")
+                insts.append(f"{res} = trunc i64 {shr} to {to_llvm}")
+                return res
+            return shr
 
-            # Int -> Float
-            if from_type not in ("f32", "f64") and to_type in ("f32", "f64"):
-                op = "uitofp" if self.is_unsigned_type(from_type) else "sitofp"
-                res = self.fresh_tmp(op)
-                insts.append(f"{res} = {op} {from_llvm} {val} to {to_llvm}")
-                return res
+        is_from_ptr = from_base.startswith("*")
+        is_to_ptr = to_base.startswith("*")
 
-            # Float -> Int
-            if from_type in ("f32", "f64") and to_type not in ("f32", "f64") and not is_to_ptr:
-                op = "fptoui" if self.is_unsigned_type(to_type) else "fptosi"
-                res = self.fresh_tmp(op)
-                insts.append(f"{res} = {op} {from_llvm} {val} to {to_llvm}")
+        # Float <-> Float
+        if from_base in ("f32", "f64") and to_base in ("f32", "f64"):
+            if from_base == "f32" and to_base == "f64":
+                res = self.fresh_tmp("fpext")
+                insts.append(f"{res} = fpext float {val} to double")
                 return res
-
-            if is_from_ptr and is_to_ptr:
-                res = self.fresh_tmp("bitcast")
-                insts.append(f"{res} = bitcast {from_llvm} {val} to {to_llvm}")
-                return res
-            if is_from_ptr and not is_to_ptr:
-                res = self.fresh_tmp("p2i")
-                insts.append(f"{res} = ptrtoint {from_llvm} {val} to {to_llvm}")
-                return res
-            if not is_from_ptr and is_to_ptr:
-                res = self.fresh_tmp("i2p")
-                insts.append(f"{res} = inttoptr {from_llvm} {val} to {to_llvm}")
+            elif from_base == "f64" and to_base == "f32":
+                res = self.fresh_tmp("fptrunc")
+                insts.append(f"{res} = fptrunc double {val} to float")
                 return res
 
-            # Int <-> Int
-            size_map = {"i1": 1, "u8": 8, "i8": 8, "u16": 16, "i16": 16, "u32": 32, "i32": 32, "u64": 64, "i64": 64}
-            s_from = size_map.get(from_type, 32)
-            s_to = size_map.get(to_type, 32)
+        # Int -> Float
+        if from_base not in ("f32", "f64") and to_base in ("f32", "f64"):
+            op = "uitofp" if self.is_unsigned_type(from_base) else "sitofp"
+            res = self.fresh_tmp(op)
+            insts.append(f"{res} = {op} {from_llvm} {val} to {to_llvm}")
+            return res
 
-            if s_from > s_to:
-                res = self.fresh_tmp("trunc")
-                insts.append(f"{res} = trunc {from_llvm} {val} to {to_llvm}")
-                return res
-            elif s_from < s_to:
-                is_signed = from_type in ("i8", "i16", "i32", "i64")
-                op = "sext" if is_signed else "zext"
-                res = self.fresh_tmp(op)
-                insts.append(f"{res} = {op} {from_llvm} {val} to {to_llvm}")
-                return res
-            else:
-                return val
+        # Float -> Int
+        if from_base in ("f32", "f64") and to_base not in ("f32", "f64") and not is_to_ptr:
+            op = "fptoui" if self.is_unsigned_type(to_base) else "fptosi"
+            res = self.fresh_tmp(op)
+            insts.append(f"{res} = {op} {from_llvm} {val} to {to_llvm}")
+            return res
+
+        if is_from_ptr and is_to_ptr:
+            res = self.fresh_tmp("bitcast")
+            insts.append(f"{res} = bitcast {from_llvm} {val} to {to_llvm}")
+            return res
+        if is_from_ptr and not is_to_ptr:
+            res = self.fresh_tmp("p2i")
+            insts.append(f"{res} = ptrtoint {from_llvm} {val} to {to_llvm}")
+            return res
+        if not is_from_ptr and is_to_ptr:
+            res = self.fresh_tmp("i2p")
+            insts.append(f"{res} = inttoptr {from_llvm} {val} to {to_llvm}")
+            return res
+
+        # Int <-> Int
+        size_map = {"i1": 1, "u8": 8, "i8": 8, "u16": 16, "i16": 16, "u32": 32, "i32": 32, "u64": 64, "i64": 64}
+        s_from = size_map.get(from_base, 32)
+        s_to = size_map.get(to_base, 32)
+
+        if s_from > s_to:
+            res = self.fresh_tmp("trunc")
+            insts.append(f"{res} = trunc {from_llvm} {val} to {to_llvm}")
+            return res
+        elif s_from < s_to:
+            is_signed = from_base in ("i8", "i16", "i32", "i64")
+            op = "sext" if is_signed else "zext"
+            res = self.fresh_tmp(op)
+            insts.append(f"{res} = {op} {from_llvm} {val} to {to_llvm}")
+            return res
+        else:
+            return val
 
         return "0"

@@ -15,6 +15,10 @@ KEYWORDS = {
     "panic": TokenType.PANIC,
     "include": TokenType.INCLUDE,
     "cast": TokenType.CAST,
+    "distinct": TokenType.DISTINCT,
+    "network": TokenType.NETWORK,
+    "node": TokenType.NODE,
+    "connect": TokenType.CONNECT,
 }
 
 SYMBOLS = [
@@ -37,6 +41,7 @@ SYMBOLS = [
     (":", TokenType.COLON),
     (";", TokenType.SEMICOLON),
     (",", TokenType.COMMA),
+    ("..", TokenType.DOTDOT),
     (".", TokenType.DOT),
     ("=", TokenType.EQUALS),
     ("*", TokenType.STAR),
@@ -90,8 +95,8 @@ class Lexer:
                 self.pos = end
                 continue
 
-            # Decimal float literal (e.g. 1.5, 0.125) -> FLOAT_LIT
-            m = re.match(r'[0-9]+\.[0-9]+', self.text[self.pos:])
+            # Decimal float literal (e.g. 1.5, 0.125, 1e40, 1.5e-3) -> FLOAT_LIT
+            m = re.match(r'[0-9]+\.[0-9]+(?:[eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+', self.text[self.pos:])
             if m:
                 num = m.group(0)
                 tokens.append(Token(TokenType.FLOAT_LIT, num, self.line, self.col))

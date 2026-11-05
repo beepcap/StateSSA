@@ -1,0 +1,40 @@
+machine StageA(x: i32) -> i32 {
+    flow {}
+    states {
+        Entry: {
+            let t = x * 3;
+            let r = t + 1;
+            _ => return r;
+        }
+    }
+}
+
+machine StageB(x: i32) -> i32 {
+    flow {}
+    states {
+        Entry: {
+            let t = x * 2;
+            let r = t - 5;
+            _ => return r;
+        }
+    }
+}
+
+machine StageC(x: i32) -> i32 {
+    flow {}
+    states {
+        Entry: {
+            let r = x ^ 23130;
+            _ => return r;
+        }
+    }
+}
+
+network RunPipeline(x: i32) -> i32 {
+    node a: StageA;
+    node b: StageB;
+    node c: StageC;
+    connect {
+        x >> a >> b >> c;
+    }
+}

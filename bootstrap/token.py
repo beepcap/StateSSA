@@ -16,6 +16,10 @@ class TokenType(Enum):
     PANIC = auto()
     INCLUDE = auto()
     CAST = auto()
+    DISTINCT = auto()
+    NETWORK = auto()
+    NODE = auto()
+    CONNECT = auto()
 
     # Literals & Identifiers
     IDENT = auto()
@@ -31,6 +35,7 @@ class TokenType(Enum):
     COLON = auto()        # :
     SEMICOLON = auto()    # ;
     COMMA = auto()        # ,
+    DOTDOT = auto()       # ..
     DOT = auto()          # .
     EQUALS = auto()       # =
     STAR = auto()         # *

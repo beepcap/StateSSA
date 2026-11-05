@@ -1,0 +1,20 @@
+machine ProcessArray(in: *f32, out: *f32, len: i32) -> void {
+    flow {
+        reg i: i32 = 0;
+    }
+    states {
+        Entry: {
+            _ => Loop;
+        }
+        Loop: {
+            i >= len => Exit;
+            _ => Loop [ i <= i + 1 ];
+            let val = *(in + i);
+            let t = val * 2.5;
+            *(out + i) <- t + 1.0;
+        }
+        Exit: {
+            _ => return;
+        }
+    }
+}

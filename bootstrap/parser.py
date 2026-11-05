@@ -1,6 +1,6 @@
 from typing import Any
 from .token import TokenType, Token
-from .ast_nodes import Program, Machine, Flow, Reg, Wire, State, Rule, Action, TypeDef, ExternFn
+from .ast_nodes import Program, Machine, Flow, Reg, Wire, State, Rule, Action, TypeDef, TypeKind, BoundsNode, ExternFn, ParamDecl, NodeDecl, ConnectPipeline, NetworkDecl
 from .expr_nodes import BinaryExpr, UnaryExpr, CallExpr, FieldExpr, StructLit, VarExpr, IntLit, StringLit, NullLit, CastExpr, Q64Lit, FloatLit
 from .lexer import parse_q64_str
 
@@ -21,12 +21,15 @@ class Parser:
     def expect(self, ttype: TokenType) -> Token:
         tok = self.peek()
         if tok.type != ttype:
+            if ttype == TokenType.IDENT and tok.type == TokenType.NODE:
+                self.pos += 1
+                return tok
             raise SyntaxError(f"Expected {ttype.name}, got {tok.type.name} ('{tok.value}') at line {tok.line}")
         self.pos += 1
         return tok
 
     def parse_program(self) -> Program:
-        includes, types, externs, machines = [], [], [], []
+        includes, types, externs, machines, networks = [], [], [], [], []
         while self.peek().type != TokenType.EOF:
             if self.peek().type == TokenType.INCLUDE:
                 self.expect(TokenType.INCLUDE)
@@ -34,33 +37,74 @@ class Parser:
                 self.expect(TokenType.SEMICOLON)
                 includes.append(inc_path)
             elif self.peek().type == TokenType.TYPE:
-                types.append(self.parse_type_def())
+                tdef = self.parse_type_def()
+                if any(t.name == tdef.name for t in types):
+                    raise SyntaxError(f"Duplicate type definition '{tdef.name}'")
+                types.append(tdef)
             elif self.peek().type == TokenType.EXTERN:
                 externs.extend(self.parse_extern_block())
             elif self.peek().type == TokenType.MACHINE:
                 machines.append(self.parse_machine())
+            elif self.peek().type == TokenType.NETWORK:
+                networks.append(self.parse_network())
             else:
                 raise SyntaxError(f"Unexpected token {self.peek().value} at top-level")
-        return Program(includes, types, externs, machines)
+        return Program(includes, types, externs, machines, networks)
+
+    def parse_bound_expr(self) -> Any:
+        if self.match(TokenType.MINUS):
+            operand = self.parse_bound_expr()
+            if isinstance(operand, IntLit):
+                return IntLit(-operand.val)
+            if isinstance(operand, FloatLit):
+                return FloatLit(-operand.val, f"-{operand.raw_str}")
+            raise SyntaxError(f"Expected numeric literal after '-' in bound range at line {self.peek().line}")
+
+        if self.peek().type == TokenType.FLOAT_LIT:
+            tok = self.expect(TokenType.FLOAT_LIT)
+            return FloatLit(float(tok.value), tok.value)
+
+        if self.peek().type == TokenType.INT_LIT:
+            tok = self.expect(TokenType.INT_LIT)
+            return IntLit(int(tok.value))
+
+        tok = self.peek()
+        raise SyntaxError(f"Expected numeric literal in bound range, got {tok.type.name} ('{tok.value}') at line {tok.line}")
 
     def parse_type_def(self) -> TypeDef:
         self.expect(TokenType.TYPE)
         name = self.expect(TokenType.IDENT).value
         self.expect(TokenType.EQUALS)
-        if self.match(TokenType.STAR):
-            target_type = self.expect(TokenType.IDENT).value
+        if self.match(TokenType.LBRACE):
+            fields = []
+            while not self.match(TokenType.RBRACE):
+                fname = self.expect(TokenType.IDENT).value
+                self.expect(TokenType.COLON)
+                ftype = self.parse_type_str()
+                self.match(TokenType.COMMA)
+                fields.append((fname, ftype))
             self.expect(TokenType.SEMICOLON)
-            return TypeDef(name, [("__ptr__", f"*{target_type}")])
-        self.expect(TokenType.LBRACE)
-        fields = []
-        while not self.match(TokenType.RBRACE):
-            fname = self.expect(TokenType.IDENT).value
-            self.expect(TokenType.COLON)
-            ftype = self.parse_type_str()
-            self.match(TokenType.COMMA)
-            fields.append((fname, ftype))
+            return TypeDef(name=name, kind=TypeKind.STRUCT, fields=fields)
+
+        base_type = self.parse_type_str()
+        if self.match(TokenType.LBRACKET):
+            min_expr = self.parse_bound_expr()
+            if not self.match(TokenType.DOTDOT):
+                raise SyntaxError(f"Expected '..' (DOTDOT) in range constraint at line {self.peek().line}")
+            max_expr = self.parse_bound_expr()
+            self.expect(TokenType.RBRACKET)
+            self.expect(TokenType.SEMICOLON)
+            return TypeDef(name=name, kind=TypeKind.BOUNDED, base_type=base_type, bounds=BoundsNode(min_expr, max_expr))
+
         self.expect(TokenType.SEMICOLON)
-        return TypeDef(name, fields)
+        return TypeDef(name=name, kind=TypeKind.NEWTYPE, base_type=base_type, fields=[])
+
+    def parse_param(self) -> ParamDecl:
+        pname = self.expect(TokenType.IDENT).value
+        self.expect(TokenType.COLON)
+        is_distinct = self.match(TokenType.DISTINCT)
+        ptype = self.parse_type_str()
+        return ParamDecl(name=pname, type_str=ptype, is_distinct=is_distinct)
 
     def parse_extern_block(self) -> list[ExternFn]:
         self.expect(TokenType.EXTERN)
@@ -72,23 +116,31 @@ class Parser:
             self.expect(TokenType.IDENT) # 'fn'
             fname = self.expect(TokenType.IDENT).value
             self.expect(TokenType.LPAREN)
-            params = []
+            params: list[ParamDecl] = []
             while not self.match(TokenType.RPAREN):
-                pname = self.expect(TokenType.IDENT).value
-                self.expect(TokenType.COLON)
-                ptype = self.parse_type_str()
+                params.append(self.parse_param())
                 self.match(TokenType.COMMA)
-                params.append((pname, ptype))
             self.expect(TokenType.ARROW)
+            if self.peek().type == TokenType.DISTINCT:
+                raise SyntaxError("Unexpected token DISTINCT in return type")
             ret_type = self.parse_type_str()
             self.expect(TokenType.SEMICOLON)
             fns.append(ExternFn(fname, params, ret_type))
         return fns
 
     def parse_type_str(self) -> str:
+        if self.match(TokenType.LPAREN):
+            t = self.parse_type_str()
+            self.expect(TokenType.RPAREN)
+            return t
         prefix = ""
         while self.match(TokenType.STAR):
             prefix += "*"
+        if self.peek().type == TokenType.LPAREN:
+            self.expect(TokenType.LPAREN)
+            inner = self.parse_type_str()
+            self.expect(TokenType.RPAREN)
+            return prefix + inner
         base = self.expect(TokenType.IDENT).value
         return prefix + base
 
@@ -96,14 +148,13 @@ class Parser:
         self.expect(TokenType.MACHINE)
         name = self.expect(TokenType.IDENT).value
         self.expect(TokenType.LPAREN)
-        params = []
+        params: list[ParamDecl] = []
         while not self.match(TokenType.RPAREN):
-            pname = self.expect(TokenType.IDENT).value
-            self.expect(TokenType.COLON)
-            ptype = self.parse_type_str()
+            params.append(self.parse_param())
             self.match(TokenType.COMMA)
-            params.append((pname, ptype))
         self.expect(TokenType.ARROW)
+        if self.peek().type == TokenType.DISTINCT:
+            raise SyntaxError("Unexpected token DISTINCT in return type")
         ret_type = self.parse_type_str()
         self.expect(TokenType.LBRACE)
 
@@ -111,6 +162,41 @@ class Parser:
         states = self.parse_states()
         self.expect(TokenType.RBRACE)
         return Machine(name, params, ret_type, flow, states)
+
+    def parse_network(self) -> NetworkDecl:
+        self.expect(TokenType.NETWORK)
+        net_name = self.expect(TokenType.IDENT).value
+        self.expect(TokenType.LPAREN)
+        params: list[ParamDecl] = []
+        while not self.match(TokenType.RPAREN):
+            params.append(self.parse_param())
+            self.match(TokenType.COMMA)
+        self.expect(TokenType.ARROW)
+        if self.peek().type == TokenType.DISTINCT:
+            raise SyntaxError("Unexpected token DISTINCT in return type")
+        ret_type = self.parse_type_str()
+        self.expect(TokenType.LBRACE)
+
+        nodes: list[NodeDecl] = []
+        while self.match(TokenType.NODE):
+            node_id = self.expect(TokenType.IDENT).value
+            self.expect(TokenType.COLON)
+            m_name = self.expect(TokenType.IDENT).value
+            self.expect(TokenType.SEMICOLON)
+            nodes.append(NodeDecl(node_id, m_name))
+
+        self.expect(TokenType.CONNECT)
+        self.expect(TokenType.LBRACE)
+        pipelines: list[ConnectPipeline] = []
+        while not self.match(TokenType.RBRACE):
+            elements = [self.expect(TokenType.IDENT).value]
+            while self.match(TokenType.SHR):
+                elements.append(self.expect(TokenType.IDENT).value)
+            self.expect(TokenType.SEMICOLON)
+            pipelines.append(ConnectPipeline(elements))
+
+        self.expect(TokenType.RBRACE)
+        return NetworkDecl(net_name, params, ret_type, nodes, pipelines)
 
     def parse_flow(self) -> Flow:
         self.expect(TokenType.FLOW)
@@ -120,6 +206,8 @@ class Parser:
             if self.match(TokenType.REG):
                 rname = self.expect(TokenType.IDENT).value
                 self.expect(TokenType.COLON)
+                if self.peek().type == TokenType.DISTINCT:
+                    raise SyntaxError("Unexpected token DISTINCT in flow register declaration")
                 rtype = self.parse_type_str()
                 init_expr = None
                 if self.match(TokenType.EQUALS):
@@ -147,7 +235,11 @@ class Parser:
             actions = []
             rules = []
             while not self.match(TokenType.RBRACE):
+                if self.peek().type == TokenType.DISTINCT:
+                    raise SyntaxError("Unexpected token DISTINCT in action")
                 if self.match(TokenType.LET):
+                    if self.peek().type == TokenType.DISTINCT:
+                        raise SyntaxError("Unexpected token DISTINCT in action")
                     if self.match(TokenType.UNDERSCORE):
                         tname = "_"
                     else:
@@ -310,7 +402,7 @@ class Parser:
                 return Q64Lit(-operand.val)
             if isinstance(operand, FloatLit):
                 return FloatLit(-operand.val, f"-{operand.raw_str}")
-            return BinaryExpr("-", IntLit(0), operand)
+            return UnaryExpr("-", operand)
         if self.match(TokenType.STAR):
             return UnaryExpr("*", self.parse_unary())
         if self.match(TokenType.BIT_AND):
@@ -347,8 +439,8 @@ class Parser:
         if self.peek().type == TokenType.STRING_LIT:
             val = self.expect(TokenType.STRING_LIT).value
             return StringLit(val)
-        if self.peek().type == TokenType.IDENT:
-            name = self.expect(TokenType.IDENT).value
+        if self.peek().type in (TokenType.IDENT, TokenType.NODE):
+            name = self.expect(self.peek().type).value
             if name == "null":
                 return NullLit()
             # Struct literal: TypeName { ... }

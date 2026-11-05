@@ -82,7 +82,7 @@ machine bump_alloc(alloc: *BumpAlloc, size: u32, align: u32) -> *u8 {
             _ => return res_ptr;
         }
         AllocFail: {
-            _ => panic(1);
+            _ => return null;
         }
     }
 }

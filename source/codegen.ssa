@@ -62,6 +62,13 @@ type BasicBlock = {
     buf_cap:      u32
 };
 
+type RetValEntry = {
+    val_p: *u8,
+    val_l: u32,
+    bb_p:  *u8,
+    bb_l:  u32
+};
+
 type CodegenCtx = {
     prog:        *ProgramDef,
     alloc:       *BumpAlloc,
@@ -94,7 +101,19 @@ type CodegenCtx = {
     cur_machine: *MachineDef,
     error_code:  i32,
     cur_state_p: *u8,
-    cur_state_l: u32
+    cur_state_l: u32,
+
+    pad_ctx:         u32,
+    node_prefix_p:   *u8,
+    node_prefix_l:   u32,
+    fused_next_bb_p: *u8,
+    fused_next_bb_l: u32,
+    fused_is_last:   u32,
+    fused_ret_cnt:   u32,
+    fused_ret_vals:  *RetValEntry,
+    fused_prev_type_p: *u8,
+    fused_prev_type_l: u32,
+    pad_ctx2:        u32
 };
 
 machine calc_bb_required_size(s: *StateDef, m: *MachineDef) -> u32 {
@@ -157,6 +176,38 @@ machine calc_branch_bb_size(m: *MachineDef) -> u32 {
     }
 }
 
+machine make_prefixed_name(alloc: *BumpAlloc, pfx_p: *u8, pfx_l: u32, name_p: *u8, name_l: u32) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            let b_p = alloc.base_ptr;
+            let off = alloc.offset;
+            let res_p = b_p + off;
+            let _ = call append_str_to_alloc(alloc, pfx_p, pfx_l);
+            let _ = call append_char_to_alloc(alloc, 95); // '_'
+            let _ = call append_str_to_alloc(alloc, name_p, name_l);
+            let _ = call append_char_to_alloc(alloc, 0);
+            _ => return res_p;
+        }
+    }
+}
+
+machine make_fused_reg_name(alloc: *BumpAlloc, nid_p: *u8, nid_l: u32) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            let b_p = alloc.base_ptr;
+            let off = alloc.offset;
+            let res_p = b_p + off;
+            let _ = call append_char_to_alloc(alloc, 37); // '%'
+            let _ = call append_str_to_alloc(alloc, nid_p, nid_l);
+            let _ = call append_str_to_alloc(alloc, "_res", 4);
+            let _ = call append_char_to_alloc(alloc, 0);
+            _ => return res_p;
+        }
+    }
+}
+
 machine add_basic_block(ctx: *CodegenCtx, name_p: *u8, name_l: u32, s_idx: i32, cap: u32) -> *BasicBlock {
     flow {
         wire alloc = ctx.alloc;
@@ -164,19 +215,39 @@ machine add_basic_block(ctx: *CodegenCtx, name_p: *u8, name_l: u32, s_idx: i32, 
         wire blks = ctx.blocks;
         wire bb = blks + idx;
         wire next_cnt = idx + 1;
+        wire pfx_p = ctx.node_prefix_p;
+        wire pfx_l = ctx.node_prefix_l;
     }
     states {
         Entry: {
-            let res_bb = bb;
+            pfx_p != null => WithPrefix;
+            _             => NoPrefix;
+        }
+        WithPrefix: {
+            let full_p = call make_prefixed_name(alloc, pfx_p, pfx_l, name_p, name_l);
+            let full_l = call strlen(full_p);
             let buf = call bump_alloc(alloc, cap, 8);
-            bb.name_ptr   <- name_p;
-            bb.name_len   <- name_l;
-            bb.state_idx  <- s_idx;
-            bb.buf_ptr    <- buf;
-            bb.buf_pos    <- 0;
-            bb.buf_cap    <- cap;
-            ctx.block_cnt <- next_cnt;
-            _ => return res_bb;
+            let ret_bb = bb;
+            ret_bb.name_ptr   <- full_p;
+            ret_bb.name_len   <- full_l;
+            ret_bb.state_idx  <- s_idx;
+            ret_bb.buf_ptr    <- buf;
+            ret_bb.buf_pos    <- 0;
+            ret_bb.buf_cap    <- cap;
+            ctx.block_cnt     <- next_cnt;
+            _ => return ret_bb;
+        }
+        NoPrefix: {
+            let buf = call bump_alloc(alloc, cap, 8);
+            let ret_bb = bb;
+            ret_bb.name_ptr   <- name_p;
+            ret_bb.name_len   <- name_l;
+            ret_bb.state_idx  <- s_idx;
+            ret_bb.buf_ptr    <- buf;
+            ret_bb.buf_pos    <- 0;
+            ret_bb.buf_cap    <- cap;
+            ctx.block_cnt     <- next_cnt;
+            _ => return ret_bb;
         }
     }
 }
@@ -960,6 +1031,71 @@ machine register_struct_type_map(ctx: *CodegenCtx, name_p: *u8, name_l: u32) -> 
     }
 }
 
+machine register_alias_type_map(ctx: *CodegenCtx, name_p: *u8, name_l: u32, base_p: *u8, base_l: u32) -> u32 {
+    flow {
+        wire alloc = ctx.alloc;
+        wire mapped_llvm = call map_type_ptr(ctx, base_p, base_l);
+        wire mapped_len = call map_type_len(ctx, base_p, base_l);
+    }
+    states {
+        Entry: {
+            let _ = call register_type_map(ctx, name_p, name_l, mapped_llvm, mapped_len);
+
+            let b_star = alloc.base_ptr;
+            let off_star = alloc.offset;
+            let star_src_p = b_star + off_star;
+            let _ = call append_char_to_alloc(alloc, 42); // '*'
+            let _ = call append_str_to_alloc(alloc, name_p, name_l);
+            let _ = call append_char_to_alloc(alloc, 0);
+            let star_src_l = name_l + 1;
+
+            let b_llvm = alloc.base_ptr;
+            let off_llvm = alloc.offset;
+            let star_llvm_p = b_llvm + off_llvm;
+            let _ = call append_str_to_alloc(alloc, mapped_llvm, mapped_len);
+            let _ = call append_char_to_alloc(alloc, 42); // '*'
+            let _ = call append_char_to_alloc(alloc, 0);
+            let star_llvm_l = mapped_len + 1;
+
+            let _ = call register_type_map(ctx, star_src_p, star_src_l, star_llvm_p, star_llvm_l);
+            _ => return 0;
+        }
+    }
+}
+
+machine register_one_type_def(ctx: *CodegenCtx, t_ptr: *TypeDef) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            let k = t_ptr.kind;
+            k == 1 => RegAliasKind;
+            k == 2 => RegAliasKind;
+            let f_cnt = t_ptr.field_count;
+            f_cnt == 1 => CheckAlias;
+            _          => RegStruct;
+        }
+        RegAliasKind: {
+            let _ = call register_alias_type_map(ctx, t_ptr.name_ptr, t_ptr.name_len, t_ptr.base_ptr, t_ptr.base_len);
+            _ => return 0;
+        }
+        CheckAlias: {
+            let f0 = t_ptr.fields;
+            let f0_nl = f0.name_len;
+            f0_nl == 0 => RegAlias;
+            _          => RegStruct;
+        }
+        RegAlias: {
+            let f0 = t_ptr.fields;
+            let _ = call register_alias_type_map(ctx, t_ptr.name_ptr, t_ptr.name_len, f0.type_ptr, f0.type_len);
+            _ => return 0;
+        }
+        RegStruct: {
+            let _ = call register_struct_type_map(ctx, t_ptr.name_ptr, t_ptr.name_len);
+            _ => return 0;
+        }
+    }
+}
+
 machine init_type_registry(ctx: *CodegenCtx) -> u32 {
     flow {
         reg t_idx: u32 = 0;
@@ -979,30 +1115,7 @@ machine init_type_registry(ctx: *CodegenCtx) -> u32 {
             _                   => Exit;
         }
         ProcessType: {
-            let f_cnt = t_ptr.field_count;
-            f_cnt == 1 => CheckAlias;
-            _          => RegStruct;
-        }
-        CheckAlias: {
-            let f0 = t_ptr.fields;
-            let f0_nl = f0.name_len;
-            f0_nl == 0 => RegAlias;
-            _          => RegStruct;
-        }
-        RegAlias: {
-            let f0 = t_ptr.fields;
-            let target_p = f0.type_ptr;
-            let target_l = f0.type_len;
-            let mapped_llvm = call map_type_ptr(ctx, target_p, target_l);
-            let mapped_len = call map_type_len(ctx, target_p, target_l);
-            let _ = call register_type_map(ctx, t_ptr.name_ptr, t_ptr.name_len, mapped_llvm, mapped_len);
-            _ => NextType;
-        }
-        RegStruct: {
-            let _ = call register_struct_type_map(ctx, t_ptr.name_ptr, t_ptr.name_len);
-            _ => NextType;
-        }
-        NextType: {
+            let _ = call register_one_type_def(ctx, t_ptr);
             _ => TypesLoop [ t_idx <= t_idx + 1 ];
         }
         Exit: {
@@ -2489,6 +2602,270 @@ machine emit_cast_op(ctx: *CodegenCtx, op_p: *u8, op_l: u32, src_t: *u8, src_l: 
     }
 }
 
+machine find_bounded_type(prog: *ProgramDef, name_p: *u8, name_l: u32) -> *TypeDef {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = prog.type_count;
+        wire has_more = i < cnt;
+        wire fld_t = prog.types;
+        wire t = fld_t + i;
+        wire is_match = call str_eq(t.name_ptr, t.name_len, name_p, name_l);
+    }
+    states {
+        Entry: {
+            name_p == null => NotFound;
+            _              => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            t.kind == 2   => CheckName;
+            _             => Next;
+        }
+        CheckName: {
+            is_match != 0 => Found;
+            _             => Next;
+        }
+        Next: {
+            _ => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return t;
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine emit_clamp_f32(ctx: *CodegenCtx, val_reg: *u8, type_def: *TypeDef) -> *u8 {
+    flow {
+        wire min_lit = type_def.min_ptr;
+        wire min_len = type_def.min_len;
+        wire max_lit = type_def.max_ptr;
+        wire max_len = type_def.max_len;
+    }
+    states {
+        Entry: {
+            let min_c = call fresh_tmp_str(ctx, "c_min", 5);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, min_c, call strlen(min_c));
+            let _ = call emit_str(ctx, " = fptrunc double ", 18);
+            let _ = call emit_str(ctx, min_lit, min_len);
+            let _ = call emit_str(ctx, " to float", 9);
+            let _ = call emit_nl(ctx);
+
+            let max_c = call fresh_tmp_str(ctx, "c_max", 5);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, max_c, call strlen(max_c));
+            let _ = call emit_str(ctx, " = fptrunc double ", 18);
+            let _ = call emit_str(ctx, max_lit, max_len);
+            let _ = call emit_str(ctx, " to float", 9);
+            let _ = call emit_nl(ctx);
+
+            let t1 = call fresh_tmp_str(ctx, "clamp_max", 9);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, t1, call strlen(t1));
+            let _ = call emit_str(ctx, " = call float @llvm.maxnum.f32(float ", 37);
+            let _ = call emit_str(ctx, val_reg, call strlen(val_reg));
+            let _ = call emit_str(ctx, ", float ", 8);
+            let _ = call emit_str(ctx, min_c, call strlen(min_c));
+            let _ = call emit_char(ctx, 41); // ')'
+            let _ = call emit_nl(ctx);
+
+            let t2 = call fresh_tmp_str(ctx, "clamped", 7);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, t2, call strlen(t2));
+            let _ = call emit_str(ctx, " = call float @llvm.minnum.f32(float ", 37);
+            let _ = call emit_str(ctx, t1, call strlen(t1));
+            let _ = call emit_str(ctx, ", float ", 8);
+            let _ = call emit_str(ctx, max_c, call strlen(max_c));
+            let _ = call emit_char(ctx, 41); // ')'
+            let _ = call emit_nl(ctx);
+            _ => return t2;
+        }
+    }
+}
+
+machine emit_clamp_f64(ctx: *CodegenCtx, val_reg: *u8, type_def: *TypeDef) -> *u8 {
+    flow {
+        wire min_lit = type_def.min_ptr;
+        wire min_len = type_def.min_len;
+        wire max_lit = type_def.max_ptr;
+        wire max_len = type_def.max_len;
+    }
+    states {
+        Entry: {
+            let t1 = call fresh_tmp_str(ctx, "clamp_max", 9);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, t1, call strlen(t1));
+            let _ = call emit_str(ctx, " = call double @llvm.maxnum.f64(double ", 40);
+            let _ = call emit_str(ctx, val_reg, call strlen(val_reg));
+            let _ = call emit_str(ctx, ", double ", 9);
+            let _ = call emit_str(ctx, min_lit, min_len);
+            let _ = call emit_char(ctx, 41); // ')'
+            let _ = call emit_nl(ctx);
+
+            let t2 = call fresh_tmp_str(ctx, "clamped", 7);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, t2, call strlen(t2));
+            let _ = call emit_str(ctx, " = call double @llvm.minnum.f64(double ", 40);
+            let _ = call emit_str(ctx, t1, call strlen(t1));
+            let _ = call emit_str(ctx, ", double ", 9);
+            let _ = call emit_str(ctx, max_lit, max_len);
+            let _ = call emit_char(ctx, 41); // ')'
+            let _ = call emit_nl(ctx);
+            _ => return t2;
+        }
+    }
+}
+
+machine emit_clamp_float(ctx: *CodegenCtx, val_reg: *u8, type_def: *TypeDef) -> *u8 {
+    flow {
+        wire is_f32 = call str_eq(type_def.base_ptr, type_def.base_len, "f32", 3);
+    }
+    states {
+        Entry: {
+            is_f32 != 0 => DoF32;
+            _           => DoF64;
+        }
+        DoF32: {
+            let res = call emit_clamp_f32(ctx, val_reg, type_def);
+            _ => return res;
+        }
+        DoF64: {
+            let res = call emit_clamp_f64(ctx, val_reg, type_def);
+            _ => return res;
+        }
+    }
+}
+
+machine emit_clamp_int_body(
+    ctx: *CodegenCtx,
+    val_reg: *u8,
+    llvm_t_p: *u8,
+    llvm_t_l: u32,
+    min_lit: *u8,
+    min_len: u32,
+    max_lit: *u8,
+    max_len: u32,
+    cmp_lt: *u8,
+    cmp_gt: *u8
+) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            let c1 = call fresh_tmp_str(ctx, "cmp_min", 7);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, c1, call strlen(c1));
+            let _ = call emit_str(ctx, " = icmp ", 8);
+            let _ = call emit_str(ctx, cmp_lt, 3);
+            let _ = call emit_char(ctx, 32);
+            let _ = call emit_str(ctx, llvm_t_p, llvm_t_l);
+            let _ = call emit_char(ctx, 32);
+            let _ = call emit_str(ctx, val_reg, call strlen(val_reg));
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, min_lit, min_len);
+            let _ = call emit_nl(ctx);
+
+            let s1 = call fresh_tmp_str(ctx, "val_min", 7);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, s1, call strlen(s1));
+            let _ = call emit_str(ctx, " = select i1 ", 13);
+            let _ = call emit_str(ctx, c1, call strlen(c1));
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, llvm_t_p, llvm_t_l);
+            let _ = call emit_char(ctx, 32);
+            let _ = call emit_str(ctx, min_lit, min_len);
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, llvm_t_p, llvm_t_l);
+            let _ = call emit_char(ctx, 32);
+            let _ = call emit_str(ctx, val_reg, call strlen(val_reg));
+            let _ = call emit_nl(ctx);
+
+            let c2 = call fresh_tmp_str(ctx, "cmp_max", 7);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, c2, call strlen(c2));
+            let _ = call emit_str(ctx, " = icmp ", 8);
+            let _ = call emit_str(ctx, cmp_gt, 3);
+            let _ = call emit_char(ctx, 32);
+            let _ = call emit_str(ctx, llvm_t_p, llvm_t_l);
+            let _ = call emit_char(ctx, 32);
+            let _ = call emit_str(ctx, s1, call strlen(s1));
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, max_lit, max_len);
+            let _ = call emit_nl(ctx);
+
+            let s2 = call fresh_tmp_str(ctx, "clamped", 7);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, s2, call strlen(s2));
+            let _ = call emit_str(ctx, " = select i1 ", 13);
+            let _ = call emit_str(ctx, c2, call strlen(c2));
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, llvm_t_p, llvm_t_l);
+            let _ = call emit_char(ctx, 32);
+            let _ = call emit_str(ctx, max_lit, max_len);
+            let _ = call emit_str(ctx, ", ", 2);
+            let _ = call emit_str(ctx, llvm_t_p, llvm_t_l);
+            let _ = call emit_char(ctx, 32);
+            let _ = call emit_str(ctx, s1, call strlen(s1));
+            let _ = call emit_nl(ctx);
+            _ => return s2;
+        }
+    }
+}
+
+machine emit_clamp_int(ctx: *CodegenCtx, val_reg: *u8, type_def: *TypeDef) -> *u8 {
+    flow {
+        wire b_p = type_def.base_ptr;
+        wire b_l = type_def.base_len;
+        wire is_u = *b_p == 117; // 'u'
+        wire llvm_t_p = call map_type_ptr(ctx, b_p, b_l);
+        wire llvm_t_l = call map_type_len(ctx, b_p, b_l);
+        wire min_lit = type_def.min_ptr;
+        wire min_len = type_def.min_len;
+        wire max_lit = type_def.max_ptr;
+        wire max_len = type_def.max_len;
+    }
+    states {
+        Entry: {
+            is_u != 0 => EmitUnsigned;
+            _         => EmitSigned;
+        }
+        EmitUnsigned: {
+            let res = call emit_clamp_int_body(ctx, val_reg, llvm_t_p, llvm_t_l, min_lit, min_len, max_lit, max_len, "ult", "ugt");
+            _ => return res;
+        }
+        EmitSigned: {
+            let res = call emit_clamp_int_body(ctx, val_reg, llvm_t_p, llvm_t_l, min_lit, min_len, max_lit, max_len, "slt", "sgt");
+            _ => return res;
+        }
+    }
+}
+
+machine emit_clamp(ctx: *CodegenCtx, val_reg: *u8, type_def: *TypeDef) -> *u8 {
+    flow {
+        wire b_p = type_def.base_ptr;
+        wire b_l = type_def.base_len;
+        wire is_f32 = call str_eq(b_p, b_l, "f32", 3);
+        wire is_f64 = call str_eq(b_p, b_l, "f64", 3);
+        wire is_fp = is_f32 | is_f64;
+    }
+    states {
+        Entry: {
+            is_fp != 0 => ClampFloat;
+            _          => ClampInt;
+        }
+        ClampFloat: {
+            let res = call emit_clamp_float(ctx, val_reg, type_def);
+            _ => return res;
+        }
+        ClampInt: {
+            let res = call emit_clamp_int(ctx, val_reg, type_def);
+            _ => return res;
+        }
+    }
+}
+
 machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     flow {
         reg src_is_ptr: u32 = 0;
@@ -2562,6 +2939,13 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let d_l = call strlen(d_type);
             let is_same = call str_eq(s_type, s_l, d_type, d_l);
             is_same != 0 => ReturnNop;
+
+            let map_s = call map_type_ptr(ctx, s_type, s_l);
+            let map_s_l = call map_type_len(ctx, s_type, s_l);
+            let map_d = call map_type_ptr(ctx, d_type, d_l);
+            let map_d_l = call map_type_len(ctx, d_type, d_l);
+            let is_llvm_same = call str_eq(map_s, map_s_l, map_d, map_d_l);
+            is_llvm_same != 0 => ReturnNop;
 
             let is_dst_q = call is_type_q64(d_type);
             is_dst_q != 0 => CastToQ64;
@@ -2791,6 +3175,8 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
 
 machine emit_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     flow {
+        reg cast_res: *u8 = null;
+        reg cast_bt:  *TypeDef = null;
         wire kind = expr.kind;
     }
     states {
@@ -2849,7 +3235,13 @@ machine emit_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
         }
         EmitCastExpr: {
             let res = call emit_cast_expr(ctx, expr);
-            _ => return res;
+            let btype = call find_bounded_type(ctx.prog, expr.str_ptr, expr.str_len);
+            btype != null => ClampCast [ cast_res <= res, cast_bt <= btype ];
+            _             => return res;
+        }
+        ClampCast: {
+            let cr = call emit_clamp(ctx, cast_res, cast_bt);
+            _ => return cr;
         }
     }
 }
@@ -2868,13 +3260,13 @@ machine emit_var(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let is_null = call str_eq(name_p, name_l, "null", 4);
             is_null != 0 => ReturnNull;
 
-            // マシンパラメータか？ -> "%arg_name"
-            let is_param = call find_param_idx(m, name_p, name_l);
-            is_param >= 0 => ReturnParam;
-
             // 現在のブロック環境 (cur_env) に登録されているか？
             let ssa_p = call env_get_ptr(ctx, name_p, name_l);
             ssa_p != null => ReturnEnv [ res_p <= ssa_p ];
+
+            // マシンパラメータか？ -> "%arg_name"
+            let is_param = call find_param_idx(m, name_p, name_l);
+            is_param >= 0 => ReturnParam;
 
             // マシンのワイヤーか？ -> オンデマンド展開して env に記録
             let wire_ptr = call find_wire(m, name_p, name_l);
@@ -3400,6 +3792,43 @@ machine emit_float_bin_op(ctx: *CodegenCtx, op: u32, lt_p: *u8, rt_p: *u8, lv: *
     }
 }
 
+machine bridge_operand_to_fp(ctx: *CodegenCtx, op_val: *u8, op_type: *u8, target_fp_type: *u8) -> *u8 {
+    flow {
+        wire is_q = call is_type_q64(op_type);
+        wire is_f64 = call str_contains(target_fp_type, call strlen(target_fp_type), "f64", 3);
+    }
+    states {
+        Entry: {
+            is_q == 0 => ReturnAsIs;
+            is_f64 != 0 => BridgeF64;
+            _           => BridgeF32;
+        }
+        BridgeF64: {
+            let res = call emit_bridge_q64_to_f64(ctx, op_val);
+            _ => return res;
+        }
+        BridgeF32: {
+            let res = call emit_bridge_q64_to_f32(ctx, op_val);
+            _ => return res;
+        }
+        ReturnAsIs: {
+            _ => return op_val;
+        }
+    }
+}
+
+machine emit_float_bin_op_bridged(ctx: *CodegenCtx, op: u32, lt_p: *u8, rt_p: *u8, lv: *u8, rv: *u8) -> *u8 {
+    flow {}
+    states {
+        Entry: {
+            let blv = call bridge_operand_to_fp(ctx, lv, lt_p, rt_p);
+            let brv = call bridge_operand_to_fp(ctx, rv, rt_p, lt_p);
+            let res = call emit_float_bin_op(ctx, op, lt_p, rt_p, blv, brv);
+            _ => return res;
+        }
+    }
+}
+
 machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     flow {
         reg left_val:     *u8 = null;
@@ -3485,7 +3914,7 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             _         => EmitStandard [ plv_r <= plv, prv_r <= prv ];
         }
         EmitFloatOp: {
-            let res = call emit_float_bin_op(ctx, op, left_type_p, right_type_p, left_val, right_val);
+            let res = call emit_float_bin_op_bridged(ctx, op, left_type_p, right_type_p, left_val, right_val);
             _ => return res;
         }
         CheckQ64Op: {
@@ -4022,7 +4451,12 @@ machine emit_call_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             // 内部マシンか？
             let mach = call find_machine_in_prog(prog, func_p, func_l);
             mach != null => EvalArgs [ target_params <= mach.params, target_param_cnt <= mach.param_count, target_ret_p <= mach.ret_type_ptr, target_ret_l <= mach.ret_type_len ];
-            _            => UnresolvedSymbol;
+            _            => SearchNetwork;
+        }
+        SearchNetwork: {
+            let net = call find_network_in_prog(prog, func_p, func_l);
+            net != null => EvalArgs [ target_params <= net.params, target_param_cnt <= net.param_count, target_ret_p <= net.ret_type_ptr, target_ret_l <= net.ret_type_len ];
+            _           => UnresolvedSymbol;
         }
         UnresolvedSymbol: {
             // 未解決シンボルフォールバック
@@ -4124,6 +4558,7 @@ machine eval_call_args(ctx: *CodegenCtx, fn_p: *u8, fn_l: u32, first_arg: *ExprN
         reg cur:     *ExprNode = null;
         reg cur_val: *u8 = null;
         reg cur_t:   *u8 = null;
+        reg arg_bt:  *TypeDef = null;
         wire has_more = cur != null;
     }
     states {
@@ -4198,6 +4633,17 @@ machine eval_call_args(ctx: *CodegenCtx, fn_p: *u8, fn_l: u32, first_arg: *ExprN
             _ => SaveArg [ cur_val <= ext_v ];
         }
         SaveArg: {
+            let exp_p = call get_param_type_ptr(ctx, params, param_cnt, i);
+            let exp_l = call get_param_type_len(ctx, params, param_cnt, i);
+            let btype = call find_bounded_type(ctx.prog, exp_p, exp_l);
+            btype != null => ClampCallArg [ arg_bt <= btype ];
+            _             => StoreSlot;
+        }
+        ClampCallArg: {
+            let cv = call emit_clamp(ctx, cur_val, arg_bt);
+            _ => StoreSlot [ cur_val <= cv ];
+        }
+        StoreSlot: {
             let slot = slots + i;
             slot.val_ptr <- cur_val;
             _ => Loop [ i <= i + 1, cur <= cur.next_arg ];
@@ -4501,23 +4947,13 @@ machine emit_machine_param_types(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
     }
 }
 
-machine emit_machine(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
+machine emit_machine_body(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
     flow {
         wire ret_p = call map_type_ptr(ctx, m.ret_type_ptr, m.ret_type_len);
         wire ret_l = call map_type_len(ctx, m.ret_type_ptr, m.ret_type_len);
     }
     states {
         Entry: {
-            ctx.cur_machine <- m;
-            ctx.cur_env_cnt <- 0;
-            ctx.phi_cnt     <- 0;
-            ctx.block_cnt   <- 0;
-
-            // Pass 1: 各ブロックの命令蓄積 & Phi 収集
-            let _ = call emit_entry_block(ctx, m);
-            let _ = call emit_machine_states(ctx, m);
-
-            // Pass 2: メイン出力バッファに並べ直して出力
             ctx.out_buf <- ctx.main_buf;
             ctx.out_pos <- ctx.main_pos;
             ctx.max_len <- ctx.main_cap;
@@ -4537,8 +4973,37 @@ machine emit_machine(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
             let _ = call emit_nl(ctx);
             let _ = call emit_nl(ctx);
             ctx.main_pos <- ctx.out_pos;
-
             _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine emit_machine(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
+    flow {
+        wire is_sealed = m.is_sealed;
+    }
+    states {
+        Entry: {
+            // [Shield 3]: Prefix Sanitization
+            ctx.node_prefix_p <- null;
+            ctx.node_prefix_l <- 0;
+
+            is_sealed != 0 => SkipSealed;
+            _              => DoEmit;
+        }
+        SkipSealed: {
+            _ => return ctx.out_pos;
+        }
+        DoEmit: {
+            ctx.cur_machine <- m;
+            ctx.cur_env_cnt <- 0;
+            ctx.phi_cnt     <- 0;
+            ctx.block_cnt   <- 0;
+
+            let _ = call emit_entry_block(ctx, m);
+            let _ = call emit_machine_states(ctx, m);
+            let res = call emit_machine_body(ctx, m);
+            _ => return res;
         }
     }
 }
@@ -4572,6 +5037,14 @@ machine emit_machine_params(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
             let mapped_p = call map_type_ptr(ctx, p.type_ptr, p.type_len);
             let mapped_l = call map_type_len(ctx, p.type_ptr, p.type_len);
             let _ = call emit_str(ctx, mapped_p, mapped_l);
+            p.is_distinct != 0 => EmitDistinct;
+            _                  => EmitArgName;
+        }
+        EmitDistinct: {
+            let _ = call emit_str(ctx, " noalias", 8);
+            _ => EmitArgName;
+        }
+        EmitArgName: {
             let _ = call emit_str(ctx, " %arg_", 6);
             let _ = call emit_str(ctx, p.name_ptr, p.name_len);
             _ => Loop [ p_idx <= p_idx + 1 ];
@@ -4582,12 +5055,72 @@ machine emit_machine_params(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
     }
 }
 
-machine emit_entry_block(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
+machine emit_bind_param_clamps(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
     flow {
-        reg r_idx:   u32 = 0;
+        reg p_idx:  u32 = 0;
+        reg cur_bt: *TypeDef = null;
+        wire cnt = m.param_count;
+        wire has_more = p_idx < cnt;
+        wire fld_p = m.params;
+        wire p = fld_p + p_idx;
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            _ => Loop [ p_idx <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => CheckParam;
+            _             => Exit;
+        }
+        CheckParam: {
+            let btype = call find_bounded_type(ctx.prog, p.type_ptr, p.type_len);
+            btype != null => ClampParam [ cur_bt <= btype ];
+            _             => NextParam;
+        }
+        ClampParam: {
+            let b_arg = alloc.base_ptr;
+            let off_arg = alloc.offset;
+            let arg_p = b_arg + off_arg;
+            let _ = call append_str_to_alloc(alloc, "%arg_", 5);
+            let _ = call append_str_to_alloc(alloc, p.name_ptr, p.name_len);
+            let _ = call append_char_to_alloc(alloc, 0);
+            let cv = call emit_clamp(ctx, arg_p, cur_bt);
+            let cv_l = call strlen(cv);
+            let _ = call env_set(ctx, p.name_ptr, p.name_len, cv, cv_l);
+            _ => NextParam;
+        }
+        NextParam: {
+            _ => Loop [ p_idx <= p_idx + 1 ];
+        }
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_init_expr_val(ctx: *CodegenCtx, reg_def: *RegDef) -> *u8 {
+    flow {
         reg raw_val: *u8 = null;
-        reg raw_t:   *u8 = null;
-        reg final_v: *u8 = null;
+        reg reg_bt:  *TypeDef = null;
+    }
+    states {
+        Entry: {
+            let val = call emit_expr(ctx, reg_def.init_expr);
+            let btype = call find_bounded_type(ctx.prog, reg_def.type_ptr, reg_def.type_len);
+            btype != null => DoClamp [ raw_val <= val, reg_bt <= btype ];
+            _             => return val;
+        }
+        DoClamp: {
+            let cv = call emit_clamp(ctx, raw_val, reg_bt);
+            _ => return cv;
+        }
+    }
+}
+
+machine emit_entry_regs_init(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
+    flow {
+        reg r_idx: u32 = 0;
         wire cnt = m.reg_count;
         wire has_more = r_idx < cnt;
         wire fld_reg_def = m.regs;
@@ -4596,23 +5129,18 @@ machine emit_entry_block(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
     }
     states {
         Entry: {
-            let entry_s = m.state_defs;
-            let cap = call calc_bb_required_size(entry_s, m);
-            let entry_bb = call add_basic_block(ctx, "entry", 5, 0, cap);
-            let _ = call switch_to_bb(ctx, entry_bb);
-            ctx.cur_env_cnt <- 0;
             _ => InitRegsLoop [ r_idx <= 0 ];
         }
         InitRegsLoop: {
             has_more != 0 => InitOneReg;
-            _             => ProcessEntryActions;
+            _             => Exit;
         }
         InitOneReg: {
             init_e != null => HasInit;
             _              => NoInit;
         }
         HasInit: {
-            let val = call emit_expr(ctx, init_e);
+            let val = call emit_init_expr_val(ctx, reg_def);
             let val_l = call strlen(val);
             let _ = call env_set(ctx, reg_def.name_ptr, reg_def.name_len, val, val_l);
             _ => NextReg;
@@ -4626,10 +5154,47 @@ machine emit_entry_block(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
         NextReg: {
             _ => InitRegsLoop [ r_idx <= r_idx + 1 ];
         }
-        ProcessEntryActions: {
-            let entry_s = m.state_defs;
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_entry_block(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
+    flow {
+        reg entry_bb: *BasicBlock = null;
+        wire entry_s = m.state_defs;
+        wire ret_cnt = ctx.fused_ret_cnt;
+        wire is_fused = ctx.node_prefix_p != null;
+    }
+    states {
+        Entry: {
+            let cap = call calc_bb_required_size(entry_s, m);
+            let bb = call add_basic_block(ctx, "entry", 5, 0, cap);
+            let _ = call switch_to_bb(ctx, bb);
+
+            ret_cnt > 0 => EmitPhi [ entry_bb <= bb ];
+            _           => CheckEnv [ entry_bb <= bb ];
+        }
+        EmitPhi: {
+            let res_p = call make_fused_reg_name(ctx.alloc, ctx.node_prefix_p, ctx.node_prefix_l);
+            let res_l = call strlen(res_p);
+            let _ = call emit_phi_bridge(ctx, ctx.fused_prev_type_p, ctx.fused_prev_type_l, res_p, res_l);
+            ctx.fused_ret_cnt <- 0;
+            _ => CheckEnv;
+        }
+        CheckEnv: {
+            is_fused == 0 => ResetEnv;
+            _             => AfterEnv;
+        }
+        ResetEnv: {
+            ctx.cur_env_cnt <- 0;
+            _ => AfterEnv;
+        }
+        AfterEnv: {
+            let _ = call emit_bind_param_clamps(ctx, m);
+            let _ = call emit_entry_regs_init(ctx, m);
             let _ = call emit_state_actions(ctx, entry_s);
-            let entry_bb = ctx.blocks; // blocks[0]
             let _ = call emit_state_rules(ctx, m, entry_s, 0, entry_bb);
             _ => return 0;
         }
@@ -4742,6 +5307,34 @@ machine emit_state_actions(ctx: *CodegenCtx, s: *StateDef) -> u32 {
     }
 }
 
+machine make_reg_var_name(alloc: *BumpAlloc, pfx_p: *u8, pfx_l: u32, reg_p: *u8, reg_l: u32, s_p: *u8, s_l: u32) -> *u8 {
+    flow {
+        reg start_ptr: *u8 = null;
+    }
+    states {
+        Entry: {
+            let b = alloc.base_ptr;
+            let off = alloc.offset;
+            let res = b + off;
+            let _ = call append_str_to_alloc(alloc, "%reg_", 5);
+            pfx_p != null => WithPrefix [ start_ptr <= res ];
+            _             => NoPrefix [ start_ptr <= res ];
+        }
+        WithPrefix: {
+            let _ = call append_str_to_alloc(alloc, pfx_p, pfx_l);
+            let _ = call append_char_to_alloc(alloc, 95); // '_'
+            _ => NoPrefix;
+        }
+        NoPrefix: {
+            let _ = call append_str_to_alloc(alloc, reg_p, reg_l);
+            let _ = call append_char_to_alloc(alloc, 95); // '_'
+            let _ = call append_str_to_alloc(alloc, s_p, s_l);
+            let _ = call append_char_to_alloc(alloc, 0);
+            _ => return start_ptr;
+        }
+    }
+}
+
 machine prepare_state_regs(ctx: *CodegenCtx, m: *MachineDef, s: *StateDef) -> u32 {
     flow {
         reg r_idx: u32 = 0;
@@ -4760,15 +5353,7 @@ machine prepare_state_regs(ctx: *CodegenCtx, m: *MachineDef, s: *StateDef) -> u3
             _             => Exit;
         }
         Step: {
-            let b_reg_var = alloc.base_ptr;
-            let off_reg_var = alloc.offset;
-            let reg_var = b_reg_var + off_reg_var;
-            let _ = call append_str_to_alloc(alloc, "%reg_", 5);
-            let _ = call append_str_to_alloc(alloc, reg_def.name_ptr, reg_def.name_len);
-            let _ = call append_char_to_alloc(alloc, 95); // '_'
-            let _ = call append_str_to_alloc(alloc, s.name_ptr, s.name_len);
-            let _ = call append_char_to_alloc(alloc, 0);
-
+            let reg_var = call make_reg_var_name(alloc, ctx.node_prefix_p, ctx.node_prefix_l, reg_def.name_ptr, reg_def.name_len, s.name_ptr, s.name_len);
             let _ = call env_set(ctx, reg_def.name_ptr, reg_def.name_len, reg_var, call strlen(reg_var));
             _ => Loop [ r_idx <= r_idx + 1 ];
         }
@@ -4887,11 +5472,10 @@ machine emit_state_phi_nodes(ctx: *CodegenCtx, m: *MachineDef, s: *StateDef, s_i
         EmitOnePhi: {
             let rtype_p = call map_type_ptr(ctx, reg_def.type_ptr, reg_def.type_len);
             let rtype_l = call map_type_len(ctx, reg_def.type_ptr, reg_def.type_len);
+            let reg_var = call make_reg_var_name(ctx.alloc, ctx.node_prefix_p, ctx.node_prefix_l, reg_def.name_ptr, reg_def.name_len, s.name_ptr, s.name_len);
 
-            let _ = call emit_str(ctx, "  %reg_", 7);
-            let _ = call emit_str(ctx, reg_def.name_ptr, reg_def.name_len);
-            let _ = call emit_char(ctx, 95); // '_'
-            let _ = call emit_str(ctx, s.name_ptr, s.name_len);
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, reg_var, call strlen(reg_var));
             let _ = call emit_str(ctx, " = phi ", 7);
             let _ = call emit_str(ctx, rtype_p, rtype_l);
             let _ = call emit_char(ctx, 32); // ' '
@@ -4963,8 +5547,70 @@ machine emit_phi_entries(ctx: *CodegenCtx, s_idx: u32, r_idx: u32) -> u32 {
     }
 }
 
-machine emit_ret_value(ctx: *CodegenCtx, m: *MachineDef, expr: *ExprNode) -> u32 {
+machine record_fused_return(ctx: *CodegenCtx, val_p: *u8, cur_bb: *BasicBlock) -> u32 {
+    flow {
+        wire cnt = ctx.fused_ret_cnt;
+        wire fld_ret = ctx.fused_ret_vals;
+        wire slot = fld_ret + cnt;
+    }
+    states {
+        Entry: {
+            slot.val_p <- val_p;
+            slot.val_l <- call strlen(val_p);
+            slot.bb_p  <- cur_bb.name_ptr;
+            slot.bb_l  <- cur_bb.name_len;
+            ctx.fused_ret_cnt <- cnt + 1;
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_branch_target(ctx: *CodegenCtx, target_p: *u8, target_l: u32) -> u32 {
+    flow {
+        wire pfx_p = ctx.node_prefix_p;
+        wire pfx_l = ctx.node_prefix_l;
+    }
+    states {
+        Entry: {
+            let _ = call emit_str(ctx, "  br label %", 12);
+            pfx_p != null => WithPrefix;
+            _             => NoPrefix;
+        }
+        WithPrefix: {
+            let _ = call emit_str(ctx, pfx_p, pfx_l);
+            let _ = call emit_char(ctx, 95); // '_'
+            _ => NoPrefix;
+        }
+        NoPrefix: {
+            let _ = call emit_str(ctx, target_p, target_l);
+            let _ = call emit_nl(ctx);
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_ret_inst(ctx: *CodegenCtx, m: *MachineDef, val: *u8) -> u32 {
     flow {}
+    states {
+        Entry: {
+            let ret_p = call map_type_ptr(ctx, m.ret_type_ptr, m.ret_type_len);
+            let ret_l = call map_type_len(ctx, m.ret_type_ptr, m.ret_type_len);
+            let v_len = call strlen(val);
+            let _ = call emit_str(ctx, "  ret ", 6);
+            let _ = call emit_str(ctx, ret_p, ret_l);
+            let _ = call emit_char(ctx, 32);
+            let _ = call emit_str(ctx, val, v_len);
+            let _ = call emit_nl(ctx);
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine emit_ret_value(ctx: *CodegenCtx, m: *MachineDef, expr: *ExprNode, cur_bb: *BasicBlock) -> u32 {
+    flow {
+        reg cur_val: *u8 = null;
+        reg cur_bt:  *TypeDef = null;
+    }
     states {
         Entry: {
             let val = call emit_expr(ctx, expr);
@@ -4972,17 +5618,33 @@ machine emit_ret_value(ctx: *CodegenCtx, m: *MachineDef, expr: *ExprNode) -> u32
             let vtl = call strlen(vt);
             let ok = call validate_type(ctx, 4, m.name_ptr, m.name_len, 0, m.ret_type_ptr, m.ret_type_len, vt, vtl, expr);
 
-            let ret_p = call map_type_ptr(ctx, m.ret_type_ptr, m.ret_type_len);
-            let ret_l = call map_type_len(ctx, m.ret_type_ptr, m.ret_type_len);
-
-            let _ = call emit_str(ctx, "  ret ", 6);
-            let _ = call emit_str(ctx, ret_p, ret_l);
-            let _ = call emit_char(ctx, 32); // ' '
-            let _ = call emit_str(ctx, val, call strlen(val));
-            let _ = call emit_nl(ctx);
-            _ => Exit;
+            let btype = call find_bounded_type(ctx.prog, m.ret_type_ptr, m.ret_type_len);
+            btype != null => DoClamp [ cur_val <= val, cur_bt <= btype ];
+            _             => CheckFused [ cur_val <= val ];
         }
-        Exit: {
+        DoClamp: {
+            let cv = call emit_clamp(ctx, cur_val, cur_bt);
+            _ => CheckFused [ cur_val <= cv ];
+        }
+        CheckFused: {
+            let is_fused = ctx.node_prefix_p != null;
+            is_fused != 0 => CheckLast;
+            _             => DoRet;
+        }
+        CheckLast: {
+            let is_last = ctx.fused_is_last;
+            is_last == 0 => EmitBranchNext;
+            _            => DoRet;
+        }
+        EmitBranchNext: {
+            let _ = call record_fused_return(ctx, cur_val, cur_bb);
+            let _ = call emit_str(ctx, "  br label %", 12);
+            let _ = call emit_str(ctx, ctx.fused_next_bb_p, ctx.fused_next_bb_l);
+            let _ = call emit_nl(ctx);
+            _ => return ctx.out_pos;
+        }
+        DoRet: {
+            let _ = call emit_ret_inst(ctx, m, cur_val);
             _ => return ctx.out_pos;
         }
     }
@@ -5019,7 +5681,7 @@ machine emit_state_rules(ctx: *CodegenCtx, m: *MachineDef, s: *StateDef, s_idx: 
             _                => RetVoid;
         }
         RetVal: {
-            let _ = call emit_ret_value(ctx, m, rule_ret);
+            let _ = call emit_ret_value(ctx, m, rule_ret, cur_bb);
             _ => FinishStateBlock;
         }
         RetVoid: {
@@ -5081,9 +5743,7 @@ machine emit_state_rules(ctx: *CodegenCtx, m: *MachineDef, s: *StateDef, s_idx: 
             let then_bb = call add_basic_block(ctx, then_bb_p, then_bb_l, -1, branch_cap);
             let _ = call switch_to_bb(ctx, then_bb);
             let _ = call record_latches_for_rule(ctx, m, rule, then_bb_p, then_bb_l);
-            let _ = call emit_str(ctx, "  br label %", 12);
-            let _ = call emit_str(ctx, rule.target_ptr, rule.target_len);
-            let _ = call emit_nl(ctx);
+            let _ = call emit_branch_target(ctx, rule.target_ptr, rule.target_len);
             let _ = call finish_cur_bb(ctx, then_bb);
 
             // else_bb を追加して次のルールの出力先にする
@@ -5094,9 +5754,7 @@ machine emit_state_rules(ctx: *CodegenCtx, m: *MachineDef, s: *StateDef, s_idx: 
         }
         UnconditionalBranch: {
             let _ = call record_latches_for_rule(ctx, m, rule, cur_bb.name_ptr, cur_bb.name_len);
-            let _ = call emit_str(ctx, "  br label %", 12);
-            let _ = call emit_str(ctx, rule.target_ptr, rule.target_len);
-            let _ = call emit_nl(ctx);
+            let _ = call emit_branch_target(ctx, rule.target_ptr, rule.target_len);
             _ => FinishStateBlock;
         }
         VectorGuardError: {
@@ -5184,6 +5842,62 @@ machine assemble_machine_blocks(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
     }
 }
 
+machine record_one_latch_phi(
+    ctx: *CodegenCtx,
+    reg_def: *RegDef,
+    rule: *TransitionRule,
+    target_s_idx: i32,
+    r_idx: u32,
+    from_bb_p: *u8,
+    from_bb_l: u32
+) -> u32 {
+    flow {
+        reg cur_val: *u8 = null;
+        reg cur_bt:  *TypeDef = null;
+        wire latch_e = call find_latch_expr(rule, reg_def.name_ptr, reg_def.name_len);
+        wire ssa_p = call env_get_ptr(ctx, reg_def.name_ptr, reg_def.name_len);
+    }
+    states {
+        Entry: {
+            latch_e != null => HasLatch;
+            _               => DefaultLatch;
+        }
+        HasLatch: {
+            let val = call emit_expr(ctx, latch_e);
+            let lt = call get_expr_type(ctx, latch_e);
+            let ltl = call strlen(lt);
+            let ok = call validate_type(ctx, 3, reg_def.name_ptr, reg_def.name_len, 0, reg_def.type_ptr, reg_def.type_len, lt, ltl, latch_e);
+            let btype = call find_bounded_type(ctx.prog, reg_def.type_ptr, reg_def.type_len);
+            btype != null => ClampLatch [ cur_val <= val, cur_bt <= btype ];
+            _             => RecordLatch [ cur_val <= val ];
+        }
+        ClampLatch: {
+            let cv = call emit_clamp(ctx, cur_val, cur_bt);
+            _ => RecordLatch [ cur_val <= cv ];
+        }
+        RecordLatch: {
+            let val_l = call strlen(cur_val);
+            let _ = call record_phi_incoming(ctx, target_s_idx, r_idx, from_bb_p, from_bb_l, cur_val, val_l);
+            _ => return 0;
+        }
+        DefaultLatch: {
+            ssa_p != null => EmitEnvVal;
+            _             => EmitDefVal;
+        }
+        EmitEnvVal: {
+            let val_l = call strlen(ssa_p);
+            let _ = call record_phi_incoming(ctx, target_s_idx, r_idx, from_bb_p, from_bb_l, ssa_p, val_l);
+            _ => return 0;
+        }
+        EmitDefVal: {
+            let def_val = call get_default_reg_val(reg_def.type_ptr, reg_def.type_len);
+            let val_l = call strlen(def_val);
+            let _ = call record_phi_incoming(ctx, target_s_idx, r_idx, from_bb_p, from_bb_l, def_val, val_l);
+            _ => return 0;
+        }
+    }
+}
+
 machine record_latches_for_rule(ctx: *CodegenCtx, m: *MachineDef, rule: *TransitionRule, from_bb_p: *u8, from_bb_l: u32) -> u32 {
     flow {
         reg r_idx: u32 = 0;
@@ -5192,8 +5906,6 @@ machine record_latches_for_rule(ctx: *CodegenCtx, m: *MachineDef, rule: *Transit
         wire fld_reg_def = m.regs;
         wire reg_def = fld_reg_def + r_idx;
         wire target_s_idx = call find_state_idx(m, rule.target_ptr, rule.target_len);
-        wire latch_e = call find_latch_expr(rule, reg_def.name_ptr, reg_def.name_len);
-        wire ssa_p = call env_get_ptr(ctx, reg_def.name_ptr, reg_def.name_len);
     }
     states {
         Entry: {
@@ -5205,34 +5917,7 @@ machine record_latches_for_rule(ctx: *CodegenCtx, m: *MachineDef, rule: *Transit
             _             => Exit;
         }
         ProcessOneReg: {
-            latch_e != null => HasLatch;
-            _               => DefaultLatch;
-        }
-        HasLatch: {
-            let val = call emit_expr(ctx, latch_e);
-            let val_l = call strlen(val);
-            let lt = call get_expr_type(ctx, latch_e);
-            let ltl = call strlen(lt);
-            let ok = call validate_type(ctx, 3, reg_def.name_ptr, reg_def.name_len, 0, reg_def.type_ptr, reg_def.type_len, lt, ltl, latch_e);
-            let _ = call record_phi_incoming(ctx, target_s_idx, r_idx, from_bb_p, from_bb_l, val, val_l);
-            _ => NextReg;
-        }
-        DefaultLatch: {
-            ssa_p != null => EmitEnvVal;
-            _             => EmitDefVal;
-        }
-        EmitEnvVal: {
-            let val_l = call strlen(ssa_p);
-            let _ = call record_phi_incoming(ctx, target_s_idx, r_idx, from_bb_p, from_bb_l, ssa_p, val_l);
-            _ => NextReg;
-        }
-        EmitDefVal: {
-            let def_val = call get_default_reg_val(reg_def.type_ptr, reg_def.type_len);
-            let val_l = call strlen(def_val);
-            let _ = call record_phi_incoming(ctx, target_s_idx, r_idx, from_bb_p, from_bb_l, def_val, val_l);
-            _ => NextReg;
-        }
-        NextReg: {
+            let _ = call record_one_latch_phi(ctx, reg_def, rule, target_s_idx, r_idx, from_bb_p, from_bb_l);
             _ => Loop [ r_idx <= r_idx + 1 ];
         }
         Exit: {
@@ -5324,6 +6009,36 @@ machine emit_header(ctx: *CodegenCtx) -> u32 {
     }
 }
 
+machine emit_one_type_def(ctx: *CodegenCtx, t_ptr: *TypeDef) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            t_ptr.kind != 0 => Skip;
+            let f_cnt = t_ptr.field_count;
+            f_cnt == 1 => CheckAlias;
+            _          => EmitStruct;
+        }
+        CheckAlias: {
+            let f0 = t_ptr.fields;
+            let f0_nl = f0.name_len;
+            f0_nl == 0 => Skip;
+            _          => EmitStruct;
+        }
+        EmitStruct: {
+            let _ = call emit_str(ctx, "%struct.", 8);
+            let _ = call emit_str(ctx, t_ptr.name_ptr, t_ptr.name_len);
+            let _ = call emit_str(ctx, " = type { ", 10);
+            let _ = call emit_struct_fields(ctx, t_ptr);
+            let _ = call emit_str(ctx, " }", 2);
+            let _ = call emit_nl(ctx);
+            _ => return 0;
+        }
+        Skip: {
+            _ => return 0;
+        }
+    }
+}
+
 machine emit_all_types(ctx: *CodegenCtx) -> u32 {
     flow {
         reg t_idx: u32 = 0;
@@ -5342,31 +6057,7 @@ machine emit_all_types(ctx: *CodegenCtx) -> u32 {
             _             => Done;
         }
         ProcessOne: {
-            // エイリアス型なら構造体定義はスキップ (codegen.py L29-36)
-            let f_cnt = t_ptr.field_count;
-            f_cnt == 1 => CheckAlias;
-            _          => EmitStruct;
-        }
-        CheckAlias: {
-            let f0 = t_ptr.fields;
-            let f0_nl = f0.name_len;
-            f0_nl == 0 => SkipAlias;
-            _          => EmitStruct;
-        }
-        SkipAlias: {
-            _ => NextIter;
-        }
-        EmitStruct: {
-            let _ = call emit_str(ctx, "%struct.", 8);
-            let _ = call emit_str(ctx, t_ptr.name_ptr, t_ptr.name_len);
-            let _ = call emit_str(ctx, " = type { ", 10);
-
-            let _ = call emit_struct_fields(ctx, t_ptr);
-            let _ = call emit_str(ctx, " }", 2);
-            let _ = call emit_nl(ctx);
-            _ => NextIter;
-        }
-        NextIter: {
+            let _ = call emit_one_type_def(ctx, t_ptr);
             _ => Loop [ t_idx <= t_idx + 1 ];
         }
         Done: {
@@ -5498,6 +6189,14 @@ machine emit_extern_params(ctx: *CodegenCtx, ext: *ExternFn) -> u32 {
             let mapped_p = call map_type_ptr(ctx, p.type_ptr, p.type_len);
             let mapped_l = call map_type_len(ctx, p.type_ptr, p.type_len);
             let _ = call emit_str(ctx, mapped_p, mapped_l);
+            p.is_distinct != 0 => EmitDistinct;
+            _                  => NextParam;
+        }
+        EmitDistinct: {
+            let _ = call emit_str(ctx, " noalias", 8);
+            _ => NextParam;
+        }
+        NextParam: {
             _ => Loop [ p_idx <= p_idx + 1 ];
         }
         Exit: {
@@ -5600,6 +6299,627 @@ machine emit_all_machines(ctx: *CodegenCtx) -> u32 {
     }
 }
 
+machine mark_net_nodes(prog: *ProgramDef, net: *NetworkDef) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = net.node_count;
+        wire has_more = i < cnt;
+        wire fld_node = net.nodes;
+        wire cur_node = fld_node + i;
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => SealOne;
+            _             => Exit;
+        }
+        SealOne: {
+            let m = call find_machine_in_prog(prog, cur_node.mach_name_p, cur_node.mach_name_l);
+            m != null => DoSeal;
+            _         => Next;
+        }
+        DoSeal: {
+            let m = call find_machine_in_prog(prog, cur_node.mach_name_p, cur_node.mach_name_l);
+            m.is_sealed <- 1;
+            _ => Next;
+        }
+        Next: {
+            _ => Loop [ i <= i + 1 ];
+        }
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
+machine mark_sealed_machines(prog: *ProgramDef) -> u32 {
+    flow {
+        reg n_idx: u32 = 0;
+        wire cnt = prog.network_count;
+        wire has_more = n_idx < cnt;
+        wire fld_net = prog.networks;
+        wire net = fld_net + n_idx;
+    }
+    states {
+        Entry: {
+            _ => LoopNet [ n_idx <= 0 ];
+        }
+        LoopNet: {
+            has_more != 0 => MarkNet;
+            _             => Exit;
+        }
+        MarkNet: {
+            let _ = call mark_net_nodes(prog, net);
+            _ => LoopNet [ n_idx <= n_idx + 1 ];
+        }
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
+machine find_network_in_prog(prog: *ProgramDef, name_p: *u8, name_l: u32) -> *NetworkDef {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = prog.network_count;
+        wire has_more = i < cnt;
+        wire fld_net = prog.networks;
+        wire net = fld_net + i;
+        wire is_match = call str_eq(net.name_ptr, net.name_len, name_p, name_l);
+    }
+    states {
+        Entry: {
+            name_p == null => NotFound;
+            _              => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Next;
+        }
+        Next: {
+            _ => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            _ => return net;
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine find_network_node_machine(prog: *ProgramDef, net: *NetworkDef, nid_p: *u8, nid_l: u32) -> *MachineDef {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = net.node_count;
+        wire has_more = i < cnt;
+        wire fld_node = net.nodes;
+        wire cur_node = fld_node + i;
+        wire is_match = call str_eq(cur_node.node_id_p, cur_node.node_id_l, nid_p, nid_l);
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => FoundNode;
+            _             => Next;
+        }
+        FoundNode: {
+            let m = call find_machine_in_prog(prog, cur_node.mach_name_p, cur_node.mach_name_l);
+            _ => return m;
+        }
+        Next: {
+            _ => Loop [ i <= i + 1 ];
+        }
+        NotFound: {
+            _ => return null;
+        }
+    }
+}
+
+machine emit_net_params(ctx: *CodegenCtx, net: *NetworkDef) -> u32 {
+    flow {
+        reg p_idx: u32 = 0;
+        wire cnt = net.param_count;
+        wire has_more = p_idx < cnt;
+        wire fld_p = net.params;
+        wire p = fld_p + p_idx;
+        wire is_first = p_idx == 0;
+    }
+    states {
+        Entry: {
+            _ => Loop [ p_idx <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => EmitParam;
+            _             => Exit;
+        }
+        EmitParam: {
+            is_first == 0 => EmitComma;
+            _             => EmitOne;
+        }
+        EmitComma: {
+            let _ = call emit_str(ctx, ", ", 2);
+            _ => EmitOne;
+        }
+        EmitOne: {
+            let mapped_p = call map_type_ptr(ctx, p.type_ptr, p.type_len);
+            let mapped_l = call map_type_len(ctx, p.type_ptr, p.type_len);
+            let _ = call emit_str(ctx, mapped_p, mapped_l);
+            let _ = call emit_str(ctx, " %arg_", 6);
+            let _ = call emit_str(ctx, p.name_ptr, p.name_len);
+            _ => Loop [ p_idx <= p_idx + 1 ];
+        }
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_net_header(ctx: *CodegenCtx, net: *NetworkDef, first_nid_p: *u8, first_nid_l: u32) -> u32 {
+    flow {
+        wire ret_p = call map_type_ptr(ctx, net.ret_type_ptr, net.ret_type_len);
+        wire ret_l = call map_type_len(ctx, net.ret_type_ptr, net.ret_type_len);
+    }
+    states {
+        Entry: {
+            let _ = call emit_str(ctx, "define ", 7);
+            let _ = call emit_str(ctx, ret_p, ret_l);
+            let _ = call emit_str(ctx, " @", 2);
+            let _ = call emit_str(ctx, net.name_ptr, net.name_len);
+            let _ = call emit_char(ctx, 40); // '('
+            let _ = call emit_net_params(ctx, net);
+            let _ = call emit_str(ctx, ") {", 3);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "net_entry:", 10);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "  br label %", 12);
+            let _ = call emit_str(ctx, first_nid_p, first_nid_l);
+            let _ = call emit_str(ctx, "_entry", 6);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_nl(ctx);
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_net_close(ctx: *CodegenCtx) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            ctx.out_buf <- ctx.main_buf;
+            ctx.out_pos <- ctx.main_pos;
+            ctx.max_len <- ctx.main_cap;
+
+            let _ = call emit_char(ctx, 125); // '}'
+            let _ = call emit_nl(ctx);
+            let _ = call emit_nl(ctx);
+            ctx.main_pos <- ctx.out_pos;
+
+            // [Shield 3]: Prefix Sanitization
+            ctx.node_prefix_p     <- null;
+            ctx.node_prefix_l     <- 0;
+            ctx.fused_is_last     <- 0;
+            ctx.fused_ret_cnt     <- 0;
+            ctx.fused_prev_type_p <- null;
+            ctx.fused_prev_type_l <- 0;
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine emit_phi_bridge(ctx: *CodegenCtx, out_type_p: *u8, out_type_l: u32, res_p: *u8, res_l: u32) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire cnt = ctx.fused_ret_cnt;
+        wire has_more = i < cnt;
+        wire fld_ret = ctx.fused_ret_vals;
+        wire slot = fld_ret + i;
+        wire is_first = i == 0;
+    }
+    states {
+        Entry: {
+            cnt == 0 => Exit;
+            let _ = call emit_str(ctx, "  ", 2);
+            let _ = call emit_str(ctx, res_p, res_l);
+            let _ = call emit_str(ctx, " = phi ", 7);
+            let _ = call emit_str(ctx, out_type_p, out_type_l);
+            let _ = call emit_char(ctx, 32); // ' '
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => EmitOne;
+            _             => FinishPhi;
+        }
+        EmitOne: {
+            is_first == 0 => EmitComma;
+            _             => EmitEntry;
+        }
+        EmitComma: {
+            let _ = call emit_str(ctx, ", ", 2);
+            _ => EmitEntry;
+        }
+        EmitEntry: {
+            let _ = call emit_str(ctx, "[ ", 2);
+            let _ = call emit_str(ctx, slot.val_p, slot.val_l);
+            let _ = call emit_str(ctx, ", %", 3);
+            let _ = call emit_str(ctx, slot.bb_p, slot.bb_l);
+            let _ = call emit_str(ctx, " ]", 2);
+            _ => Loop [ i <= i + 1 ];
+        }
+        FinishPhi: {
+            let _ = call emit_nl(ctx);
+            _ => Exit;
+        }
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
+machine assemble_fused_blocks(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
+    flow {
+        reg b_idx: u32 = 0;
+        wire cnt = ctx.block_cnt;
+        wire has_more = b_idx < cnt;
+        wire fld_bb = ctx.blocks;
+        wire bb = fld_bb + b_idx;
+    }
+    states {
+        Entry: {
+            _ => Loop [ b_idx <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => EmitBlock;
+            _             => Exit;
+        }
+        EmitBlock: {
+            let _ = call emit_str(ctx, bb.name_ptr, bb.name_len);
+            let _ = call emit_char(ctx, 58); // ':'
+            let _ = call emit_nl(ctx);
+
+            let s_idx = bb.state_idx;
+            s_idx >= 1 => DoEmitStatePhi;
+            _          => EmitInsts;
+        }
+        DoEmitStatePhi: {
+            let s = call find_state_by_idx(m, bb.state_idx);
+            s != null => EmitStatePhiNodes;
+            _         => EmitInsts;
+        }
+        EmitStatePhiNodes: {
+            let s = call find_state_by_idx(m, bb.state_idx);
+            let _ = call emit_state_phi_nodes(ctx, m, s, bb.state_idx);
+            _ => EmitInsts;
+        }
+        EmitInsts: {
+            let _ = call emit_str(ctx, bb.buf_ptr, bb.buf_pos);
+            _ => Loop [ b_idx <= b_idx + 1 ];
+        }
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_node_fused(
+    ctx: *CodegenCtx,
+    m: *MachineDef,
+    nid_p: *u8,
+    nid_l: u32,
+    in_val_p: *u8,
+    in_val_l: u32,
+    is_last: u32,
+    next_bb_p: *u8,
+    next_bb_l: u32,
+    prev_out_type_p: *u8,
+    prev_out_type_l: u32
+) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            ctx.cur_machine       <- m;
+            ctx.node_prefix_p     <- nid_p;
+            ctx.node_prefix_l     <- nid_l;
+            ctx.fused_is_last     <- is_last;
+            ctx.fused_next_bb_p   <- next_bb_p;
+            ctx.fused_next_bb_l   <- next_bb_l;
+            ctx.fused_prev_type_p <- prev_out_type_p;
+            ctx.fused_prev_type_l <- prev_out_type_l;
+            ctx.cur_env_cnt       <- 0;
+            ctx.phi_cnt           <- 0;
+            ctx.block_cnt         <- 0;
+
+            let p0 = m.params;
+            p0 != null => BindInVal;
+            _          => DoEntry;
+        }
+        BindInVal: {
+            let p0 = m.params;
+            let _ = call env_set(ctx, p0.name_ptr, p0.name_len, in_val_p, in_val_l);
+            _ => DoEntry;
+        }
+        DoEntry: {
+            // Pass 1: 各ブロック作成 & 命令蓄積 (entry_bb の先頭で必要なら phi 生成)
+            let _ = call emit_entry_block(ctx, m);
+            let _ = call emit_machine_states(ctx, m);
+
+            // Pass 2: メイン出力バッファへブロック出力
+            ctx.out_buf <- ctx.main_buf;
+            ctx.out_pos <- ctx.main_pos;
+            ctx.max_len <- ctx.main_cap;
+
+            let _ = call assemble_fused_blocks(ctx, m);
+
+            ctx.main_pos <- ctx.out_pos;
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine emit_network_node_intermediate(
+    ctx: *CodegenCtx,
+    prog: *ProgramDef,
+    net: *NetworkDef,
+    node_idx: u32,
+    curr_in_p: *u8,
+    curr_in_l: u32,
+    prev_out_p: *u8,
+    prev_out_l: u32
+) -> u32 {
+    flow {
+        wire el_list = net.pipeline_elems;
+        wire el_cur = el_list + (node_idx + 1);
+        wire el_nxt = el_list + (node_idx + 2);
+        wire m = call find_network_node_machine(prog, net, el_cur.ptr, el_cur.len);
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            let next_bb_p = call make_prefixed_name(alloc, el_nxt.ptr, el_nxt.len, "entry", 5);
+            let next_bb_l = call strlen(next_bb_p);
+
+            let _ = call emit_node_fused(ctx, m, el_cur.ptr, el_cur.len, curr_in_p, curr_in_l, 0, next_bb_p, next_bb_l, prev_out_p, prev_out_l);
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_network_node_last(
+    ctx: *CodegenCtx,
+    prog: *ProgramDef,
+    net: *NetworkDef,
+    node_idx: u32,
+    curr_in_p: *u8,
+    curr_in_l: u32,
+    prev_out_p: *u8,
+    prev_out_l: u32
+) -> u32 {
+    flow {
+        wire el_list = net.pipeline_elems;
+        wire el_cur = el_list + (node_idx + 1);
+        wire m = call find_network_node_machine(prog, net, el_cur.ptr, el_cur.len);
+    }
+    states {
+        Entry: {
+            let _ = call emit_node_fused(ctx, m, el_cur.ptr, el_cur.len, curr_in_p, curr_in_l, 1, null, 0, prev_out_p, prev_out_l);
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_net_start(ctx: *CodegenCtx, net: *NetworkDef) -> *u8 {
+    flow {
+        wire el_list = net.pipeline_elems;
+        wire el_in = el_list + 0;
+        wire el_first = el_list + 1;
+        wire alloc = ctx.alloc;
+    }
+    states {
+        Entry: {
+            ctx.out_buf <- ctx.main_buf;
+            ctx.out_pos <- ctx.main_pos;
+            ctx.max_len <- ctx.main_cap;
+
+            let _ = call emit_net_header(ctx, net, el_first.ptr, el_first.len);
+            ctx.main_pos <- ctx.out_pos;
+
+            let in_p = call make_prefixed_name(alloc, "%arg", 4, el_in.ptr, el_in.len);
+            ctx.fused_ret_cnt <- 0;
+            _ => return in_p;
+        }
+    }
+}
+
+machine emit_network_node_step(
+    ctx: *CodegenCtx,
+    prog: *ProgramDef,
+    net: *NetworkDef,
+    node_idx: u32,
+    curr_in_p: *u8,
+    curr_in_l: u32,
+    prev_out_p: *u8,
+    prev_out_l: u32
+) -> *u8 {
+    flow {
+        wire alloc = ctx.alloc;
+        wire el_list = net.pipeline_elems;
+        wire el_nxt = el_list + (node_idx + 2);
+        wire nxt_in_p = call make_fused_reg_name(alloc, el_nxt.ptr, el_nxt.len);
+    }
+    states {
+        Entry: {
+            let _ = call emit_network_node_intermediate(ctx, prog, net, node_idx, curr_in_p, curr_in_l, prev_out_p, prev_out_l);
+            _ => return nxt_in_p;
+        }
+    }
+}
+
+machine emit_network(ctx: *CodegenCtx, net: *NetworkDef) -> u32 {
+    flow {
+        reg node_idx:   u32 = 0;
+        reg curr_in_p:  *u8 = null;
+        reg curr_in_l:  u32 = 0;
+        reg prev_out_p: *u8 = null;
+        reg prev_out_l: u32 = 0;
+
+        wire prog = ctx.prog;
+        wire pipe_cnt = net.pipeline_count;
+        wire num_nodes = pipe_cnt - 1;
+        wire has_more = node_idx < num_nodes;
+    }
+    states {
+        Entry: {
+            pipe_cnt < 2 => Close;
+            let in_p = call emit_net_start(ctx, net);
+            let in_l = call strlen(in_p);
+            _ => Loop [ node_idx <= 0, curr_in_p <= in_p, curr_in_l <= in_l, prev_out_p <= null, prev_out_l <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => ProcessNode;
+            _             => Close;
+        }
+        ProcessNode: {
+            let is_last = node_idx == (num_nodes - 1);
+            is_last != 0 => NodeLast;
+            _            => NodeNext;
+        }
+        NodeLast: {
+            let _ = call emit_network_node_last(ctx, prog, net, node_idx, curr_in_p, curr_in_l, prev_out_p, prev_out_l);
+            _ => Loop [ node_idx <= node_idx + 1, curr_in_p <= null, curr_in_l <= 0, prev_out_p <= null, prev_out_l <= 0 ];
+        }
+        NodeNext: {
+            let el_list = net.pipeline_elems;
+            let el_cur = el_list + (node_idx + 1);
+            let m = call find_network_node_machine(prog, net, el_cur.ptr, el_cur.len);
+            let out_t_p = call map_type_ptr(ctx, m.ret_type_ptr, m.ret_type_len);
+            let out_t_l = call map_type_len(ctx, m.ret_type_ptr, m.ret_type_len);
+            let res_var_p = call emit_network_node_step(ctx, prog, net, node_idx, curr_in_p, curr_in_l, prev_out_p, prev_out_l);
+            let res_var_l = call strlen(res_var_p);
+            _ => Loop [ node_idx <= node_idx + 1, curr_in_p <= res_var_p, curr_in_l <= res_var_l, prev_out_p <= out_t_p, prev_out_l <= out_t_l ];
+        }
+        Close: {
+            let _ = call emit_net_close(ctx);
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_all_networks(ctx: *CodegenCtx) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        wire prog = ctx.prog;
+        wire cnt = prog.network_count;
+        wire has_more = i < cnt;
+        wire fld_net = prog.networks;
+        wire net = fld_net + i;
+    }
+    states {
+        Entry: {
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more != 0 => ProcessOne;
+            _             => Done;
+        }
+        ProcessOne: {
+            let _ = call emit_network(ctx, net);
+            _ => Loop [ i <= i + 1 ];
+        }
+        Done: {
+            // [Shield 3]: Prefix Sanitization
+            ctx.node_prefix_p <- null;
+            ctx.node_prefix_l <- 0;
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
+machine scan_bounded_types_mask(prog: *ProgramDef) -> u32 {
+    flow {
+        reg i: u32 = 0;
+        reg mask: u32 = 0;
+        wire cnt = prog.type_count;
+        wire has_more = i < cnt;
+        wire fld_t = prog.types;
+        wire t = fld_t + i;
+    }
+    states {
+        Entry: {
+            _ => ScanLoop [ i <= 0, mask <= 0 ];
+        }
+        ScanLoop: {
+            has_more != 0 => CheckType;
+            _             => Exit;
+        }
+        CheckType: {
+            t.kind == 2 => CheckBase;
+            _           => NextType;
+        }
+        CheckBase: {
+            let is_f32 = call str_eq(t.base_ptr, t.base_len, "f32", 3);
+            is_f32 != 0 => MarkF32;
+            let is_f64 = call str_eq(t.base_ptr, t.base_len, "f64", 3);
+            is_f64 != 0 => MarkF64;
+            _           => NextType;
+        }
+        MarkF32: {
+            let m1 = mask | 1;
+            _ => ScanLoop [ i <= i + 1, mask <= m1 ];
+        }
+        MarkF64: {
+            let m2 = mask | 2;
+            _ => ScanLoop [ i <= i + 1, mask <= m2 ];
+        }
+        NextType: {
+            _ => ScanLoop [ i <= i + 1, mask <= mask ];
+        }
+        Exit: {
+            _ => return mask;
+        }
+    }
+}
+
+machine emit_bounded_intrinsics(ctx: *CodegenCtx) -> u32 {
+    flow {
+        wire mask = call scan_bounded_types_mask(ctx.prog);
+        wire has_f32 = mask & 1;
+        wire has_f64 = mask & 2;
+    }
+    states {
+        Entry: {
+            has_f32 != 0 => EmitF32;
+            _            => CheckF64;
+        }
+        EmitF32: {
+            let _ = call emit_str(ctx, "declare float @llvm.minnum.f32(float, float)", 44);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "declare float @llvm.maxnum.f32(float, float)", 44);
+            let _ = call emit_nl(ctx);
+            _ => CheckF64;
+        }
+        CheckF64: {
+            has_f64 != 0 => EmitF64;
+            _            => Exit;
+        }
+        EmitF64: {
+            let _ = call emit_str(ctx, "declare double @llvm.minnum.f64(double, double)", 47);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "declare double @llvm.maxnum.f64(double, double)", 47);
+            let _ = call emit_nl(ctx);
+            _ => Exit;
+        }
+        Exit: {
+            _ => return ctx.out_pos;
+        }
+    }
+}
+
 machine ssac_codegen(prog: *ProgramDef, alloc_obj: *BumpAlloc, out_buf: *u8, max_len: u32) -> i32 {
     flow {
         reg res: i32 = 0;
@@ -5626,18 +6946,27 @@ machine ssac_codegen(prog: *ProgramDef, alloc_obj: *BumpAlloc, out_buf: *u8, max
             ctx.cur_state_p  <- null;
             ctx.cur_state_l  <- 0;
 
+            ctx.node_prefix_p     <- null;
+            ctx.node_prefix_l     <- 0;
+            ctx.fused_is_last     <- 0;
+            ctx.fused_ret_cnt     <- 0;
+            ctx.fused_prev_type_p <- null;
+            ctx.fused_prev_type_l <- 0;
+
             // バッファ確保 (大容量アリーナから安全に切り出し)
             let type_map_mem = call bump_alloc(alloc_obj, 65536, 8);
             let string_mem   = call bump_alloc(alloc_obj, 65536, 8);
             let env_mem      = call bump_alloc(alloc_obj, 65536, 8);
             let phi_mem      = call bump_alloc(alloc_obj, 262144, 8);
             let blocks_mem   = call bump_alloc(alloc_obj, 262144, 8);
+            let ret_mem      = call bump_alloc(alloc_obj, 4096, 8);
 
-            ctx.type_map    <- type_map_mem;
-            ctx.strings     <- string_mem;
-            ctx.cur_env     <- env_mem;
-            ctx.phi_entries <- phi_mem;
-            ctx.blocks      <- blocks_mem;
+            ctx.type_map       <- type_map_mem;
+            ctx.strings        <- string_mem;
+            ctx.cur_env        <- env_mem;
+            ctx.phi_entries    <- phi_mem;
+            ctx.blocks         <- blocks_mem;
+            ctx.fused_ret_vals <- ret_mem;
 
             // 1. 型レジストリ初期化 (エイリアス展開含む)
             let _ = call init_type_registry(ctx);
@@ -5653,14 +6982,23 @@ machine ssac_codegen(prog: *ProgramDef, alloc_obj: *BumpAlloc, out_buf: *u8, max
 
             ctx.main_pos <- ctx.out_pos;
 
-            // 5. 各マシン出力
+            // 5. ノード封印マーク
+            let _ = call mark_sealed_machines(prog);
+
+            // 6. 各マシン出力
             let _ = call emit_all_machines(ctx);
 
-            // 6. 文字列定数出力
+            // 7. 各ネットワーク出力 (Same-Stack Fusion)
+            let _ = call emit_all_networks(ctx);
+
+            // 8. 文字列定数出力
             ctx.out_buf <- ctx.main_buf;
             ctx.out_pos <- ctx.main_pos;
             ctx.max_len <- ctx.main_cap;
             let _ = call emit_all_strings(ctx);
+
+            // 9. Bounded Intrinsics declare 出力 (Shield 4)
+            let _ = call emit_bounded_intrinsics(ctx);
 
             let err = ctx.error_code;
             let pos = ctx.out_pos;

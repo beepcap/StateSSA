@@ -5,6 +5,7 @@ from . import __version__
 from .lexer import Lexer
 from .parser import Parser
 from .codegen import CodeGen
+from .semantics.analyzer import SemanticAnalyzer
 from .ast_nodes import Program
 
 def load_and_merge(input_files: list[str]) -> Program:
@@ -14,6 +15,7 @@ def load_and_merge(input_files: list[str]) -> Program:
     all_types = {}
     all_externs = {}
     all_machines = {}
+    all_networks = {}
 
     while queue:
         curr_file = queue.pop(0)
@@ -55,11 +57,18 @@ def load_and_merge(input_files: list[str]) -> Program:
                 raise SyntaxError(f"Duplicate machine definition '{m.name}' in {curr_file}")
             all_machines[m.name] = m
 
+        # Check network duplicates
+        for net in prog.networks:
+            if net.name in all_networks:
+                raise SyntaxError(f"Duplicate network definition '{net.name}' in {curr_file}")
+            all_networks[net.name] = net
+
     return Program(
         includes=[],
         types=list(all_types.values()),
         externs=list(all_externs.values()),
-        machines=list(all_machines.values())
+        machines=list(all_machines.values()),
+        networks=list(all_networks.values())
     )
 
 def main():
@@ -74,7 +83,8 @@ def main():
         sys.exit(1)
 
     merged_ast = load_and_merge(args.input)
-    llvm_ir = CodeGen(merged_ast).generate()
+    annotations = SemanticAnalyzer(merged_ast).analyze()
+    llvm_ir = CodeGen(merged_ast, annotations=annotations).generate()
 
     if args.output:
         Path(args.output).write_text(llvm_ir, encoding="utf-8")

@@ -2,8 +2,11 @@
 bin/
 build/
 *.ll
+*.s
 *.o
 *.out
+*.wav
+benchmarks/**/bench_*
 __pycache__/
 *.pyc
 Makefile

@@ -760,7 +760,7 @@ machine main(argc: i32, argv: *u64) -> i32 {
 
             // ProgramDef ストレージ初期化
             let p_m = call bump_alloc(alloc, 64, 8);
-            let _ = call init_program_storage(p_m, alloc, 1024, 1024, 1024);
+            let _ = call init_program_storage(p_m, alloc, 1024, 1024, 1024, 256);
 
             // 出力用バッファ切り出し
             let out_mem = call bump_alloc(alloc, sz_out, 8);
