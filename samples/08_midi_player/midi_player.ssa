@@ -261,7 +261,7 @@ machine midi_player_run(
             let _ = call MidiParse_InitTracks(file_track_start, f_end, num_tracks, cursors);
 
             _ => CheckOutputMode [
-                pipeline <= pipe,
+                pipeline <= cast(*SynthPipeline) pipe,
                 voice_slots <= cast(*VoiceSlot) p_slot,
                 max_voices <= max_v,
                 total_samples <= 0
@@ -428,7 +428,7 @@ machine midi_player_run(
         }
 
         ExecChunkRender: {
-            let _ = call SynthPipeline_Render(pipeline, chunk_buf, cur_chunk_s);
+            let _ = call SynthPipeline_Render(cast(*UnifiedSynth) pipeline, chunk_buf, cur_chunk_s);
             is_stdout != 0 => WriteChunkStdout;
             _ => WriteChunkFile;
         }
@@ -612,7 +612,7 @@ machine midi_player_run(
             );
 
             // Set Voice in Synthesis Pipeline
-            let _ = call SynthPipeline_SetVoice(pipeline, v_search_idx, spatial_params);
+            let _ = call SynthPipeline_SetVoice(cast(*UnifiedSynth) pipeline, v_search_idx, spatial_params);
 
             _ => CheckTrackReady;
         }
@@ -647,7 +647,7 @@ machine midi_player_run(
         FoundSlotToSilence: {
             let slot = voice_slots + v_search_idx;
             slot.is_active <- 0;
-            let _ = call SynthPipeline_SilenceVoice(pipeline, v_search_idx);
+            let _ = call SynthPipeline_SilenceVoice(cast(*UnifiedSynth) pipeline, v_search_idx);
             _ => CheckTrackReady;
         }
 
@@ -741,7 +741,7 @@ machine midi_player_run(
         }
 
         CleanupResources: {
-            let _ = call SynthPipeline_Destroy(pipeline);
+            let _ = call SynthPipeline_Destroy(cast(*UnifiedSynth) pipeline);
             let _ = call free(file_buf);
             let _ = call free(cast(*u8) cursors);
             let _ = call free(cast(*u8) voice_slots);
