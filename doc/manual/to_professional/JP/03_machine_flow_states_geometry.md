@@ -183,6 +183,37 @@ State_Node の終端には、1 つ以上の遷移規則が定義される：
 3. **アトミック・ラッチ（`[ reg <= expr ]`）**:
    遷移エッジが選択された瞬間にのみ、次状態へ引き渡すレジスタ値がアトミックに計算され、合流先ノードの `phi` 入力として渡される。
 
+### 2.4 統合例：パケットヘッダ検証マシン
+これまで分解して解説した `machine`（契約境界）、`flow`（データパス）、`states`（コントロールパス）を統合した完全な StateSSA コードを示す。読者はこのコードをそのままコピーし、`python3 -m ssac.main` で LLVM IR へコンパイルして挙動を検証できる。
+
+```ssa
+machine parse_header(buf: *u8, len: i32) -> i32 {
+    flow {
+        reg cursor: i32 = 0;
+        reg token_count: i32 = 0;
+        reg error_code: i32 = 0;
+
+        wire safe_limit = len - 8;
+        wire is_eof = cursor >= len;
+    }
+    states {
+        Entry: {
+            len <= 0 => Exit [ error_code <= -1 ];
+            _        => Process [ cursor <= 0, token_count <= 0 ];
+        }
+        Process: {
+            is_eof != 0 => Exit [ error_code <= 0 ];
+            let b = *(buf + cursor);
+            b == 0      => Exit [ error_code <= -2 ];
+            _           => Process [ cursor <= cursor + 1, token_count <= token_count + 1 ];
+        }
+        Exit: {
+            _ => return error_code;
+        }
+    }
+}
+```
+
 ---
 
 ## 3. 3番地コード（3-Address Code）の必然性と 1行1演算規律
@@ -323,9 +354,12 @@ ProcessStream: {
 ```mermaid
 stateDiagram-v2
     direction TB
-    StateA --> MergeNode: reg_val <= 100
-    StateB --> MergeNode: reg_val <= 200
-    MergeNode --> [*]: return reg_val
+    [*] --> Entry
+    Entry --> Positive: flag > 0
+    Entry --> NonPositive: _
+    Positive --> Merge: result <= 100
+    NonPositive --> Merge: result <= 200
+    Merge --> [*]: return result
 ```
 
 この合流をハードウェアおよび LLVM SSA において実現するのが **Phi ノード（マルチプレクサ）** である。
@@ -408,20 +442,22 @@ if (signed_len < buffer_size) { // 符号なし比較へ暗黙昇格！
 StateSSA では、暗黙の型昇格、暗黙の型変換、暗黙の型切り捨てを 1 ビットたりとも認めない。
 
 ```ssa
-flow {
-    reg a: i32 = 0;
-    reg b: i64 = 0;
-}
-states {
-    Entry: {
-        // コンパイルエラー: i32 と i64 の直接代入や加算は禁止
-        // a = b;              <-- TypeError
-        // let sum = a + b;    <-- TypeError
+machine strict_cast_demo(val_b: i64) -> i32 {
+    flow {
+        reg a: i32 = 10;
+        reg b: i64 = val_b;
+    }
+    states {
+        Entry: {
+            // コンパイルエラー: i32 と i64 の直接代入や演算は型不一致として禁止される
+            // a = b;              <-- TypeError: cannot assign i64 to i32
+            // let sum = a + b;    <-- TypeError: binary op '+' between i32 and i64 prohibited
 
-        // 正しい記述: 明示的なキャストの強制
-        let b_trunc = cast(i32) b;
-        let sum = a + b_trunc;
-        _ => return;
+            // 正しい記述: 明示的な cast による縮小変換の強制
+            let b_trunc = cast(i32) b;
+            let sum = a + b_trunc;
+            _ => return sum;
+        }
     }
 }
 ```
@@ -433,6 +469,27 @@ StateSSA がプログラマに `cast(TargetType)` の明記を強制するのは
    符号なし整数を拡張するのか、符号付き整数を拡張するのかによって、上位ビットが 0 で埋められるのか符号ビットで埋められるのかが異なる。キャストを明記することにより、CPU 命令レベルの振る舞いがコード上で明確化される。
 2. **Newtype（名目的型）による物理単位の保全**:
    `type UserId = u64;` や `type PacketSize = u32;` のように定義された Newtype は、基底型と同じビット幅であっても互換性を持たない。異なる単位同士を誤って加算・代入するバグは、コンパイル時に即座に拒絶（`TypeError`）される。
+
+```ssa
+type UserId = u64;
+type PacketSize = u32;
+
+machine process_user(id: UserId, size: PacketSize) -> u64 {
+    flow {}
+    states {
+        Entry: {
+            // コンパイルエラー: 異なる Newtype 同士の直接演算や代入は禁止される
+            // let invalid = id + size;  <-- TypeError
+
+            // 正しい記述: 明示的に基底型へアンラップ（キャスト）して演算
+            let raw_id = cast(u64) id;
+            let raw_size = cast(u64) size;
+            let total = raw_id + raw_size;
+            _ => return total;
+        }
+    }
+}
+```
 
 ### 5.2 内部メモリのアドレス取得（`&`）排除によるスタック破壊・ポインタエスケープの物理的消滅
 
@@ -463,6 +520,19 @@ StateSSA は、言語仕様から **アドレス取得演算子 `&` を完全に
    アドレスを取得できないため、すべての内部変数は LLVM IR 上でメモリ領域（`alloca`）を必要とせず、100% 物理 CPU レジスタ（SSA 値）として割り当てられる。
 3. **外部バッファ参照の制限**:
    ポインタ型（`*T`）は、関数の引数として外部から渡されたバッファポインタや、外部関数（`extern`）から返却されたアドレスの参照・デリファレンス（`*ptr`）、およびオフセット加算（`ptr + offset`）にのみ限定される。
+
+```ssa
+machine read_buffer(buf: *u8, offset: i32) -> u8 {
+    flow {}
+    states {
+        Entry: {
+            let p = buf + offset;
+            let val = *p;
+            _ => return val;
+        }
+    }
+}
+```
 
 この言語仕様による防壁により、StateSSA プログラムの内部において **「スタック破壊」「スタック上のリターンアドレスの改ざん」「ローカル変数のダングリングポインタ」という低レイヤーの脆弱性は、原理的・幾何学的に発生し得ない**。
 
