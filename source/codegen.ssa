@@ -1700,6 +1700,48 @@ machine get_vector_byte_size(t: *u8, len: u32) -> u32 {
     }
 }
 
+machine get_vector_elem_size(t: *u8, len: u32) -> u32 {
+    flow {}
+    states {
+        Entry: {
+            t == null => RetZero;
+            len < 4   => CheckU8;
+
+            let is_f32 = call str_starts_with(t, len, "f32x", 4);
+            is_f32 != 0 => Ret4;
+            let is_f64 = call str_starts_with(t, len, "f64x", 4);
+            is_f64 != 0 => Ret8;
+            let is_i32 = call str_starts_with(t, len, "i32x", 4);
+            is_i32 != 0 => Ret4;
+            let is_i64 = call str_starts_with(t, len, "i64x", 4);
+            is_i64 != 0 => Ret8;
+            let is_u32 = call str_starts_with(t, len, "u32x", 4);
+            is_u32 != 0 => Ret4;
+            let is_u64 = call str_starts_with(t, len, "u64x", 4);
+            is_u64 != 0 => Ret8;
+            let is_i16 = call str_starts_with(t, len, "i16x", 4);
+            is_i16 != 0 => Ret2;
+            let is_u16 = call str_starts_with(t, len, "u16x", 4);
+            is_u16 != 0 => Ret2;
+
+            _ => CheckU8;
+        }
+        CheckU8: {
+            len < 3 => RetZero;
+            let is_u8 = call str_starts_with(t, len, "u8x", 3);
+            is_u8 != 0 => Ret1;
+            let is_i8 = call str_starts_with(t, len, "i8x", 3);
+            is_i8 != 0 => Ret1;
+            _ => RetZero;
+        }
+        Ret8: { _ => return 8; }
+        Ret4: { _ => return 4; }
+        Ret2: { _ => return 2; }
+        Ret1: { _ => return 1; }
+        RetZero: { _ => return 0; }
+    }
+}
+
 machine align_to(offset: u32, align: u32) -> u32 {
     flow {
         reg pad: u32 = 0;
@@ -1861,7 +1903,7 @@ machine get_struct_byte_size(prog: *ProgramDef, sname_p: *u8, sname_l: u32) -> u
 
 machine get_type_align(prog: *ProgramDef, t: *u8, len: u32) -> u32 {
     flow {
-        reg vsz: u32 = 0;
+        reg e_sz: u32 = 0;
     }
     states {
         Entry: {
@@ -1871,8 +1913,8 @@ machine get_type_align(prog: *ProgramDef, t: *u8, len: u32) -> u32 {
             c0 == 42 => Ret8; // '*' pointer alignment is 8
 
             // Vector check
-            let v_sz = call get_vector_byte_size(t, len);
-            v_sz > 0 => CheckVecAlign [ vsz <= v_sz ];
+            let elem_sz = call get_vector_elem_size(t, len);
+            elem_sz > 0 => RetElem [ e_sz <= elem_sz ];
 
             // Primitives
             let is_i64 = call str_eq(t, len, "i64", 3);
@@ -1907,18 +1949,13 @@ machine get_type_align(prog: *ProgramDef, t: *u8, len: u32) -> u32 {
             prog != null => CheckStruct;
             _            => Ret4;
         }
-        CheckVecAlign: {
-            vsz >= 64 => Ret64;
-            vsz >= 32 => Ret32;
-            _         => Ret16;
+        RetElem: {
+            _ => return e_sz;
         }
         CheckStruct: {
             let s_al = call get_struct_align(prog, t, len);
             _ => return s_al;
         }
-        Ret64: { _ => return 64; }
-        Ret32: { _ => return 32; }
-        Ret16: { _ => return 16; }
         Ret8:  { _ => return 8; }
         Ret4:  { _ => return 4; }
         Ret2:  { _ => return 2; }
@@ -3014,10 +3051,16 @@ machine get_binop_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
         }
         CheckArith: {
             let lt = call get_expr_type(ctx, expr.left);
+            let bdef_l = call find_bounded_type(ctx.prog, lt, call strlen(lt));
+            bdef_l != null => ReturnLeft [ left_t <= lt ];
+
+            let rt = call get_expr_type(ctx, expr.right);
+            let bdef_r = call find_bounded_type(ctx.prog, rt, call strlen(rt));
+            bdef_r != null => ReturnLeft [ left_t <= rt ];
+
             let is_lfv = call is_type_float_or_vec(lt, call strlen(lt));
             is_lfv != 0 => ReturnLeft [ left_t <= lt ];
 
-            let rt = call get_expr_type(ctx, expr.right);
             let is_rfv = call is_type_float_or_vec(rt, call strlen(rt));
             is_rfv != 0 => ReturnLeft [ left_t <= rt ];
 
@@ -4138,6 +4181,8 @@ machine emit_var(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
         reg res_p: *u8 = null;
         reg wire_matched: *WireDef = null;
         reg wire_mask_reg: u64 = 0;
+        reg clamped_res: *u8 = null;
+        reg cur_btype: *TypeDef = null;
         wire name_p = expr.str_ptr;
         wire name_l = expr.str_len;
         wire m = ctx.cur_machine;
@@ -4240,7 +4285,14 @@ machine emit_var(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let unmark_prog = cur_prog ^ wire_mask_reg;
             ctx.wire_in_progress <- unmark_prog;
 
+            let wt = call get_expr_type(ctx, wire_matched.expr);
+            let btype = call find_bounded_type(ctx.prog, wt, call strlen(wt));
+            btype != null => ClampWire [ clamped_res <= wire_res, cur_btype <= btype ];
             _ => return wire_res;
+        }
+        ClampWire: {
+            let c_res = call emit_clamp(ctx, clamped_res, cur_btype);
+            _ => return c_res;
         }
         EmitCyclicWireError: {
             let _ = call diag_nl();
@@ -6298,8 +6350,29 @@ machine emit_entry_block(ctx: *CodegenCtx, m: *MachineDef) -> u32 {
             let bb = call add_basic_block(ctx, "entry", 5, 0, cap);
             let _ = call switch_to_bb(ctx, bb);
 
+            let is_main = call str_eq(m.name_ptr, m.name_len, "main", 4);
+            is_main != 0 => EmitMxcsr [ entry_bb <= bb ];
+
             ret_cnt > 0 => EmitPhi [ entry_bb <= bb ];
             _           => CheckEnv [ entry_bb <= bb ];
+        }
+        EmitMxcsr: {
+            let _ = call emit_str(ctx, "  %mxcsr_ptr = alloca i32, align 4", 34);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "  %mxcsr_i8 = bitcast i32* %mxcsr_ptr to i8*", 45);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "  call void @llvm.x86.sse.stmxcsr(i8* %mxcsr_i8)", 49);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "  %old_mxcsr = load i32, i32* %mxcsr_ptr, align 4", 50);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "  %new_mxcsr = or i32 %old_mxcsr, 32832", 40);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "  store i32 %new_mxcsr, i32* %mxcsr_ptr, align 4", 49);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "  call void @llvm.x86.sse.ldmxcsr(i8* %mxcsr_i8)", 49);
+            let _ = call emit_nl(ctx);
+            ret_cnt > 0 => EmitPhi;
+            _           => CheckEnv;
         }
         EmitPhi: {
             let res_p = call make_fused_reg_name(ctx.alloc, ctx.node_prefix_p, ctx.node_prefix_l);
@@ -7316,6 +7389,10 @@ machine emit_all_externs(ctx: *CodegenCtx) -> u32 {
             let _ = call emit_str(ctx, "declare void @exit(i32) cold noreturn nounwind", 46);
             let _ = call emit_nl(ctx);
             let _ = call emit_str(ctx, "declare void @llvm.trap() cold noreturn nounwind", 48);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "declare void @llvm.x86.sse.stmxcsr(i8*)", 40);
+            let _ = call emit_nl(ctx);
+            let _ = call emit_str(ctx, "declare void @llvm.x86.sse.ldmxcsr(i8*)", 40);
             let _ = call emit_nl(ctx);
             let _ = call emit_nl(ctx);
             _ => Exit;

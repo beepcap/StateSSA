@@ -1,4 +1,4 @@
-from ..types import Type, PrimitiveType, Newtype, StructType, PointerType
+from ..types import Type, PrimitiveType, Newtype, StructType, PointerType, BoundedType
 
 UNSIGNED = {"u8", "u16", "u32", "u64"}
 
@@ -47,6 +47,10 @@ def check_binary_op(op: str, lt: Type, rt: Type, line: int = 0) -> Type:
         if rt_name not in INTEGER_TYPES:
             raise TypeError(f"Pointer subtraction requires an integer offset or pointer, got '{rt_name}' at line {line}")
         return lt
+    if isinstance(lt, BoundedType):
+        return lt
+    if isinstance(rt, BoundedType):
+        return rt
     ln, rn = getattr(lt, "name", ""), getattr(rt, "name", "")
     for t in ("f64", "f32", "q64"):
         if t in (ln, rn): return PrimitiveType(t)

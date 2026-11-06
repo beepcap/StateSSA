@@ -197,9 +197,8 @@ class CodeGen:
             if m:
                 elem_t, lanes = m.group(1), int(m.group(2))
                 elem_size = 8 if elem_t in ("f64", "i64", "u64") else (4 if elem_t in ("f32", "i32", "u32") else (2 if elem_t in ("i16", "u16") else 1))
-                total_bytes = elem_size * lanes
-                return min(total_bytes, 64)
-            return 16
+                return elem_size
+            return 4
         mapped = self.map_type(t)
         if "double" in mapped or "f64" in t or "i64" in t or "u64" in t:
             return 8
@@ -326,7 +325,9 @@ class CodeGen:
         lines.append("declare float @llvm.maxnum.f32(float, float)")
         lines.append("declare float @llvm.minnum.f32(float, float)")
         lines.append("declare double @llvm.maxnum.f64(double, double)")
-        lines.append("declare double @llvm.minnum.f64(double, double)\n")
+        lines.append("declare double @llvm.minnum.f64(double, double)")
+        lines.append("declare void @llvm.x86.sse.stmxcsr(i8*)")
+        lines.append("declare void @llvm.x86.sse.ldmxcsr(i8*)\n")
 
         # 3. Machines
         lines.extend(machine_lines)
@@ -375,6 +376,15 @@ class CodeGen:
         bb_order.append(entry_bb)
         bb_insts[entry_bb] = []
         bb_env[entry_bb] = {}
+
+        if m.name == "main":
+            bb_insts[entry_bb].append("%mxcsr_ptr = alloca i32, align 4")
+            bb_insts[entry_bb].append("%mxcsr_i8 = bitcast i32* %mxcsr_ptr to i8*")
+            bb_insts[entry_bb].append("call void @llvm.x86.sse.stmxcsr(i8* %mxcsr_i8)")
+            bb_insts[entry_bb].append("%old_mxcsr = load i32, i32* %mxcsr_ptr, align 4")
+            bb_insts[entry_bb].append("%new_mxcsr = or i32 %old_mxcsr, 32832")
+            bb_insts[entry_bb].append("store i32 %new_mxcsr, i32* %mxcsr_ptr, align 4")
+            bb_insts[entry_bb].append("call void @llvm.x86.sse.ldmxcsr(i8* %mxcsr_i8)")
 
         self.param_bindings: dict[str, str] = {}
         for pn, pt in m.params:
@@ -657,6 +667,9 @@ class CodeGen:
     def get_expr_type(self, expr, m: Machine) -> str:
         if self.annotations and id(expr) in self.annotations.expr_types:
             resolved_t = self.annotations.expr_types[id(expr)]
+            from .types import BoundedType
+            if isinstance(resolved_t, BoundedType):
+                return resolved_t.name
             return resolved_t.unwrap().to_str()
         if isinstance(expr, VarExpr):
             if expr.name == "null":
@@ -728,6 +741,11 @@ class CodeGen:
                 return "i1"
             if expr.op in ("&", "|", "^") and base_lt == "i1" and base_rt == "i1":
                 return "i1"
+            if expr.op in ("+", "-", "*", "/", "%"):
+                if lt in self.bounded_types:
+                    return lt
+                if rt in self.bounded_types:
+                    return rt
             if expr.op == "+":
                 if base_lt.startswith("*"): return lt
             if self.is_vector_type(base_lt): return base_lt
@@ -755,6 +773,9 @@ class CodeGen:
             for w in m.flow.wires:
                 if w.name == expr.name:
                     res = self.emit_expr(w.expr, m, env, insts)
+                    w_type = self.get_expr_type(w.expr, m)
+                    if w_type in self.bounded_types:
+                        res = self.emit_clamp(res, self.bounded_types[w_type], insts)
                     env[w.name] = res
                     return res
             for tm in self.prog.machines:
