@@ -170,7 +170,7 @@ machine lzma2_decode_stream(dec: *LzmaDecoder) -> u32 {
             dec.rep1  <- 0;
             dec.rep2  <- 0;
             dec.rep3  <- 0;
-            call rc_init(dec, payload);
+            call rc_init(cast(*RangeDecoder) dec, payload);
             _ => LaunchLzma;
         }
 
@@ -180,7 +180,7 @@ machine lzma2_decode_stream(dec: *LzmaDecoder) -> u32 {
             dec.rep1  <- 0;
             dec.rep2  <- 0;
             dec.rep3  <- 0;
-            call rc_init(dec, payload);
+            call rc_init(cast(*RangeDecoder) dec, payload);
             _ => LaunchLzma;
         }
 

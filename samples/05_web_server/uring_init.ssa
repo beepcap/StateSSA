@@ -80,8 +80,9 @@ machine uring_setup_ring(ctx: *UringContext, entries: u32) -> i32 {
             let _ = call memset(params, 0, 128);
 
             // syscall(__NR_io_uring_setup=425, entries, params, 0, 0, 0, 0)
-            let params_u64 = cast(u64) params;
-            let rfd_raw = call syscall(425, entries, params_u64, 0, 0, 0, 0);
+            let params_i64 = cast(i64) params;
+            let entries_i64 = cast(i64) entries;
+            let rfd_raw = call syscall(425, entries_i64, params_i64, 0, 0, 0, 0);
             let rfd = cast(i32) rfd_raw;
             rfd < 0 => FailSetup [ params_p <= params ];
             _       => MapRings  [ ring_fd <= rfd, params_p <= params ];
@@ -161,7 +162,11 @@ machine uring_enter(ctx: *UringContext, to_submit: u32, min_complete: u32, flags
     states {
         Entry: {
             // syscall(__NR_io_uring_enter=426, fd, to_submit, min_complete, flags, 0, 0)
-            let ret = call syscall(426, ring_fd, to_submit, min_complete, flags, 0, 0);
+            let fd_i64  = cast(i64) ring_fd;
+            let sub_i64 = cast(i64) to_submit;
+            let min_i64 = cast(i64) min_complete;
+            let flg_i64 = cast(i64) flags;
+            let ret = call syscall(426, fd_i64, sub_i64, min_i64, flg_i64, 0, 0);
             _ => return cast(i32) ret;
         }
     }

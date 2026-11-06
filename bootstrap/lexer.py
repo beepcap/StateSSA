@@ -54,7 +54,6 @@ SYMBOLS = [
     ("}", TokenType.RBRACE),
     ("[", TokenType.LBRACKET),
     ("]", TokenType.RBRACKET),
-    ("_", TokenType.UNDERSCORE),
 ]
 
 def parse_q64_str(text: str) -> int:
@@ -118,18 +117,42 @@ class Lexer:
             # String literal
             if self.text[self.pos] == '"':
                 start = self.pos + 1
-                end = self.text.find('"', start)
-                val = self.text[start:end]
+                curr = start
+                chars = []
+                while curr < len(self.text):
+                    ch = self.text[curr]
+                    if ch == '\\':
+                        if curr + 1 < len(self.text):
+                            chars.append(self.text[curr:curr+2])
+                            curr += 2
+                            continue
+                        else:
+                            raise SyntaxError(f"Unterminated string literal at line {self.line}, col {self.col}")
+                    elif ch == '"':
+                        break
+                    elif ch == '\n':
+                        raise SyntaxError(f"Unterminated string literal at line {self.line}, col {self.col}")
+                    else:
+                        chars.append(ch)
+                        curr += 1
+                if curr >= len(self.text) or self.text[curr] != '"':
+                    raise SyntaxError(f"Unterminated string literal at line {self.line}, col {self.col}")
+
+                val = "".join(chars)
                 tokens.append(Token(TokenType.STRING_LIT, val, self.line, self.col))
-                self.col += (end + 1 - self.pos)
-                self.pos = end + 1
+                length = (curr + 1 - self.pos)
+                self.col += length
+                self.pos = curr + 1
                 continue
 
-            # Identifiers / Keywords
+            # Identifiers / Keywords / Wildcard
             m = re.match(r'[a-zA-Z_][a-zA-Z0-9_]*', self.text[self.pos:])
             if m:
                 ident = m.group(0)
-                ttype = KEYWORDS.get(ident, TokenType.IDENT)
+                if ident == "_":
+                    ttype = TokenType.UNDERSCORE
+                else:
+                    ttype = KEYWORDS.get(ident, TokenType.IDENT)
                 tokens.append(Token(ttype, ident, self.line, self.col))
                 self.pos += len(ident)
                 self.col += len(ident)

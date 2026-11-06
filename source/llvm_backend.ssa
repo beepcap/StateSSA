@@ -26,6 +26,7 @@ extern "C" {
     fn LLVMContextCreate() -> *void;
     fn LLVMContextDispose(ctx: *void) -> void;
     fn LLVMCreateMemoryBufferWithMemoryRangeCopy(data: *u8, len: u64, name: *u8) -> *void;
+    fn LLVMDisposeMemoryBuffer(buf: *void) -> void;
     fn LLVMParseIRInContext(ctx: *void, buf: *void, out_mod: *u64, out_msg: *u64) -> u32;
     fn LLVMDisposeModule(m: *void) -> void;
     fn LLVMDisposeMessage(msg: *u8) -> void;
@@ -70,6 +71,7 @@ machine llvm_emit_object_from_memory(
         reg mod_ptr:     *void = null;
         reg tgt_ptr:     *void = null;
         reg tm_ptr:      *void = null;
+        reg mem_buf:     *void = null;
         reg pass_pipeline: *u8 = "default<O3>";
     }
 
@@ -122,7 +124,7 @@ machine llvm_emit_object_from_memory(
             let ir_len64 = cast(u64) ir_len;
             let buf_ref = call LLVMCreateMemoryBufferWithMemoryRangeCopy(ir_ptr, ir_len64, "statessa_module.ll");
             let parse_err = call LLVMParseIRInContext(ctx, buf_ref, box_mod, box_err);
-            parse_err != 0 => ErrParse;
+            parse_err != 0 => ErrParse [ mem_buf <= buf_ref ];
 
             let m_u64 = *box_mod;
             let m = cast(*void) m_u64;
@@ -169,6 +171,7 @@ machine llvm_emit_object_from_memory(
 
         ErrParse: {
             let _ = call puts("Error: LLVMParseIRInContext failed to parse StateSSA IR.");
+            let _ = call LLVMDisposeMemoryBuffer(mem_buf);
             let err_u64 = *box_err;
             let err_p = cast(*u8) err_u64;
             err_p != null => PrintErrParse;

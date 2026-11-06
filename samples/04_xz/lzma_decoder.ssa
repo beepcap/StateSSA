@@ -294,7 +294,7 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
         }
 
         CheckMatch: {
-            let is_match_bit = call rc_decode_bit(dec, match_prob_ptr);
+            let is_match_bit = call rc_decode_bit(cast(*RangeDecoder) dec, match_prob_ptr);
             is_match_bit == 0 => PrepLit;
             _                 => CheckRep;
         }
@@ -326,7 +326,7 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
         }
 
         DoDecodeLit: {
-            let lit_val = call lzma_decode_literal(dec, reg_lit_base, reg_match_mode, reg_match_byte);
+            let lit_val = call lzma_decode_literal(cast(*RangeDecoder) dec, reg_lit_base, reg_match_mode, reg_match_byte);
             *out_ptr <- lit_val;
             dec.out_pos <- next_out_pos;
             cur_state < 4  => LitUpdateState0;
@@ -350,7 +350,7 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
         }
 
         CheckRep: {
-            let is_rep_bit = call rc_decode_bit(dec, rep_prob_ptr);
+            let is_rep_bit = call rc_decode_bit(cast(*RangeDecoder) dec, rep_prob_ptr);
             is_rep_bit == 0 => DecodeNewMatch;
             _               => DecodeRepMatch;
         }
@@ -360,7 +360,7 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
             dec.rep2 <- cur_rep1;
             dec.rep1 <- cur_rep0;
 
-            let raw_len = call lzma_decode_len(dec, dec.len_probs, pos_state);
+            let raw_len = call lzma_decode_len(cast(*RangeDecoder) dec, dec.len_probs, pos_state);
             let len = raw_len + 2;
             len < 6 => DistLenShort [ reg_len <= len ];
             _       => DistLenLong  [ reg_len <= len ];
@@ -368,13 +368,13 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
 
         DistLenShort: {
             let len_state = reg_len - 2;
-            let dist = call lzma_decode_dist(dec, dec.pos_slot, dec.spec_pos, dec.align_probs, len_state);
+            let dist = call lzma_decode_dist(cast(*RangeDecoder) dec, dec.pos_slot, dec.spec_pos, dec.align_probs, len_state);
             _ => CheckMatchDist [ reg_dist <= dist ];
         }
 
         DistLenLong: {
             let len_state = 3;
-            let dist = call lzma_decode_dist(dec, dec.pos_slot, dec.spec_pos, dec.align_probs, len_state);
+            let dist = call lzma_decode_dist(cast(*RangeDecoder) dec, dec.pos_slot, dec.spec_pos, dec.align_probs, len_state);
             _ => CheckMatchDist [ reg_dist <= dist ];
         }
 
@@ -402,7 +402,7 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
         }
 
         DecodeRepMatch: {
-            let is_rep0_bit = call rc_decode_bit(dec, dec.is_rep0 + cur_state);
+            let is_rep0_bit = call rc_decode_bit(cast(*RangeDecoder) dec, dec.is_rep0 + cur_state);
             is_rep0_bit == 0 => CheckShortRep;
             _                => CheckOtherReps;
         }
@@ -411,7 +411,7 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
             let state_shift   = cur_state << 4;
             let long_prob_base = dec.is_rep0_long + state_shift;
             let long_prob_ptr = long_prob_base + pos_state;
-            let is_long_bit   = call rc_decode_bit(dec, long_prob_ptr);
+            let is_long_bit   = call rc_decode_bit(cast(*RangeDecoder) dec, long_prob_ptr);
             is_long_bit == 0 => DecodeShortRep;
             _                => DecodeLongRep0;
         }
@@ -434,7 +434,7 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
         }
 
         DecodeLongRep0: {
-            let raw_len = call lzma_decode_len(dec, dec.rep_len_probs, pos_state);
+            let raw_len = call lzma_decode_len(cast(*RangeDecoder) dec, dec.rep_len_probs, pos_state);
             let len = raw_len + 2;
             call lzma_copy_match(dict_ptr, cur_out_pos, cur_rep0, len);
             dec.out_pos <- cur_out_pos + len;
@@ -443,7 +443,7 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
         }
 
         CheckOtherReps: {
-            let is_rep1_bit = call rc_decode_bit(dec, dec.is_rep1 + cur_state);
+            let is_rep1_bit = call rc_decode_bit(cast(*RangeDecoder) dec, dec.is_rep1 + cur_state);
             is_rep1_bit == 0 => SelectRep1;
             _                => CheckRep2;
         }
@@ -456,7 +456,7 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
         }
 
         CheckRep2: {
-            let is_rep2_bit = call rc_decode_bit(dec, dec.is_rep2 + cur_state);
+            let is_rep2_bit = call rc_decode_bit(cast(*RangeDecoder) dec, dec.is_rep2 + cur_state);
             is_rep2_bit == 0 => SelectRep2;
             _                => SelectRep3;
         }
@@ -479,7 +479,7 @@ machine lzma_decode_stream(dec: *LzmaDecoder) -> u32 {
         }
 
         DecodeOtherRepLen: {
-            let raw_len = call lzma_decode_len(dec, dec.rep_len_probs, pos_state);
+            let raw_len = call lzma_decode_len(cast(*RangeDecoder) dec, dec.rep_len_probs, pos_state);
             let len = raw_len + 2;
             call lzma_copy_match(dict_ptr, cur_out_pos, dec.rep0, len);
             dec.out_pos <- cur_out_pos + len;

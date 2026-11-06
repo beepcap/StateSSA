@@ -38,16 +38,7 @@ type Token = {
 // 2. 高速キーワード判定マシン (バイト配列直接判定)
 // ----------------------------------------------------------------------------
 machine match_keyword(p: *u8, len: u32) -> u32 {
-    flow {
-        wire c0 = *(p + 0);
-        wire c1 = *(p + 1);
-        wire c2 = *(p + 2);
-        wire c3 = *(p + 3);
-        wire c4 = *(p + 4);
-        wire c5 = *(p + 5);
-        wire c6 = *(p + 6);
-        wire c7 = *(p + 7);
-    }
+    flow {}
 
     states {
         Entry: {
@@ -62,13 +53,16 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
 
         // len == 3: reg, let
         CheckLen3: {
+            let c0 = *(p + 0);
             c0 == 114 => CheckReg; // 'r'
             c0 == 108 => CheckLet; // 'l'
             _         => NotKeyword;
         }
 
         CheckReg: {
+            let c1 = *(p + 1);
             c1 != 101 => NotKeyword; // 'e'
+            let c2 = *(p + 2);
             c2 == 103 => MatchReg;   // 'g'
             _         => NotKeyword;
         }
@@ -76,7 +70,9 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchReg: { _ => return 13; } // TokenType.REG
 
         CheckLet: {
+            let c1 = *(p + 1);
             c1 != 101 => NotKeyword; // 'e'
+            let c2 = *(p + 2);
             c2 == 116 => MatchLet;   // 't'
             _         => NotKeyword;
         }
@@ -85,6 +81,7 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
 
         // len == 4: flow, wire, call, type, cast, node
         CheckLen4: {
+            let c0 = *(p + 0);
             c0 == 102 => CheckFlow; // 'f'
             c0 == 119 => CheckWire; // 'w'
             c0 == 99  => CheckC4;   // 'c'
@@ -94,8 +91,11 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         }
 
         CheckNode: {
+            let c1 = *(p + 1);
             c1 != 111 => NotKeyword; // 'o'
+            let c2 = *(p + 2);
             c2 != 100 => NotKeyword; // 'd'
+            let c3 = *(p + 3);
             c3 == 101 => MatchNode;  // 'e'
             _         => NotKeyword;
         }
@@ -103,8 +103,11 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchNode: { _ => return 25; } // TokenType.NODE
 
         CheckFlow: {
+            let c1 = *(p + 1);
             c1 != 108 => NotKeyword; // 'l'
+            let c2 = *(p + 2);
             c2 != 111 => NotKeyword; // 'o'
+            let c3 = *(p + 3);
             c3 == 119 => MatchFlow;  // 'w'
             _         => NotKeyword;
         }
@@ -112,8 +115,11 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchFlow: { _ => return 11; } // TokenType.FLOW
 
         CheckWire: {
+            let c1 = *(p + 1);
             c1 != 105 => NotKeyword; // 'i'
+            let c2 = *(p + 2);
             c2 != 114 => NotKeyword; // 'r'
+            let c3 = *(p + 3);
             c3 == 101 => MatchWire;  // 'e'
             _         => NotKeyword;
         }
@@ -121,13 +127,16 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchWire: { _ => return 14; } // TokenType.WIRE
 
         CheckC4: {
+            let c1 = *(p + 1);
             c1 != 97  => NotKeyword; // 'a'
+            let c2 = *(p + 2);
             c2 == 108 => CheckCall;  // 'l'
             c2 == 115 => CheckCast;  // 's'
             _         => NotKeyword;
         }
 
         CheckCall: {
+            let c3 = *(p + 3);
             c3 == 108 => MatchCall;  // 'l'
             _         => NotKeyword;
         }
@@ -135,6 +144,7 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchCall: { _ => return 16; } // TokenType.CALL
 
         CheckCast: {
+            let c3 = *(p + 3);
             c3 == 116 => MatchCast;  // 't'
             _         => NotKeyword;
         }
@@ -142,8 +152,11 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchCast: { _ => return 22; } // TokenType.CAST
 
         CheckType: {
+            let c1 = *(p + 1);
             c1 != 121 => NotKeyword; // 'y'
+            let c2 = *(p + 2);
             c2 != 112 => NotKeyword; // 'p'
+            let c3 = *(p + 3);
             c3 == 101 => MatchType;  // 'e'
             _         => NotKeyword;
         }
@@ -152,10 +165,15 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
 
         // len == 5: panic
         CheckLen5: {
+            let c0 = *(p + 0);
             c0 != 112 => NotKeyword; // 'p'
+            let c1 = *(p + 1);
             c1 != 97  => NotKeyword; // 'a'
+            let c2 = *(p + 2);
             c2 != 110 => NotKeyword; // 'n'
+            let c3 = *(p + 3);
             c3 != 105 => NotKeyword; // 'i'
+            let c4 = *(p + 4);
             c4 == 99  => MatchPanic; // 'c'
             _         => NotKeyword;
         }
@@ -164,6 +182,7 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
 
         // len == 6: states, extern, return
         CheckLen6: {
+            let c0 = *(p + 0);
             c0 == 115 => CheckStates; // 's'
             c0 == 101 => CheckExtern; // 'e'
             c0 == 114 => CheckReturn; // 'r'
@@ -171,10 +190,15 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         }
 
         CheckStates: {
+            let c1 = *(p + 1);
             c1 != 116 => NotKeyword; // 't'
+            let c2 = *(p + 2);
             c2 != 97  => NotKeyword; // 'a'
+            let c3 = *(p + 3);
             c3 != 116 => NotKeyword; // 't'
+            let c4 = *(p + 4);
             c4 != 101 => NotKeyword; // 'e'
+            let c5 = *(p + 5);
             c5 == 115 => MatchStates; // 's'
             _         => NotKeyword;
         }
@@ -182,10 +206,15 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchStates: { _ => return 12; } // TokenType.STATES
 
         CheckExtern: {
+            let c1 = *(p + 1);
             c1 != 120 => NotKeyword; // 'x'
+            let c2 = *(p + 2);
             c2 != 116 => NotKeyword; // 't'
+            let c3 = *(p + 3);
             c3 != 101 => NotKeyword; // 'e'
+            let c4 = *(p + 4);
             c4 != 114 => NotKeyword; // 'r'
+            let c5 = *(p + 5);
             c5 == 110 => MatchExtern; // 'n'
             _         => NotKeyword;
         }
@@ -193,10 +222,15 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchExtern: { _ => return 17; } // TokenType.EXTERN
 
         CheckReturn: {
+            let c1 = *(p + 1);
             c1 != 101 => NotKeyword; // 'e'
+            let c2 = *(p + 2);
             c2 != 116 => NotKeyword; // 't'
+            let c3 = *(p + 3);
             c3 != 117 => NotKeyword; // 'u'
+            let c4 = *(p + 4);
             c4 != 114 => NotKeyword; // 'r'
+            let c5 = *(p + 5);
             c5 == 110 => MatchReturn; // 'n'
             _         => NotKeyword;
         }
@@ -205,6 +239,7 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
 
         // len == 7: machine, include, network, connect
         CheckLen7: {
+            let c0 = *(p + 0);
             c0 == 109 => CheckMachine; // 'm'
             c0 == 105 => CheckInclude; // 'i'
             c0 == 110 => CheckNetwork; // 'n'
@@ -213,11 +248,17 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         }
 
         CheckMachine: {
+            let c1 = *(p + 1);
             c1 != 97  => NotKeyword; // 'a'
+            let c2 = *(p + 2);
             c2 != 99  => NotKeyword; // 'c'
+            let c3 = *(p + 3);
             c3 != 104 => NotKeyword; // 'h'
+            let c4 = *(p + 4);
             c4 != 105 => NotKeyword; // 'i'
+            let c5 = *(p + 5);
             c5 != 110 => NotKeyword; // 'n'
+            let c6 = *(p + 6);
             c6 == 101 => MatchMachine; // 'e'
             _         => NotKeyword;
         }
@@ -225,11 +266,17 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchMachine: { _ => return 10; } // TokenType.MACHINE
 
         CheckInclude: {
+            let c1 = *(p + 1);
             c1 != 110 => NotKeyword; // 'n'
+            let c2 = *(p + 2);
             c2 != 99  => NotKeyword; // 'c'
+            let c3 = *(p + 3);
             c3 != 108 => NotKeyword; // 'l'
+            let c4 = *(p + 4);
             c4 != 117 => NotKeyword; // 'u'
+            let c5 = *(p + 5);
             c5 != 100 => NotKeyword; // 'd'
+            let c6 = *(p + 6);
             c6 == 101 => MatchInclude; // 'e'
             _         => NotKeyword;
         }
@@ -237,11 +284,17 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchInclude: { _ => return 21; } // TokenType.INCLUDE
 
         CheckNetwork: {
+            let c1 = *(p + 1);
             c1 != 101 => NotKeyword; // 'e'
+            let c2 = *(p + 2);
             c2 != 116 => NotKeyword; // 't'
+            let c3 = *(p + 3);
             c3 != 119 => NotKeyword; // 'w'
+            let c4 = *(p + 4);
             c4 != 111 => NotKeyword; // 'o'
+            let c5 = *(p + 5);
             c5 != 114 => NotKeyword; // 'r'
+            let c6 = *(p + 6);
             c6 == 107 => MatchNetwork; // 'k'
             _         => NotKeyword;
         }
@@ -249,11 +302,17 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
         MatchNetwork: { _ => return 24; } // TokenType.NETWORK
 
         CheckConnect: {
+            let c1 = *(p + 1);
             c1 != 111 => NotKeyword; // 'o'
+            let c2 = *(p + 2);
             c2 != 110 => NotKeyword; // 'n'
+            let c3 = *(p + 3);
             c3 != 110 => NotKeyword; // 'n'
+            let c4 = *(p + 4);
             c4 != 101 => NotKeyword; // 'e'
+            let c5 = *(p + 5);
             c5 != 99  => NotKeyword; // 'c'
+            let c6 = *(p + 6);
             c6 == 116 => MatchConnect; // 't'
             _         => NotKeyword;
         }
@@ -262,17 +321,25 @@ machine match_keyword(p: *u8, len: u32) -> u32 {
 
         // len == 8: distinct
         CheckLen8: {
+            let c0 = *(p + 0);
             c0 == 100 => CheckDistinct; // 'd'
             _         => NotKeyword;
         }
 
         CheckDistinct: {
+            let c1 = *(p + 1);
             c1 != 105 => NotKeyword; // 'i'
+            let c2 = *(p + 2);
             c2 != 115 => NotKeyword; // 's'
+            let c3 = *(p + 3);
             c3 != 116 => NotKeyword; // 't'
+            let c4 = *(p + 4);
             c4 != 105 => NotKeyword; // 'i'
+            let c5 = *(p + 5);
             c5 != 110 => NotKeyword; // 'n'
+            let c6 = *(p + 6);
             c6 != 99  => NotKeyword; // 'c'
+            let c7 = *(p + 7);
             c7 == 116 => MatchDistinct; // 't'
             _         => NotKeyword;
         }
@@ -318,7 +385,6 @@ machine ssac_tokenize(src: *u8, src_len: u32, tokens: *Token, max_tokens: u32) -
 
         wire is_eof   = pos >= src_len;
         wire c0       = *(src + pos);
-        wire c1       = *(src + (pos + 1));
         wire has_next = (pos + 1) < src_len;
         wire is_full  = tok_cnt >= max_tokens;
     }
@@ -353,6 +419,7 @@ machine ssac_tokenize(src: *u8, src_len: u32, tokens: *Token, max_tokens: u32) -
 
         CheckComment: {
             has_next == 0 => CheckSymbols;
+            let c1 = *(src + (pos + 1));
             c1 == 47      => SkipComment [ pos <= pos + 2, col <= col + 2 ];
             _             => CheckSymbols;
         }
@@ -441,6 +508,7 @@ machine ssac_tokenize(src: *u8, src_len: u32, tokens: *Token, max_tokens: u32) -
 
         CheckHexPrefix: {
             has_next == 0 => ScanDec [ pos <= pos + 1, col <= col + 1 ];
+            let c1 = *(src + (pos + 1));
             c1 == 120     => StartHex; // 'x'
             c1 == 88      => StartHex; // 'X'
             _             => ScanDec [ pos <= pos + 1, col <= col + 1 ];
@@ -480,6 +548,7 @@ machine ssac_tokenize(src: *u8, src_len: u32, tokens: *Token, max_tokens: u32) -
 
         CheckDot: {
             has_next == 0 => FinishNumber;
+            let c1 = *(src + (pos + 1));
             c1 < 48       => FinishNumber;
             c1 <= 57      => StartFrac;
             _             => FinishNumber;
@@ -564,11 +633,13 @@ machine ssac_tokenize(src: *u8, src_len: u32, tokens: *Token, max_tokens: u32) -
         }
 
         Check2CharDot: {
+            let c1 = *(src + (pos + 1));
             c1 == 46 => Emit2Char [ cur_start <= 51 ]; // ".."
             _        => Check1CharSymbols;
         }
 
         Check2CharLt: {
+            let c1 = *(src + (pos + 1));
             c1 == 60 => Emit2Char [ cur_start <= 40 ]; // "<<"
             c1 == 61 => Emit2Char [ cur_start <= 44 ]; // "<="
             c1 == 45 => Emit2Char [ cur_start <= 45 ]; // "<-"
@@ -576,33 +647,39 @@ machine ssac_tokenize(src: *u8, src_len: u32, tokens: *Token, max_tokens: u32) -
         }
 
         Check2CharGt: {
+            let c1 = *(src + (pos + 1));
             c1 == 62 => Emit2Char [ cur_start <= 41 ]; // ">>"
             c1 == 61 => Emit2Char [ cur_start <= 48 ]; // ">="
             _        => Check1CharSymbols;
         }
 
         Check2CharEq: {
+            let c1 = *(src + (pos + 1));
             c1 == 62 => Emit2Char [ cur_start <= 43 ]; // "=>"
             c1 == 61 => Emit2Char [ cur_start <= 46 ]; // "=="
             _        => Check1CharSymbols;
         }
 
         Check2CharMinus: {
+            let c1 = *(src + (pos + 1));
             c1 == 62 => Emit2Char [ cur_start <= 42 ]; // "->"
             _        => Check1CharSymbols;
         }
 
         Check2CharBang: {
+            let c1 = *(src + (pos + 1));
             c1 == 61 => Emit2Char [ cur_start <= 47 ]; // "!="
             _        => Check1CharSymbols;
         }
 
         Check2CharPipe: {
+            let c1 = *(src + (pos + 1));
             c1 == 124 => Emit2Char [ cur_start <= 49 ]; // "||"
             _         => Check1CharSymbols;
         }
 
         Check2CharAmp: {
+            let c1 = *(src + (pos + 1));
             c1 == 38 => Emit2Char [ cur_start <= 50 ]; // "&&"
             _        => Check1CharSymbols;
         }

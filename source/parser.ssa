@@ -263,12 +263,28 @@ machine ctx_peek_kind(ctx: *ParseContext) -> u32 {
 machine ctx_peek_tok(ctx: *ParseContext) -> *Token {
     flow {
         wire pos = ctx.pos;
+        wire cnt = ctx.tok_cnt;
+        wire is_eof = pos >= cnt;
         wire toks = ctx.tokens;
-        wire curr_tok = toks + pos;
     }
     states {
         Entry: {
-            _ => return curr_tok;
+            is_eof != 0 => ClampEof;
+            _           => ValidTok;
+        }
+        ValidTok: {
+            let t = toks + pos;
+            _ => return t;
+        }
+        ClampEof: {
+            cnt == 0 => ZeroTok;
+            let last_idx = cnt - 1;
+            let t = toks + last_idx;
+            _ => return t;
+        }
+        ZeroTok: {
+            let t = toks + 0;
+            _ => return t;
         }
     }
 }
@@ -276,15 +292,30 @@ machine ctx_peek_tok(ctx: *ParseContext) -> *Token {
 machine ctx_consume(ctx: *ParseContext) -> *Token {
     flow {
         wire pos = ctx.pos;
+        wire cnt = ctx.tok_cnt;
+        wire is_eof = pos >= cnt;
         wire toks = ctx.tokens;
-        wire curr_tok = toks + pos;
-        wire next_pos = pos + 1;
     }
     states {
         Entry: {
-            let ret_tok = curr_tok;
-            ctx.pos <- next_pos;
-            _ => return ret_tok;
+            is_eof != 0 => ClampEof;
+            _           => ValidTok;
+        }
+        ValidTok: {
+            let t = toks + pos;
+            ctx.pos <- pos + 1;
+            _ => return t;
+        }
+        ClampEof: {
+            ctx.pos <- cnt;
+            cnt == 0 => ZeroTok;
+            let last_idx = cnt - 1;
+            let t = toks + last_idx;
+            _ => return t;
+        }
+        ZeroTok: {
+            let t = toks + 0;
+            _ => return t;
         }
     }
 }

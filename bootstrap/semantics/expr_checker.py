@@ -14,6 +14,14 @@ class ExprChecker:
         if isinstance(expr, BinaryExpr):
             lt = self.check(expr.left, scope)
             rt = self.check(expr.right, scope)
+            # DEFECT-06: Check for integer division by zero and shift width overflow
+            if expr.op in ("/", "%") and isinstance(expr.right, IntLit) and expr.right.val == 0:
+                raise TypeError("Constant division by zero is prohibited")
+            if expr.op in ("<<", ">>") and isinstance(expr.right, IntLit):
+                lt_name = lt.unwrap().to_str() if hasattr(lt, "unwrap") else getattr(lt, "name", str(lt))
+                bit_width = 64 if lt_name in ("i64", "u64") else 32
+                if expr.right.val >= bit_width or expr.right.val < 0:
+                    raise TypeError(f"Bit shift count {expr.right.val} exceeds or is invalid for type '{lt_name}' (width: {bit_width})")
             t = check_binary_op(expr.op, lt, rt)
         elif isinstance(expr, UnaryExpr):
             opnd_t = self.check(expr.operand, scope)

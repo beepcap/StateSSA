@@ -82,16 +82,23 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    merged_ast = load_and_merge(args.input)
-    annotations = SemanticAnalyzer(merged_ast).analyze()
-    llvm_ir = CodeGen(merged_ast, annotations=annotations).generate()
+    try:
+        merged_ast = load_and_merge(args.input)
+        annotations = SemanticAnalyzer(merged_ast).analyze()
+        llvm_ir = CodeGen(merged_ast, annotations=annotations).generate()
 
-    if args.output:
-        Path(args.output).write_text(llvm_ir, encoding="utf-8")
-        input_summary = ", ".join(args.input)
-        print(f"Compiled [{input_summary}] -> {args.output}")
-    else:
-        print(llvm_ir)
+        if args.output:
+            Path(args.output).write_text(llvm_ir, encoding="utf-8")
+            input_summary = ", ".join(args.input)
+            print(f"Compiled [{input_summary}] -> {args.output}")
+        else:
+            print(llvm_ir)
+    except (SyntaxError, TypeError, RuntimeError) as e:
+        print(f"ssac: error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"ssac: internal compiler error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

@@ -14,7 +14,7 @@ class SemanticAnalyzer:
     def analyze(self) -> TypeAnnotations:
         self.registry.register_all(self.prog.types)
         annotations = TypeAnnotations(type_registry=self.registry.types)
-        funcs = {ext.name: (("q64" if ext.ret_type in ("f32", "f64") else ext.ret_type), [pt for _, pt in ext.params]) for ext in self.prog.externs}
+        funcs = {ext.name: (ext.ret_type, [pt for _, pt in ext.params]) for ext in self.prog.externs}
         funcs.update({m.name: (m.ret_type, [pt for _, pt in m.params]) for m in self.prog.machines})
         funcs.update({net.name: (net.ret_type, [p.type_str for p in net.params]) for net in self.prog.networks})
         sealer = NodeSealer(self.prog.networks)

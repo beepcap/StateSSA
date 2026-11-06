@@ -171,7 +171,35 @@ class CodeGen:
             return self.map_type(base)
         return self.type_map.get(t, t)
 
+    def get_struct_layout(self, struct_name: str) -> tuple[int, int]:
+        if struct_name not in self.struct_def:
+            return 4, 4
+        current_offset = 0
+        max_align = 1
+        for _, field_type in self.struct_def[struct_name]:
+            f_size = self.get_type_byte_size(field_type)
+            f_align = self.get_type_align(field_type)
+            max_align = max(max_align, f_align)
+            if current_offset % f_align != 0:
+                current_offset += (f_align - (current_offset % f_align))
+            current_offset += f_size
+        if current_offset % max_align != 0:
+            current_offset += (max_align - (current_offset % max_align))
+        return current_offset, max_align
+
     def get_type_align(self, t: str) -> int:
+        base = self.resolve_base_primitive_name(t)
+        if base in self.struct_def:
+            return self.get_struct_layout(base)[1]
+        if self.is_vector_type(base):
+            import re
+            m = re.match(r'^(f32|f64|i32|i64|u8|u16|u32|u64)x(\d+)$', base[1:] if base.startswith("*") else base)
+            if m:
+                elem_t, lanes = m.group(1), int(m.group(2))
+                elem_size = 8 if elem_t in ("f64", "i64", "u64") else (4 if elem_t in ("f32", "i32", "u32") else (2 if elem_t in ("i16", "u16") else 1))
+                total_bytes = elem_size * lanes
+                return min(total_bytes, 64)
+            return 16
         mapped = self.map_type(t)
         if "double" in mapped or "f64" in t or "i64" in t or "u64" in t:
             return 8
@@ -180,6 +208,31 @@ class CodeGen:
         elif "i16" in t or "u16" in t:
             return 2
         elif "i8" in t or "u8" in t:
+            return 1
+        return 4
+
+    def get_type_byte_size(self, t: str) -> int:
+        base = self.resolve_base_primitive_name(t)
+        if base.startswith("*"):
+            return 8
+        if base in self.struct_def:
+            return self.get_struct_layout(base)[0]
+        if self.is_vector_type(base):
+            import re
+            m = re.match(r'^(f32|f64|i32|i64|u8|u16|u32|u64)x(\d+)$', base[1:] if base.startswith("*") else base)
+            if m:
+                elem_t, lanes = m.group(1), int(m.group(2))
+                esize = 8 if elem_t in ("f64", "i64", "u64") else (4 if elem_t in ("f32", "i32", "u32") else (2 if elem_t in ("i16", "u16") else 1))
+                return esize * lanes
+            return 16
+        mapped = self.map_type(base)
+        if "double" in mapped or "f64" in base or "i64" in base or "u64" in base or "q64" in base:
+            return 8
+        elif "float" in mapped or "f32" in base or "i32" in base or "u32" in base:
+            return 4
+        elif "i16" in base or "u16" in base:
+            return 2
+        elif "i8" in base or "u8" in base or "void" in base:
             return 1
         return 4
 
@@ -204,7 +257,50 @@ class CodeGen:
         # String constants
         for sym, sval, slen in self.string_constants:
             # Escape for LLVM IR string literal
-            escaped = sval.replace("\\n", "\\0A").replace('"', '\\22')
+            def llvm_escape(s: str) -> str:
+                res = []
+                i = 0
+                while i < len(s):
+                    if s[i] == '\\':
+                        if i + 1 < len(s):
+                            c2 = s[i+1]
+                            if c2 == '"':
+                                res.append('\\22')
+                                i += 2
+                                continue
+                            elif c2 == '\\':
+                                res.append('\\5C')
+                                i += 2
+                                continue
+                            elif c2 == 'n':
+                                res.append('\\0A')
+                                i += 2
+                                continue
+                            elif c2 == 'r':
+                                res.append('\\0D')
+                                i += 2
+                                continue
+                            elif c2 == 't':
+                                res.append('\\09')
+                                i += 2
+                                continue
+                            elif c2 == '0':
+                                res.append('\\00')
+                                i += 2
+                                continue
+                        res.append('\\5C')
+                        i += 1
+                    elif s[i] == '"':
+                        res.append('\\22')
+                        i += 1
+                    elif s[i] == '\n':
+                        res.append('\\0A')
+                        i += 1
+                    else:
+                        res.append(s[i])
+                        i += 1
+                return "".join(res)
+            escaped = llvm_escape(sval)
             lines.append(f'@{sym} = private unnamed_addr constant [{slen} x i8] c"{escaped}\\00", align 1')
         if self.string_constants: lines.append("")
 
@@ -225,6 +321,7 @@ class CodeGen:
             lines.append(f"declare {ret} @{ext.name}({params})")
         if self.prog.externs: lines.append("")
 
+        lines.append("declare void @exit(i32) cold noreturn nounwind")
         lines.append("declare void @llvm.trap() cold noreturn nounwind")
         lines.append("declare float @llvm.maxnum.f32(float, float)")
         lines.append("declare float @llvm.minnum.f32(float, float)")
@@ -328,37 +425,6 @@ class CodeGen:
                     self.emit_store(act.target, act.expr, m, bb_env[curr_bb], bb_insts[curr_bb])
 
             for r_idx, r in enumerate(s.rules):
-                if r.is_return:
-                    if r.ret_expr is None or self.map_type(m.ret_type) == "void":
-                        bb_insts[curr_bb].append("ret void")
-                    else:
-                        ret_val = self.emit_expr(r.ret_expr, m, bb_env[curr_bb], bb_insts[curr_bb])
-                        expected_ret = self.map_type(m.ret_type)
-                        actual_ret_ssa = self.get_expr_type(r.ret_expr, m)
-                        actual_ret_llvm = self.map_type(actual_ret_ssa)
-                        if expected_ret != actual_ret_llvm:
-                            if expected_ret in ("i32", "i16", "i8") and actual_ret_llvm == "i64":
-                                tr_val = self.fresh_tmp("trunc")
-                                bb_insts[curr_bb].append(f"{tr_val} = trunc i64 {ret_val} to {expected_ret}")
-                                ret_val = tr_val
-                            elif expected_ret == "i64" and actual_ret_llvm in ("i32", "i16", "i8"):
-                                ext_val = self.fresh_tmp("zext")
-                                bb_insts[curr_bb].append(f"{ext_val} = zext {actual_ret_llvm} {ret_val} to i64")
-                                ret_val = ext_val
-                            elif expected_ret.endswith("*") and actual_ret_llvm.endswith("*"):
-                                bc_val = self.fresh_tmp("bitcast")
-                                bb_insts[curr_bb].append(f"{bc_val} = bitcast {actual_ret_llvm} {ret_val} to {expected_ret}")
-                                ret_val = bc_val
-                        if m.ret_type in self.bounded_types:
-                            ret_val = self.emit_clamp(ret_val, self.bounded_types[m.ret_type], bb_insts[curr_bb])
-                        bb_insts[curr_bb].append(f"ret {expected_ret} {ret_val}")
-                    break
-                elif r.is_panic:
-                    bb_insts[curr_bb].append("call void @llvm.trap()")
-                    bb_insts[curr_bb].append("unreachable")
-                    break
-
-                target_bb = r.target.lower()
                 if r.guard is not None:
                     guard_type = self.get_expr_type(r.guard, m)
                     if guard_type.startswith("<") and "x i1>" in guard_type:
@@ -371,17 +437,36 @@ class CodeGen:
                     bb_order.append(then_bb)
                     bb_insts[then_bb] = []
                     bb_env[then_bb] = dict(bb_env[curr_bb])
-                    self.record_latches(r, m, then_bb, target_bb, bb_env, bb_insts, phi_incoming)
-                    bb_insts[then_bb].append(f"br label %{target_bb}")
+
+                    if r.is_return:
+                        self._emit_return_inst(r, m, then_bb, bb_env, bb_insts)
+                    elif r.is_panic:
+                        err_code = self.emit_expr(r.ret_expr, m, bb_env[then_bb], bb_insts[then_bb]) if r.ret_expr else "1"
+                        self.emit_panic(err_code, then_bb, bb_insts)
+                    else:
+                        target_bb = r.target.lower()
+                        self.record_latches(r, m, then_bb, target_bb, bb_env, bb_insts, phi_incoming)
+                        bb_insts[then_bb].append(f"br label %{target_bb}")
 
                     bb_order.append(else_bb)
                     bb_insts[else_bb] = []
                     bb_env[else_bb] = dict(bb_env[curr_bb])
                     curr_bb = else_bb
                 else:
-                    self.record_latches(r, m, curr_bb, target_bb, bb_env, bb_insts, phi_incoming)
-                    bb_insts[curr_bb].append(f"br label %{target_bb}")
-                    break
+                    if r.is_return:
+                        self._emit_return_inst(r, m, curr_bb, bb_env, bb_insts)
+                        break
+                    elif r.is_panic:
+                        err_code = self.emit_expr(r.ret_expr, m, bb_env[curr_bb], bb_insts[curr_bb]) if r.ret_expr else "1"
+                        self.emit_panic(err_code, curr_bb, bb_insts)
+                        break
+                    else:
+                        target_bb = r.target.lower()
+                        self.record_latches(r, m, curr_bb, target_bb, bb_env, bb_insts, phi_incoming)
+                        bb_insts[curr_bb].append(f"br label %{target_bb}")
+                        break
+            else:
+                self.emit_panic("255", curr_bb, bb_insts)
 
         for bb in bb_order:
             lines.append(f"{bb}:")
@@ -400,6 +485,35 @@ class CodeGen:
 
         lines.append("}\n")
         return lines
+
+    def _emit_return_inst(self, r: Rule, m: Machine, bb: str, bb_env: dict, bb_insts: dict):
+        if r.ret_expr is None or self.map_type(m.ret_type) == "void":
+            bb_insts[bb].append("ret void")
+        else:
+            ret_val = self.emit_expr(r.ret_expr, m, bb_env[bb], bb_insts[bb])
+            expected_ret = self.map_type(m.ret_type)
+            actual_ret_ssa = self.get_expr_type(r.ret_expr, m)
+            actual_ret_llvm = self.map_type(actual_ret_ssa)
+            if expected_ret != actual_ret_llvm:
+                if expected_ret in ("i32", "i16", "i8") and actual_ret_llvm == "i64":
+                    tr_val = self.fresh_tmp("trunc")
+                    bb_insts[bb].append(f"{tr_val} = trunc i64 {ret_val} to {expected_ret}")
+                    ret_val = tr_val
+                elif expected_ret == "i64" and actual_ret_llvm in ("i32", "i16", "i8"):
+                    ext_val = self.fresh_tmp("zext")
+                    bb_insts[bb].append(f"{ext_val} = zext {actual_ret_llvm} {ret_val} to i64")
+                    ret_val = ext_val
+                elif expected_ret.endswith("*") and actual_ret_llvm.endswith("*"):
+                    bc_val = self.fresh_tmp("bitcast")
+                    bb_insts[bb].append(f"{bc_val} = bitcast {actual_ret_llvm} {ret_val} to {expected_ret}")
+                    ret_val = bc_val
+            if m.ret_type in self.bounded_types:
+                ret_val = self.emit_clamp(ret_val, self.bounded_types[m.ret_type], bb_insts[bb])
+            bb_insts[bb].append(f"ret {expected_ret} {ret_val}")
+
+    def emit_panic(self, code_val: str, bb: str, bb_insts: dict):
+        bb_insts[bb].append(f"call void @exit(i32 {code_val})")
+        bb_insts[bb].append("unreachable")
 
     def record_latches(self, r: Rule, m: Machine, from_bb: str, target_bb: str,
                        bb_env: dict, bb_insts: dict, phi_incoming: dict):
@@ -508,6 +622,8 @@ class CodeGen:
                     final_val = bc_val
 
             insts.append(f"store {fld_llvm} {final_val}, {fld_llvm}* {fld_ptr}")
+        else:
+            raise NotImplementedError(f"Unsupported store target expression type: {type(target).__name__}")
 
     def resolve_field_ptr(self, expr: FieldExpr, m: Machine, env: dict[str, str], insts: list[str]) -> tuple[str, str, str]:
         if isinstance(expr.target, FieldExpr):
@@ -567,8 +683,6 @@ class CodeGen:
                     return net.ret_type
             for ext in self.prog.externs:
                 if ext.name == expr.func:
-                    if ext.ret_type in ("f32", "f64"):
-                        return "q64"
                     return ext.ret_type
         if isinstance(expr, FieldExpr):
             # Lookup struct
@@ -684,16 +798,30 @@ class CodeGen:
             right_type = self.get_expr_type(expr.right, m)
             if left_type.startswith("*") and expr.op == "+":
                 elem_type = self.map_type(left_type[1:])
+                idx_llvm = self.map_type(right_type)
                 res = self.fresh_tmp("gep")
-                insts.append(f"{res} = getelementptr inbounds {elem_type}, {elem_type}* {left}, i32 {right}")
+                insts.append(f"{res} = getelementptr inbounds {elem_type}, {elem_type}* {left}, {idx_llvm} {right}")
                 return res
             if left_type.startswith("*") and right_type.startswith("*") and expr.op == "-":
                 t1 = self.fresh_tmp("p2i")
                 t2 = self.fresh_tmp("p2i")
-                insts.append(f"{t1} = ptrtoint {self.map_type(left_type)} {left} to i32")
-                insts.append(f"{t2} = ptrtoint {self.map_type(right_type)} {right} to i32")
-                res = self.fresh_tmp("diff")
-                insts.append(f"{res} = sub i32 {t1}, {t2}")
+                insts.append(f"{t1} = ptrtoint {self.map_type(left_type)} {left} to i64")
+                insts.append(f"{t2} = ptrtoint {self.map_type(right_type)} {right} to i64")
+                diff = self.fresh_tmp("diff")
+                insts.append(f"{diff} = sub i64 {t1}, {t2}")
+                elem_size = self.get_type_byte_size(left_type[1:])
+                if elem_size > 1:
+                    pdiff = self.fresh_tmp("pdiff")
+                    insts.append(f"{pdiff} = sdiv i64 {diff}, {elem_size}")
+                    return pdiff
+                return diff
+            if left_type.startswith("*") and not right_type.startswith("*") and expr.op == "-":
+                elem_type = self.map_type(left_type[1:])
+                idx_llvm = self.map_type(right_type)
+                neg_idx = self.fresh_tmp("neg_idx")
+                insts.append(f"{neg_idx} = sub {idx_llvm} 0, {right}")
+                res = self.fresh_tmp("gep")
+                insts.append(f"{res} = getelementptr inbounds {elem_type}, {elem_type}* {left}, {idx_llvm} {neg_idx}")
                 return res
 
             if (left_type.startswith("*") or right_type.startswith("*")) and expr.op in ("==", "!="):
@@ -968,18 +1096,6 @@ class CodeGen:
             else:
                 res = self.fresh_tmp()
                 insts.append(f"{res} = call {ret_type} @{expr.func}({args_str})")
-                if ret_type == "double":
-                    mul_res = self.fresh_tmp("fp2q_mul")
-                    insts.append(f"{mul_res} = fmul double {res}, 4294967296.0")
-                    q_res = self.fresh_tmp("fp2q")
-                    insts.append(f"{q_res} = fptosi double {mul_res} to i64")
-                    return q_res
-                elif ret_type == "float":
-                    mul_res = self.fresh_tmp("fp2q_mul")
-                    insts.append(f"{mul_res} = fmul float {res}, 4294967296.0")
-                    q_res = self.fresh_tmp("fp2q")
-                    insts.append(f"{q_res} = fptosi float {mul_res} to i64")
-                    return q_res
                 return res
 
         if isinstance(expr, CastExpr):

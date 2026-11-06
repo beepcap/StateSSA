@@ -113,7 +113,7 @@ type CodegenCtx = {
     fused_ret_vals:  *RetValEntry,
     fused_prev_type_p: *u8,
     fused_prev_type_l: u32,
-    pad_ctx2:        u32
+    wire_in_progress:  u64
 };
 
 machine calc_bb_required_size(s: *StateDef, m: *MachineDef) -> u32 {
@@ -1518,17 +1518,17 @@ machine validate_all_program_types(ctx: *CodegenCtx) -> u32 {
     }
 }
 
-machine is_type_64(t: *u8, len: u32) -> u32 {
+machine is_type_64(t: *u8) -> u32 {
     flow {}
     states {
         Entry: {
             t == null => RetZero;
-            len == 0  => RetZero;
-            let is_i64 = call str_eq(t, len, "i64", 3);
+            let l = call strlen(t);
+            let is_i64 = call str_eq(t, l, "i64", 3);
             is_i64 != 0 => RetOne;
-            let is_u64 = call str_eq(t, len, "u64", 3);
+            let is_u64 = call str_eq(t, l, "u64", 3);
             is_u64 != 0 => RetOne;
-            let is_q64 = call str_eq(t, len, "q64", 3);
+            let is_q64 = call str_eq(t, l, "q64", 3);
             is_q64 != 0 => RetOne;
             _ => RetZero;
         }
@@ -1537,13 +1537,13 @@ machine is_type_64(t: *u8, len: u32) -> u32 {
     }
 }
 
-machine is_type_q64(t: *u8, len: u32) -> u32 {
+machine is_type_q64(t: *u8) -> u32 {
     flow {}
     states {
         Entry: {
             t == null => RetZero;
-            len == 0  => RetZero;
-            let is_q = call str_eq(t, len, "q64", 3);
+            let l = call strlen(t);
+            let is_q = call str_eq(t, l, "q64", 3);
             is_q != 0 => RetOne;
             _ => RetZero;
         }
@@ -1552,19 +1552,19 @@ machine is_type_q64(t: *u8, len: u32) -> u32 {
     }
 }
 
-machine is_type_signed(t: *u8, len: u32) -> u32 {
+machine is_type_signed(t: *u8) -> u32 {
     flow {}
     states {
         Entry: {
             t == null => RetZero;
-            len == 0  => RetZero;
-            let is_i32 = call str_eq(t, len, "i32", 3);
+            let l = call strlen(t);
+            let is_i32 = call str_eq(t, l, "i32", 3);
             is_i32 != 0 => RetOne;
-            let is_i64 = call str_eq(t, len, "i64", 3);
+            let is_i64 = call str_eq(t, l, "i64", 3);
             is_i64 != 0 => RetOne;
-            let is_i16 = call str_eq(t, len, "i16", 3);
+            let is_i16 = call str_eq(t, l, "i16", 3);
             is_i16 != 0 => RetOne;
-            let is_i8 = call str_eq(t, len, "i8", 2);
+            let is_i8 = call str_eq(t, l, "i8", 2);
             is_i8 != 0 => RetOne;
             _ => RetZero;
         }
@@ -1573,35 +1573,35 @@ machine is_type_signed(t: *u8, len: u32) -> u32 {
     }
 }
 
-machine get_type_bit_width(t: *u8, len: u32) -> u32 {
+machine get_type_bit_width(t: *u8) -> u32 {
     flow {}
     states {
         Entry: {
             t == null => RetDefault;
-            len == 0  => RetDefault;
+            let l = call strlen(t);
 
             // i64, u64, q64
-            let is_i64 = call str_eq(t, len, "i64", 3);
+            let is_i64 = call str_eq(t, l, "i64", 3);
             is_i64 != 0 => Ret64;
-            let is_u64 = call str_eq(t, len, "u64", 3);
+            let is_u64 = call str_eq(t, l, "u64", 3);
             is_u64 != 0 => Ret64;
-            let is_q64 = call str_eq(t, len, "q64", 3);
+            let is_q64 = call str_eq(t, l, "q64", 3);
             is_q64 != 0 => Ret64;
 
             // i16, u16
-            let is_i16 = call str_eq(t, len, "i16", 3);
+            let is_i16 = call str_eq(t, l, "i16", 3);
             is_i16 != 0 => Ret16;
-            let is_u16 = call str_eq(t, len, "u16", 3);
+            let is_u16 = call str_eq(t, l, "u16", 3);
             is_u16 != 0 => Ret16;
 
             // i8, u8
-            let is_i8 = call str_eq(t, len, "i8", 2);
+            let is_i8 = call str_eq(t, l, "i8", 2);
             is_i8 != 0 => Ret8;
-            let is_u8 = call str_eq(t, len, "u8", 2);
+            let is_u8 = call str_eq(t, l, "u8", 2);
             is_u8 != 0 => Ret8;
 
             // i1
-            let is_i1 = call str_eq(t, len, "i1", 2);
+            let is_i1 = call str_eq(t, l, "i1", 2);
             is_i1 != 0 => Ret1;
 
             // ポインタ (*...) は 64bit
@@ -2195,12 +2195,17 @@ machine is_ptr_type_str(p: *u8, len: u32) -> u32 {
     }
 }
 
-machine is_ptr_type(t: *u8, len: u32) -> u32 {
+machine is_ptr_type(t: *u8) -> u32 {
     flow {}
     states {
         Entry: {
-            let r = call is_ptr_type_str(t, len);
+            t == null => RetZero;
+            let l = call strlen(t);
+            let r = call is_ptr_type_str(t, l);
             _     => return r;
+        }
+        RetZero: {
+            _ => return 0;
         }
     }
 }
@@ -2325,7 +2330,7 @@ machine is_type_compatible(kind: u32, exp_p: *u8, exp_l: u32, act_p: *u8, act_l:
             let is_exp_int = call is_integral_type(exp_base_p, exp_base_l);
             let is_act_int = call is_integral_type(act_base_p, act_base_l);
             let both_int = is_exp_int & is_act_int;
-            both_int != 0 => CheckIntBaseWidth [ eb_p <= exp_base_p, eb_l <= exp_base_l, ab_p <= act_base_p, ab_l <= act_base_l ];
+            both_int != 0 => CheckIntBaseWidth [ eb_p <= exp_base_p, ab_p <= act_base_p ];
 
             _ => RetFail;
         }
@@ -2360,13 +2365,13 @@ machine is_type_compatible(kind: u32, exp_p: *u8, exp_l: u32, act_p: *u8, act_l:
             let is_exp_int = call is_integral_type(exp_base_p, exp_base_l);
             let is_act_int = call is_integral_type(act_base_p, act_base_l);
             let both_int = is_exp_int & is_act_int;
-            both_int != 0 => CheckIntBaseWidth [ eb_p <= exp_base_p, eb_l <= exp_base_l, ab_p <= act_base_p, ab_l <= act_base_l ];
+            both_int != 0 => CheckIntBaseWidth [ eb_p <= exp_base_p, ab_p <= act_base_p ];
 
             _ => RetFail;
         }
         CheckIntBaseWidth: {
-            let exp_w = call get_type_bit_width(eb_p, eb_l);
-            let act_w = call get_type_bit_width(ab_p, ab_l);
+            let exp_w = call get_type_bit_width(eb_p);
+            let act_w = call get_type_bit_width(ab_p);
             exp_w == act_w => RetPass;
             _              => RetFail;
         }
@@ -2377,8 +2382,8 @@ machine is_type_compatible(kind: u32, exp_p: *u8, exp_l: u32, act_p: *u8, act_l:
             _       => CheckWidth;
         }
         CheckWidth: {
-            let exp_w = call get_type_bit_width(exp_p, exp_l);
-            let act_w = call get_type_bit_width(act_p, act_l);
+            let exp_w = call get_type_bit_width(exp_p);
+            let act_w = call get_type_bit_width(act_p);
 
             exp_w == act_w => RetPass;
             act_w < exp_w  => RetPass;
@@ -2387,7 +2392,7 @@ machine is_type_compatible(kind: u32, exp_p: *u8, exp_l: u32, act_p: *u8, act_l:
             _         => RetFail;
         }
         CheckByteStore: {
-            let exp_w = call get_type_bit_width(exp_p, exp_l);
+            let exp_w = call get_type_bit_width(exp_p);
             exp_w <= 16 => RetPass;
             _           => RetFail;
         }
@@ -2890,18 +2895,64 @@ machine find_wire(m: *MachineDef, name_p: *u8, name_l: u32) -> *WireDef {
     }
 }
 
-machine find_wire_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
+machine find_wire_idx(m: *MachineDef, name_p: *u8, name_l: u32) -> i32 {
     flow {
-        reg w_matched: *WireDef = null;
+        reg i: u32 = 0;
+        wire cnt = m.wire_count;
+        wire has_more = i < cnt;
+        wire fld_w = m.wires;
+        wire w = fld_w + i;
+        wire is_match = call str_eq(w.name_ptr, w.name_len, name_p, name_l);
     }
     states {
         Entry: {
-            let w = call find_wire(m, name_p, name_l);
-            w == null => ReturnNull;
-            _         => ReturnFound [ w_matched <= w ];
+            _ => Loop [ i <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => NotFound;
+            is_match != 0 => Found;
+            _             => Loop [ i <= i + 1 ];
+        }
+        Found: {
+            let res = cast(i32) i;
+            _ => return res;
+        }
+        NotFound: {
+            _ => return -1;
+        }
+    }
+}
+
+machine find_wire_type(ctx: *CodegenCtx, m: *MachineDef, name_p: *u8, name_l: u32) -> *u8 {
+    flow {
+        reg w_matched: *WireDef = null;
+        reg wire_mask: u64 = 0;
+    }
+    states {
+        Entry: {
+            let widx = call find_wire_idx(m, name_p, name_l);
+            widx < 0 => ReturnNull;
+            let u_widx = cast(u64) widx;
+            let one64 = cast(u64) 1;
+            let mask = one64 << u_widx;
+            let in_prog = ctx.wire_in_progress;
+            let in_prog_masked = in_prog & mask;
+            let is_cyclic = in_prog_masked != 0;
+            is_cyclic != 0 => ReturnCycleFallback;
+
+            let next_prog = in_prog | mask;
+            ctx.wire_in_progress <- next_prog;
+            let w = m.wires + widx;
+            _ => ReturnFound [ w_matched <= w, wire_mask <= cast(u64) mask ];
+        }
+        ReturnCycleFallback: {
+            _ => return "i32";
         }
         ReturnFound: {
             let res = call get_expr_type(ctx, w_matched.expr);
+            let cur_prog = ctx.wire_in_progress;
+            let unmark_prog = cur_prog ^ wire_mask;
+            ctx.wire_in_progress <- unmark_prog;
             _ => return res;
         }
         ReturnNull: {
@@ -2963,23 +3014,21 @@ machine get_binop_type(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
         }
         CheckArith: {
             let lt = call get_expr_type(ctx, expr.left);
-            let ltl = call strlen(lt);
-            let is_lfv = call is_type_float_or_vec(lt, ltl);
+            let is_lfv = call is_type_float_or_vec(lt, call strlen(lt));
             is_lfv != 0 => ReturnLeft [ left_t <= lt ];
 
             let rt = call get_expr_type(ctx, expr.right);
-            let rtl = call strlen(rt);
-            let is_rfv = call is_type_float_or_vec(rt, rtl);
+            let is_rfv = call is_type_float_or_vec(rt, call strlen(rt));
             is_rfv != 0 => ReturnLeft [ left_t <= rt ];
 
-            let is_lq64 = call is_type_q64(lt, ltl);
+            let is_lq64 = call is_type_q64(lt);
             is_lq64 != 0 => ReturnQ64;
-            let is_rq64 = call is_type_q64(rt, rtl);
+            let is_rq64 = call is_type_q64(rt);
             is_rq64 != 0 => ReturnQ64;
 
-            let is_l64 = call is_type_64(lt, ltl);
+            let is_l64 = call is_type_64(lt);
             is_l64 != 0 => ReturnI64;
-            let is_r64 = call is_type_64(rt, rtl);
+            let is_r64 = call is_type_64(rt);
             is_r64 != 0 => ReturnI64;
             _           => ReturnI32;
         }
@@ -3181,29 +3230,15 @@ machine find_func_ret_type(prog: *ProgramDef, alloc: *BumpAlloc, name_p: *u8, na
     }
 }
 
-machine is_pointer_add(left_type: *u8, right_type_p: *u8, right_type_l: u32, op: u32) -> u32 {
+machine is_pointer_add(left_type: *u8, op: u32) -> u32 {
     flow {}
     states {
         Entry: {
-            left_type == null    => RetZero;
-            right_type_p == null => RetZero;
-            op != 71             => RetZero; // 71 is '+'
+            left_type == null => RetZero;
+            op != 71          => RetZero; // 71 is '+'
             let c0 = *left_type;
-            c0 != 42             => RetZero; // left must be pointer
-
-            // Check right type: pointer is forbidden!
-            let rc0 = *right_type_p;
-            rc0 == 42            => RetZero;
-
-            // Check right type: float is forbidden!
-            let is_fp = call is_type_float_or_vec(right_type_p, right_type_l);
-            is_fp != 0           => RetZero;
-
-            // Check right type: must be integer!
-            let is_int = call is_integral_type(right_type_p, right_type_l);
-            is_int != 0          => RetOne;
-
-            _                    => RetZero;
+            c0 == 42          => RetOne;  // 42 is '*'
+            _                 => RetZero;
         }
         RetOne: {
             _ => return 1;
@@ -3310,19 +3345,19 @@ machine is_i1_type(t: *u8) -> u32 {
     }
 }
 
-machine is_type_small(t: *u8, len: u32) -> u32 {
+machine is_type_small(t: *u8) -> u32 {
     flow {}
     states {
         Entry: {
             t == null => RetZero;
-            len == 0  => RetZero;
-            let is_i8 = call str_eq(t, len, "i8", 2);
+            let l = call strlen(t);
+            let is_i8 = call str_eq(t, l, "i8", 2);
             is_i8 != 0 => RetOne;
-            let is_u8 = call str_eq(t, len, "u8", 2);
+            let is_u8 = call str_eq(t, l, "u8", 2);
             is_u8 != 0 => RetOne;
-            let is_i16 = call str_eq(t, len, "i16", 3);
+            let is_i16 = call str_eq(t, l, "i16", 3);
             is_i16 != 0 => RetOne;
-            let is_u16 = call str_eq(t, len, "u16", 3);
+            let is_u16 = call str_eq(t, l, "u16", 3);
             is_u16 != 0 => RetOne;
             _ => RetZero;
         }
@@ -3331,19 +3366,19 @@ machine is_type_small(t: *u8, len: u32) -> u32 {
     }
 }
 
-machine is_unsigned_type(t: *u8, len: u32) -> u32 {
+machine is_unsigned_type(t: *u8) -> u32 {
     flow {}
     states {
         Entry: {
             t == null => RetZero;
-            len == 0  => RetZero;
-            let is_u8 = call str_eq(t, len, "u8", 2);
+            let l = call strlen(t);
+            let is_u8 = call str_eq(t, l, "u8", 2);
             is_u8 != 0 => RetOne;
-            let is_u16 = call str_eq(t, len, "u16", 3);
+            let is_u16 = call str_eq(t, l, "u16", 3);
             is_u16 != 0 => RetOne;
-            let is_u32 = call str_eq(t, len, "u32", 3);
+            let is_u32 = call str_eq(t, l, "u32", 3);
             is_u32 != 0 => RetOne;
-            let is_u64 = call str_eq(t, len, "u64", 3);
+            let is_u64 = call str_eq(t, l, "u64", 3);
             is_u64 != 0 => RetOne;
             _ => RetZero;
         }
@@ -3755,8 +3790,8 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let st = call get_expr_type(ctx, operand);
             let dt = call make_cstr(ctx.alloc, target_t_p, target_t_l);
 
-            let s_ptr = call is_ptr_type(st, call strlen(st));
-            let d_ptr = call is_ptr_type(dt, target_t_l);
+            let s_ptr = call is_ptr_type(st);
+            let d_ptr = call is_ptr_type(dt);
 
             _ => Classify [ val_str <= val, s_type <= st, d_type <= dt, src_is_ptr <= s_ptr, dst_is_ptr <= d_ptr ];
         }
@@ -3799,10 +3834,10 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let is_llvm_same = call str_eq(map_s, map_s_l, map_d, map_d_l);
             is_llvm_same != 0 => ReturnNop;
 
-            let is_dst_q = call is_type_q64(d_type, d_l);
+            let is_dst_q = call is_type_q64(d_type);
             is_dst_q != 0 => CastToQ64;
 
-            let is_src_q = call is_type_q64(s_type, s_l);
+            let is_src_q = call is_type_q64(s_type);
             is_src_q != 0 => CastFromQ64;
 
             src_is_ptr != 0 => SrcIsPtr;
@@ -3839,7 +3874,7 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             _ => return res;
         }
         IntToFp: {
-            let is_signed = call is_type_signed(s_type, call strlen(s_type));
+            let is_signed = call is_type_signed(s_type);
             is_signed != 0 => DoSitofp;
             _              => DoUitofp;
         }
@@ -3852,7 +3887,7 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             _ => return res;
         }
         FpToInt: {
-            let is_signed = call is_type_signed(d_type, call strlen(d_type));
+            let is_signed = call is_type_signed(d_type);
             is_signed != 0 => DoFptosi;
             _              => DoFptoui;
         }
@@ -3872,7 +3907,7 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let is_src_fp = call is_type_float_or_vec(s_type, s_l);
             is_src_fp != 0 => CastToQ64_Fp;
 
-            let s_bits = call get_type_bit_width(s_type, s_l);
+            let s_bits = call get_type_bit_width(s_type);
             s_bits < 64 => CastToQ64_Ext;
             _           => CastToQ64_Shl [ ext_val <= val_str ];
         }
@@ -3901,7 +3936,7 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             _ => return res;
         }
         CastToQ64_Ext: {
-            let is_signed = call is_type_signed(s_type, call strlen(s_type));
+            let is_signed = call is_type_signed(s_type);
             is_signed != 0 => CastToQ64_Sext;
             _              => CastToQ64_Zext;
         }
@@ -3966,7 +4001,7 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let _ = call emit_str(ctx, ", 32", 4);
             let _ = call emit_nl(ctx);
 
-            let d_bits = call get_type_bit_width(d_type, call strlen(d_type));
+            let d_bits = call get_type_bit_width(d_type);
             d_bits < 64 => CastFromQ64_Trunc [ shr_val <= shr ];
             _           => ReturnShr [ shr_val <= shr ];
         }
@@ -3998,15 +4033,15 @@ machine emit_cast_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             _ => return res;
         }
         IntToInt: {
-            let s_bits = call get_type_bit_width(s_type, call strlen(s_type));
-            let d_bits = call get_type_bit_width(d_type, call strlen(d_type));
+            let s_bits = call get_type_bit_width(s_type);
+            let d_bits = call get_type_bit_width(d_type);
 
             s_bits < d_bits => CheckIntSign;
             s_bits > d_bits => DoTrunc;
             _               => ReturnNop;
         }
         CheckIntSign: {
-            let is_signed = call is_type_signed(s_type, call strlen(s_type));
+            let is_signed = call is_type_signed(s_type);
             is_signed != 0 => DoSext;
             _              => DoZext;
         }
@@ -4101,6 +4136,8 @@ machine emit_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
 machine emit_var(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     flow {
         reg res_p: *u8 = null;
+        reg wire_matched: *WireDef = null;
+        reg wire_mask_reg: u64 = 0;
         wire name_p = expr.str_ptr;
         wire name_l = expr.str_len;
         wire m = ctx.cur_machine;
@@ -4178,9 +4215,47 @@ machine emit_var(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             _ => return res_p;
         }
         ExpandWire: {
-            let wire_ptr = call find_wire(m, name_p, name_l);
-            let wire_res = call emit_expr(ctx, wire_ptr.expr);
+            let widx = call find_wire_idx(m, name_p, name_l);
+            widx < 0 => ReturnNull;
+            let u_widx = cast(u64) widx;
+            let one64 = cast(u64) 1;
+            let mask = one64 << u_widx;
+            let in_prog = ctx.wire_in_progress;
+            let in_prog_masked = in_prog & mask;
+            let is_cyclic = in_prog_masked != 0;
+            is_cyclic != 0 => EmitCyclicWireError;
+
+            // Mark wire in progress
+            let next_prog = in_prog | mask;
+            ctx.wire_in_progress <- next_prog;
+
+            let wire_ptr = m.wires + widx;
+            _ => DoExpandWire [ wire_matched <= wire_ptr, wire_mask_reg <= cast(u64) mask ];
+        }
+        DoExpandWire: {
+            let wire_res = call emit_expr(ctx, wire_matched.expr);
+
+            // Unmark wire
+            let cur_prog = ctx.wire_in_progress;
+            let unmark_prog = cur_prog ^ wire_mask_reg;
+            ctx.wire_in_progress <- unmark_prog;
+
             _ => return wire_res;
+        }
+        EmitCyclicWireError: {
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            let _ = call diag_str("[StateSSA Compile Error]: Cyclic wire dependency detected for wire '");
+            let _ = call diag_write(name_p, name_l);
+            let _ = call diag_str("' (CWE-674/CWE-400 Prevention).");
+            let _ = call diag_nl();
+            let _ = call diag_str("Recursive or cyclic wire definitions are strictly prohibited.");
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            ctx.error_code <- -61;
+            _ => return "null";
         }
     }
 }
@@ -4328,7 +4403,7 @@ machine emit_ptr_gep(ctx: *CodegenCtx, left_val: *u8, left_type_p: *u8, right_va
             let _ = call emit_str(ctx, "* ", 2);
             let _ = call emit_str(ctx, left_val, call strlen(left_val));
 
-            let is_64 = call is_type_64(right_type_p, call strlen(right_type_p));
+            let is_64 = call is_type_64(right_type_p);
             is_64 != 0 => EmitGep64 [ res_var_reg <= res_var ];
             _          => EmitGep32 [ res_var_reg <= res_var ];
         }
@@ -4681,7 +4756,7 @@ machine emit_float_bin_op(ctx: *CodegenCtx, op: u32, lt_p: *u8, rt_p: *u8, lv: *
 
 machine bridge_operand_to_fp(ctx: *CodegenCtx, op_val: *u8, op_type: *u8, target_fp_type: *u8) -> *u8 {
     flow {
-        wire is_q = call is_type_q64(op_type, call strlen(op_type));
+        wire is_q = call is_type_q64(op_type);
         wire is_f64 = call str_contains(target_fp_type, call strlen(target_fp_type), "f64", 3);
     }
     states {
@@ -4733,12 +4808,29 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
     }
     states {
         Entry: {
+            let is_lit_r = right_e.kind == 1; // INT_LIT
+            let r_ival = right_e.int_val;
+            let is_div = op == 73; // '/'
+            let is_r_zero = r_ival == 0;
+            let is_div_lit = is_div & is_lit_r;
+            let is_zero_div = is_div_lit & is_r_zero;
+            is_zero_div != 0 => EmitDivByZeroErr;
+
+            let is_lit_l = left_e.kind == 1;
+            let l_ival = left_e.int_val;
+            let both_lit = is_lit_l & is_lit_r;
+            let is_div_both = is_div & both_lit;
+            let is_r_neg1 = r_ival == -1;
+            let is_div_neg1 = is_div_both & is_r_neg1;
+            let is_l_min32 = l_ival == -2147483648;
+            let is_l_min64 = l_ival == -9223372036854775808;
+            let is_l_min = is_l_min32 | is_l_min64;
+            let is_overflow_div = is_div_neg1 & is_l_min;
+            is_overflow_div != 0 => EmitDivOverflowErr;
+
             let lt = call get_expr_type(ctx, left_e);
             let rt = call get_expr_type(ctx, right_e);
-            let ltl = call strlen(lt);
-            let rtl = call strlen(rt);
-
-            let is_ptr_add = call is_pointer_add(lt, rt, rtl, op);
+            let is_ptr_add = call is_pointer_add(lt, op);
             is_ptr_add != 0 => EvalArgs [ is_case <= 1, left_type_p <= lt, right_type_p <= rt ];
 
             let is_ptr_diff = call is_pointer_diff(lt, rt, op);
@@ -4750,29 +4842,17 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let is_ptr_cmp = call is_pointer_cmp(lt, rt, op);
             is_ptr_cmp != 0 => EvalArgs [ is_case <= 3 ];
 
-            // FAIL-FAST Guard: Any other pointer binary operation is ILLEGAL (CWE-843 Prevention)
-            let is_lp = call is_ptr_type(lt, ltl);
-            let is_rp = call is_ptr_type(rt, rtl);
-            let has_ptr = is_lp | is_rp;
-            has_ptr != 0 => EmitInvalidPtrOp [ left_type_p <= lt, right_type_p <= rt ];
-
-            // FAIL-FAST Guard: Struct value binary operations are ILLEGAL
-            let is_ls = call find_struct_def(ctx.prog, lt, ltl);
-            is_ls != null => EmitInvalidStructOp [ left_type_p <= lt, right_type_p <= rt ];
-            let is_rs = call find_struct_def(ctx.prog, rt, rtl);
-            is_rs != null => EmitInvalidStructOp [ left_type_p <= lt, right_type_p <= rt ];
-
             let is_i1_l = call is_i1_type(lt);
             let is_i1_r = call is_i1_type(rt);
             let is_i1_op = is_i1_l | is_i1_r;
             is_i1_op != 0 => EvalArgs [ is_case <= 4, op_mode_reg <= 1, left_type_p <= lt, right_type_p <= rt ];
 
-            let is_i64_l = call is_type_64(lt, ltl);
-            let is_i64_r = call is_type_64(rt, rtl);
+            let is_i64_l = call is_type_64(lt);
+            let is_i64_r = call is_type_64(rt);
             let is_i64_op = is_i64_l | is_i64_r;
 
-            let is_u_l = call is_unsigned_type(lt, ltl);
-            let is_u_r = call is_unsigned_type(rt, rtl);
+            let is_u_l = call is_unsigned_type(lt);
+            let is_u_r = call is_unsigned_type(rt);
             let is_u_op = is_u_l | is_u_r;
 
             let is_both = is_i64_op & is_u_op;
@@ -4780,6 +4860,32 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             is_i64_op != 0 => EvalArgs [ is_case <= 4, op_mode_reg <= 2, left_type_p <= lt, right_type_p <= rt ];
             is_u_op != 0   => EvalArgs [ is_case <= 4, op_mode_reg <= 4, left_type_p <= lt, right_type_p <= rt ];
             _              => EvalArgs [ is_case <= 4, op_mode_reg <= 0, left_type_p <= lt, right_type_p <= rt ];
+        }
+        EmitDivByZeroErr: {
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            let _ = call diag_str("[StateSSA Compile Error]: Division by zero detected in constant expression (CWE-369 Prevention).");
+            let _ = call diag_nl();
+            let _ = call diag_str("Division by constant 0 is undefined behavior.");
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            ctx.error_code <- -62;
+            _ => return "null";
+        }
+        EmitDivOverflowErr: {
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            let _ = call diag_str("[StateSSA Compile Error]: Arithmetic overflow in constant division (INT_MIN / -1) (CWE-190 Prevention).");
+            let _ = call diag_nl();
+            let _ = call diag_str("Result cannot be represented in signed integer and causes hardware SIGFPE.");
+            let _ = call diag_nl();
+            let _ = call diag_str("================================================================================");
+            let _ = call diag_nl();
+            ctx.error_code <- -63;
+            _ => return "null";
         }
         EvalArgs: {
             let lv = call emit_expr(ctx, left_e);
@@ -4795,26 +4901,12 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             _ => return res;
         }
         EmitPtrSub: {
-            let is_min = call str_eq(right_val, call strlen(right_val), "-9223372036854775808", 20);
-            is_min != 0 => EmitPtrSubMinOverflow;
-
             let neg_var = call fresh_tmp_str(ctx, "neg_idx", 7);
             let _ = call emit_str(ctx, "  ", 2);
             let _ = call emit_str(ctx, neg_var, call strlen(neg_var));
-            let is_64 = call is_type_64(right_type_p, call strlen(right_type_p));
+            let is_64 = call is_type_64(right_type_p);
             is_64 != 0 => EmitPtrSubOp64 [ plv_r <= neg_var ];
             _          => EmitPtrSubOp32 [ plv_r <= neg_var ];
-        }
-        EmitPtrSubMinOverflow: {
-            let _ = call diag_nl();
-            let _ = call diag_str("================================================================================");
-            let _ = call diag_nl();
-            let _ = call diag_str("[StateSSA Compile Error]: Pointer subtraction by INT64_MIN causes arithmetic overflow.");
-            let _ = call diag_nl();
-            let _ = call diag_str("================================================================================");
-            let _ = call diag_nl();
-            ctx.error_code <- -52;
-            _ => return "null";
         }
         EmitPtrSubOp64: {
             let _ = call emit_str(ctx, " = sub i64 0, ", 14);
@@ -4838,44 +4930,6 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let res = call emit_ptr_cmp(ctx, left_val, right_val, op);
             _ => return res;
         }
-        EmitInvalidPtrOp: {
-            let _ = call diag_nl();
-            let _ = call diag_str("================================================================================");
-            let _ = call diag_nl();
-            let _ = call diag_str("[StateSSA Compile Error]: Invalid pointer binary operation (CWE-843 Prevention).");
-            let _ = call diag_nl();
-            let _ = call diag_str("Left operand type:  ");
-            let _ = call diag_write(left_type_p, call strlen(left_type_p));
-            let _ = call diag_nl();
-            let _ = call diag_str("Right operand type: ");
-            let _ = call diag_write(right_type_p, call strlen(right_type_p));
-            let _ = call diag_nl();
-            let _ = call diag_str("Pointer operations only allow: ptr + int, ptr - int, ptr - ptr, ptr ==/!= ptr.");
-            let _ = call diag_nl();
-            let _ = call diag_str("================================================================================");
-            let _ = call diag_nl();
-            ctx.error_code <- -51;
-            _ => return "null";
-        }
-        EmitInvalidStructOp: {
-            let _ = call diag_nl();
-            let _ = call diag_str("================================================================================");
-            let _ = call diag_nl();
-            let _ = call diag_str("[StateSSA Compile Error]: Invalid binary operation on struct value type.");
-            let _ = call diag_nl();
-            let _ = call diag_str("Left operand type:  ");
-            let _ = call diag_write(left_type_p, call strlen(left_type_p));
-            let _ = call diag_nl();
-            let _ = call diag_str("Right operand type: ");
-            let _ = call diag_write(right_type_p, call strlen(right_type_p));
-            let _ = call diag_nl();
-            let _ = call diag_str("Struct values do not support primitive binary operations.");
-            let _ = call diag_nl();
-            let _ = call diag_str("================================================================================");
-            let _ = call diag_nl();
-            ctx.error_code <- -53;
-            _ => return "null";
-        }
         EmitNormal: {
             let is_fl = call is_type_float_or_vec(left_type_p, call strlen(left_type_p));
             let is_fr = call is_type_float_or_vec(right_type_p, call strlen(right_type_p));
@@ -4887,8 +4941,8 @@ machine emit_bin_expr(ctx: *CodegenCtx, expr: *ExprNode) -> *u8 {
             let plv = call promote_bin_operand(ctx, left_e, left_type_p, left_val, op_mode_reg);
             let prv = call promote_bin_operand(ctx, right_e, right_type_p, right_val, op_mode_reg);
 
-            let is_ql = call is_type_q64(left_type_p, call strlen(left_type_p));
-            let is_qr = call is_type_q64(right_type_p, call strlen(right_type_p));
+            let is_ql = call is_type_q64(left_type_p);
+            let is_qr = call is_type_q64(right_type_p);
             let is_q = is_ql | is_qr;
             is_q != 0 => CheckQ64Op [ plv_r <= plv, prv_r <= prv ];
             _         => EmitStandard [ plv_r <= plv, prv_r <= prv ];
@@ -5586,7 +5640,7 @@ machine eval_call_args(ctx: *CodegenCtx, fn_p: *u8, fn_l: u32, first_arg: *ExprN
 
             let ok = call validate_type(ctx, 1, fn_p, fn_l, i + 1, raw_p, raw_l, ct, ctl, cur);
 
-            let is_q = call is_type_q64(ct, ctl);
+            let is_q = call is_type_q64(ct);
             is_q != 0 => CheckBridgeArg [ cur_val <= val, cur_t <= ct ];
 
             let is_exp_i32 = call str_eq(exp_p, exp_l, "i32", 3);
@@ -5620,7 +5674,7 @@ machine eval_call_args(ctx: *CodegenCtx, fn_p: *u8, fn_l: u32, first_arg: *ExprN
             _ => SaveArg [ cur_val <= bv ];
         }
         CheckExtI32: {
-            let is_sm = call is_type_small(cur_t, call strlen(cur_t));
+            let is_sm = call is_type_small(cur_t);
             is_sm != 0 => ExtArgI32;
             _          => SaveArg;
         }
@@ -5632,7 +5686,7 @@ machine eval_call_args(ctx: *CodegenCtx, fn_p: *u8, fn_l: u32, first_arg: *ExprN
             cur_t == null => ExtArg64;
             let c0 = *cur_t;
             c0 == 42    => SaveArg;
-            let is_i64 = call is_type_64(cur_t, call strlen(cur_t));
+            let is_i64 = call is_type_64(cur_t);
             is_i64 != 0 => SaveArg;
             _           => ExtArg64;
         }
@@ -7317,6 +7371,121 @@ machine emit_extern_params(ctx: *CodegenCtx, ext: *ExternFn) -> u32 {
     }
 }
 
+machine calc_unescaped_str_len(val_ptr: *u8, val_len: u32) -> u32 {
+    flow {
+        reg pos: u32 = 0;
+        reg len: u32 = 0;
+        wire has_more = pos < val_len;
+        wire p = val_ptr + pos;
+        wire c = *p;
+    }
+    states {
+        Entry: {
+            val_ptr == null => RetZero;
+            val_len == 0    => RetZero;
+            _ => Loop [ pos <= 0, len <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => Finish;
+            c == 92       => CheckEscape; // '\'
+            _             => StepNormal;
+        }
+        CheckEscape: {
+            let next_pos = pos + 1;
+            next_pos >= val_len => StepNormal;
+            _ => Loop [ pos <= pos + 2, len <= len + 1 ];
+        }
+        StepNormal: {
+            _ => Loop [ pos <= pos + 1, len <= len + 1 ];
+        }
+        Finish: {
+            _ => return len;
+        }
+        RetZero: {
+            _ => return 0;
+        }
+    }
+}
+
+machine emit_llvm_escaped_string(ctx: *CodegenCtx, val_ptr: *u8, val_len: u32) -> u32 {
+    flow {
+        reg pos: u32 = 0;
+        wire has_more = pos < val_len;
+        wire p = val_ptr + pos;
+        wire c = *p;
+    }
+    states {
+        Entry: {
+            val_ptr == null => Exit;
+            val_len == 0    => Exit;
+            _ => Loop [ pos <= 0 ];
+        }
+        Loop: {
+            has_more == 0 => Exit;
+            c == 92       => CheckEsc;
+            c == 34       => EmitHex22;
+            _             => EmitNormal;
+        }
+        CheckEsc: {
+            let next_pos = pos + 1;
+            next_pos >= val_len => EmitNormal;
+            let np = val_ptr + next_pos;
+            let nc = *np;
+
+            nc == 34  => EmitEscQuote;     // \"
+            nc == 92  => EmitEscBackslash; // \\
+            nc == 110 => EmitEscNl;        // \n
+            nc == 114 => EmitEscCr;        // \r
+            nc == 116 => EmitEscTab;       // \t
+            nc == 48  => EmitEscZero;      // \0
+            _         => EmitEscOther;
+        }
+        EmitEscQuote: {
+            let _ = call emit_str(ctx, "\\22", 3);
+            _ => Loop [ pos <= pos + 2 ];
+        }
+        EmitEscBackslash: {
+            let _ = call emit_str(ctx, "\\5C", 3);
+            _ => Loop [ pos <= pos + 2 ];
+        }
+        EmitEscNl: {
+            let _ = call emit_str(ctx, "\\0A", 3);
+            _ => Loop [ pos <= pos + 2 ];
+        }
+        EmitEscCr: {
+            let _ = call emit_str(ctx, "\\0D", 3);
+            _ => Loop [ pos <= pos + 2 ];
+        }
+        EmitEscTab: {
+            let _ = call emit_str(ctx, "\\09", 3);
+            _ => Loop [ pos <= pos + 2 ];
+        }
+        EmitEscZero: {
+            let _ = call emit_str(ctx, "\\00", 3);
+            _ => Loop [ pos <= pos + 2 ];
+        }
+        EmitEscOther: {
+            let _ = call emit_char(ctx, 92);
+            let next_p = pos + 1;
+            let np = val_ptr + next_p;
+            let nc = *np;
+            let _ = call emit_char(ctx, cast(u32) nc);
+            _ => Loop [ pos <= pos + 2 ];
+        }
+        EmitHex22: {
+            let _ = call emit_str(ctx, "\\22", 3);
+            _ => Loop [ pos <= pos + 1 ];
+        }
+        EmitNormal: {
+            let _ = call emit_char(ctx, cast(u32) c);
+            _ => Loop [ pos <= pos + 1 ];
+        }
+        Exit: {
+            _ => return 0;
+        }
+    }
+}
+
 machine collect_string_const(ctx: *CodegenCtx, val_ptr: *u8, val_len: u32) -> u32 {
     flow {
         wire cnt = ctx.string_cnt;
@@ -7330,7 +7499,8 @@ machine collect_string_const(ctx: *CodegenCtx, val_ptr: *u8, val_len: u32) -> u3
             entry.sym_id   <- res_id;
             entry.val_ptr  <- val_ptr;
             entry.val_len  <- val_len;
-            entry.byte_len <- val_len + 1; // null終端含む
+            let real_len   = call calc_unescaped_str_len(val_ptr, val_len);
+            entry.byte_len <- real_len + 1; // null終端含む
             ctx.string_cnt <- cnt + 1;
             _ => return res_id;
         }
@@ -7361,7 +7531,7 @@ machine emit_all_strings(ctx: *CodegenCtx) -> u32 {
             let _ = call emit_u32(ctx, entry.byte_len);
             let _ = call emit_str(ctx, " x i8] c", 8);
             let _ = call emit_char(ctx, 34); // '"'
-            let _ = call emit_str(ctx, entry.val_ptr, entry.val_len);
+            let _ = call emit_llvm_escaped_string(ctx, entry.val_ptr, entry.val_len);
             let _ = call emit_char(ctx, 92); // '\\'
             let _ = call emit_char(ctx, 48); // '0'
             let _ = call emit_char(ctx, 48); // '0'
