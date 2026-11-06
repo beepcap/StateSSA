@@ -468,13 +468,13 @@ StateSSA がプログラマに `cast(TargetType)` の明記を強制するのは
 1. **ゼロ拡張（`zext`）と符号拡張（`sext`）の自覚**:
    符号なし整数を拡張するのか、符号付き整数を拡張するのかによって、上位ビットが 0 で埋められるのか符号ビットで埋められるのかが異なる。キャストを明記することにより、CPU 命令レベルの振る舞いがコード上で明確化される。
 2. **Newtype（名目的型）による物理単位の保全**:
-   `type UserId = u64;` や `type PacketSize = u32;` のように定義された Newtype は、基底型と同じビット幅であっても互換性を持たない。異なる単位同士を誤って加算・代入するバグは、コンパイル時に即座に拒絶（`TypeError`）される。
+   `type UserId = i64;` や `type PacketSize = i32;` のように定義された Newtype は、基底型と同じビット幅であっても互換性を持たない。異なる単位同士を誤って加算・代入するバグは、コンパイル時に即座に拒絶（`TypeError`）される。
 
 ```ssa
-type UserId = u64;
-type PacketSize = u32;
+type UserId = i64;
+type PacketSize = i32;
 
-machine process_user(id: UserId, size: PacketSize) -> u64 {
+machine process_user(id: UserId, size: PacketSize) -> i64 {
     flow {}
     states {
         Entry: {
@@ -482,8 +482,8 @@ machine process_user(id: UserId, size: PacketSize) -> u64 {
             // let invalid = id + size;  <-- TypeError
 
             // 正しい記述: 明示的に基底型へアンラップ（キャスト）して演算
-            let raw_id = cast(u64) id;
-            let raw_size = cast(u64) size;
+            let raw_id = cast(i64) id;
+            let raw_size = cast(i64) size;
             let total = raw_id + raw_size;
             _ => return total;
         }
