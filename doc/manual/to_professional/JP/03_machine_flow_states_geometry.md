@@ -1,567 +1,578 @@
-# 第3章：プログラムの骨格 —— machine, flow, states の幾何学
+# 第3章：プログラムの骨格 —— machine, flow, states の幾何学（SWAR Fast-Path による FSM 最適化）
 
-## 1. 抽象構文木（AST）思考から、有向グラフ幾何学へのパラダイムシフト
+---
 
-### 1.1 構文木の入れ子構造と認知限界：暗黙の経路爆発
-C/C++、Rust、Go などの構造化プログラミング言語において、処理ロジックの構築は構文要素の階層的ネスト（入れ子構造）を基礎として行われる。順次実行されるブロックの内部に `while` や `for` による反復が配置され、その内部に `if-else` や `switch-case`（あるいはパターンマッチ）による条件分岐が多重に重なり、さらに必要に応じてブロックを脱出するための `break`、`continue`、`return` や、例外送出構文が挿入される。
+## 1. 課題の工学的所在 (Problem Context & Motivation)
 
-この構造化アプローチは、プログラムを局所的なブロック単位で分割・隠蔽できるという点で、ソフトウェア開発の初期生産性を飛躍的に高めた。しかし、処理対象が通信プロトコル、パケットパーサー、ステートマシン、デバイスドライバのように離散的な状態遷移を伴うストリーム処理へと移行したとき、この構文木の入れ子構造はプログラマの認知に対して深刻な構造的負荷を課し始める。
+### 1.1 第2章 1 バイト FSM の到達点とスループットの物理的限界
+前章（第2章）において、我々は RFC 8259 準拠の JSON トークナイザーを StateSSA のマイクロモジュールとして構築した。その構造は、`WaitToken`、`InString`、`InEscape`、`InNumber` という 4 つの離散状態ノード（Basic Block）と、状態遷移の通過時のみに更新されるレジスタ（Phi 調停）から構成される純粋な有限状態機械（FSM）である。
 
-```c
-// 構文木のネストによる暗黙の制御フローと可変状態の散在例
-while (cursor < len) {
-    char c = buf[cursor++];
-    if (in_escape) {
-        in_escape = false;
-        if (c == 'u') {
-            unicode_digits = 4;
-        } else {
-            // エスケープ処理
+このトークナイザーは、ヒープ割り当てを 1 バイトも行わないゼロアロケーション（Zero-Allocation）、スタックフレームを消費しない定数空間 $\mathcal{O}(1)$ の深さトラッキング、暗黙の型変換を排除した厳格な境界検査を達成し、C 言語の現場を長年悩ませてきたフラグ変数の散在やバッファオーバーランの脆弱性を構造的に根絶した。
+
+しかし、計算機工学における最適化の歴史が示す通り、**「安全性の獲得」と「極限の実行スループット」の間には常に冷徹な物理的トレードオフが存在する**。
+
+第2章で構築した素の 1 バイト FSM は、入力バイト列を 1 バイトずつ先頭から末尾まで逐次的に読み進める。このモデルは、区切り文字（`{`、`}`、`[`、`]`、`:`、`,`）やエスケープシーケンス（`\`）のように、1 バイト単位で文脈が激変する構文境界においては極めて効率的である。
+
+だが、現実のワークロード——たとえば Web API のペイロード、データベースのダンプ、ログテレメトリ、メッセージングキューのデータ——において、入力ストリームの過半数を占めるのは構文境界ではなく、**「文字列リテラルの内部に連続する、何の意味も持たない通常文字のバイト列」**（英数字、記号、空白）である。
+
+```json
+{"telemetry_log": "node-us-east-compute-2026-11-07-system-metric-alpha-0091823-running-state-ok"}
+```
+
+上記のような JSON において、ダブルクォートで囲まれた文字列区間（70 バイト以上）の内部には、エスケープ（`\`）も終端（`"`）も制御文字（`< 0x20`）も存在しない。
+素朴な 1 バイト FSM は、この平坦な通常文字の区間に対しても、CPU のクロックサイクルごとに以下のステップを愚直に反復する：
+
+1. メモリから 1 バイトをロード（`movzx`）
+2. 終端クォート（`"`: 0x22）との比較（`cmp`）
+3. エスケープ（`\`: 0x5C）との比較（`cmp`）
+4. 制御文字（`< 0x20`）の範囲比較（`cmp`）
+5. ポインタインクリメントとループ境界判定（`inc`, `cmp`, `jge`）
+6. 状態ノード自身への自己ループジャンプ（`jmp`）
+
+1 バイトの文字を消費するために、CPU パイプラインは 5〜8 命令を実行し、分岐予測ユニットに負荷をかけ続ける。この 1 バイト逐次走査モデルは、最新プロセッサの広帯域なメモリバス（64 バイト/キャッシュライン）や 64 ビット ALU の並列処理能力の大部分を遊休状態のまま放置することを意味する。
+
+---
+
+### 1.2 現代 C 言語パーサー（yyjson, jsmn）が提示する速度と功績
+ここで、現代のソフトウェア工学が到達した C 言語 JSON パーサーの金字塔に目を向けなければならない。我々は既存技術の功績を正当かつ客観的に直視する必要がある。
+
+特に、現代最速の C 言語 DOM パーサーとして知られる `yyjson`（ibireme 氏作）や、超軽量トークナイザー `jsmn`（zserge 氏作）は、徹底したハードウェア特性の掌握によって驚異的なスループットを叩き出している。
+
+```text
+[yyjson の高速化アプローチ]
+- 単一文字の走査ループを排除
+- 64 ビット ALU レジスタに 8 バイト（または SIMD で 16〜32 バイト）を一括ロード
+- ビットマスク演算（SWAR: SIMD Within A Register）により、クォート・エスケープ・制御文字を一括検出
+- 特殊文字が存在しない区間は、数サイクルで 8〜16 バイトをスキップ
+```
+
+`yyjson` は、通常文字の連続区間において 1.4〜1.7 GB/s という、メモリバスの限界に迫るスループットを達成している。この卓越したエンジニアリングは、単に「C 言語が速い」からではなく、**「CPU のワード長（64 ビット）をフルに活用し、状態遷移のオーバーヘッドをビット並列演算へと変換した」** という高度な構造的最適化の賜物である。
+
+---
+
+### 1.3 素朴な FSM の敗北とプロファイリングによるボトルネック特定
+本プロジェクトのベンチマークスイート（[`samples/11_json_benchmark/README.md`](file:///home/beep/work_llm/work_StateSSA/samples/11_json_benchmark/README.md)）における実測データは、この冷徹な現実を我々に突きつける。同一マシン、同一最適化（`clang -O3`）下で測定された初期の 1 バイト FSM の実測値は以下の通りであった：
+
+| データセット | 特徴 | 1 バイト FSM スループット | yyjson スループット |
+| :--- | :--- | :---: | :---: |
+| **Small** (1.14 KB) | 典型的な REST API レスポンス | **約 380 MB/s** | 1,430 MB/s |
+| **Medium** (63.61 KB) | EC カタログ（文字列と配列） | **約 420 MB/s** | 1,743 MB/s |
+| **Large** (975.70 KB) | 大規模テレメトリログ | **約 460 MB/s** | 647 MB/s |
+
+素の 1 バイト FSM は、安全で決定論的であるものの、スループットにおいて `yyjson` に 3 倍以上の差をつけられていた。
+
+Linux の `perf` ツールを用いたハードウェアプロファイリングを実行すると、この敗北の原因は明白であった：
+- **CPU サイクルの 72.4%** が、状態ノード `InString` の自己ループ命令群に集中していた。
+- トークンの構文解析（ブラケットのネスト管理やキー・バリューの分離）に要する時間は全体の 30% 未満に過ぎず、**実行時間の圧倒的大部分は「文字列内の通常文字を 1 バイトずつ確認しながらポインタを進める」処理に拘束されていた**。
+
+我々が直面した工学的課題は明確である：
+**「StateSSA のゼロアロケーション、静的単一代入（SSA）、形式的境界防衛という安全性の不変条件を 1 ビットも損なうことなく、文字列走査の自己ループを SWAR によって極限まで加速することは可能か？」**
+
+---
+
+### 1.4 状態空間爆発の罠：なぜブロック全体を FSM 化してはならないのか
+この課題に直面したとき、多くの設計者が陥る典型的な過誤が存在する。それは「パーサー全体を 16 バイト単位で遷移する超巨大な FSM として再設計しようとする」アプローチである。
+
+入力ブロック（16 バイト）の内部には、`{`、`"`、`:`、`[`、空白、エスケープなどのあらゆる文字の組み合わせが任意のオフセットに現れ得る。16 バイトの入力に対して取り得る入力シンボルの空間は $256^{16}$ であり、これを状態遷移表として表現しようとすれば、状態空間の指数関数的爆発（State Explosion）が発生する。
+
+状態空間を圧縮しようとすれば、巨大な遷移テーブルが L1/L2 キャッシュを圧迫し、キャッシュミスによるペナルティがビット並列処理の利点を完全に相殺してしまう。さらに、エスケープシーケンスや深さ制限の安全検査が複雑化し、形式的検証の容易性が失われる。
+
+したがって、我々が採るべき幾何学的解法は、パーサー全体の破壊的再構築ではない。
+**「既存のきめ細かな 1 バイト FSM を土台として 100% 維持したまま、ボトルネックである『通常文字の自己ループ』に対してのみ、幾何学的なバイパス（Fast-Path Edge）を最小差分（Minimal-Diff）で架橋する」**
+というトポロジー設計である。
+
+---
+
+## 2. 構造モデルの定義 (Theoretical & Architectural Model)
+
+### 2.1 自己ループに対する「幾何学的バイパス（Fast-Path Edge）」のトポロジー設計
+StateSSA における有限状態機械は、Basic Block を頂点とし、Transfer Edge を有向辺とする有向グラフ（CFG）である。
+
+第2章の素朴な文字列パーサーにおいて、文字列走査は `InString` ノード自身の「自己ループ（Self-Loop）」として表現されていた。我々はこの自己ループに対し、16 バイトを一括走査する高速頂点 **`InStringFast`** を新設し、以下の幾何学的バイパスを構築する。
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    [*] --> WaitToken
+
+    WaitToken --> InStringFast : is_quote && can_fast (16B以上余白あり)
+    WaitToken --> InString : is_quote && !can_fast (残余 < 16B)
+
+    InStringFast --> InStringFast : loop_fast (16Bスキップ: 特殊文字なし && 次も16B余裕)
+    InStringFast --> InString : no_special (端数到達: 特殊文字なし && 残余 < 16B)
+    InStringFast --> InString : has_special (特殊文字検出: 同一位置から1B精査へ)
+
+    InString --> WaitToken : b == 34 (文字列終端クォート)
+    InString --> InEscape : b == 92 (エスケープ開始)
+    InString --> ExitError : b < 32 (制御文字違反: 即死)
+    InString --> InString : normal_char (1B自己ループ)
+
+    InEscape --> InString : valid_escape (1B消費して復帰)
+    InEscape --> ExitError : invalid_escape (即死)
+```
+
+このトポロジー幾何学の特徴は以下の通りである：
+
+1. **`InStringFast` の孤立性と直交性**:
+   `InStringFast` は、ただ 1 つの目的——「特殊文字が存在しない 16 バイト区間を、一撃でスキップする」——のためだけに存在する。構文の解釈、エスケープの展開、終端の確定は一切行わない。
+2. **安全フォールバックの確定性**:
+   特殊文字（クォート、エスケープ、制御文字）が 1 バイトでも検知された場合、あるいはバッファの残余が 16 バイト未満となった場合、制御は即座に既存の安全な `InString` ノードへと合流する。
+3. **安全ロジックの完全温存**:
+   エスケープ解釈（`InEscape`）、深さオーバーフロー検査、制御文字の即死拒絶など、第2章で構築された厳格なセキュリティ不変条件には **1 行の変更も加えない**。
+
+---
+
+### 2.2 Minimal-Diff（最小差分）設計原則
+StateSSA の機能マージプロトコルにおいて、既存の安定したステートマシンを改修する際の鉄則は「Minimal-Diff（最小差分）」である。
+
+この最適化において変更・追加された要素は、設計全体の中で厳密に以下の 2 点のみに限定される：
+- **追加された状態ノード**: `InStringFast`（1 ノードのみ）
+- **追加された遷移ガード**: `WaitToken` からの分岐条件（`can_fast` の判定）
+
+既存の `InString`、`InEscape`、`InNumber`、`CheckFinalDepth` などの状態ノードの実装ロジック、エラーコード体系、戻り値の契約は 100% そのまま維持される。この局所性により、最適化に起因するデグレや未知の脆弱性の混入が構造的に遮断される。
+
+---
+
+### 2.3 決定論的境界防衛（`safe_len = len - 16`）と端数フォールバック
+SIMD や SWAR 最適化において、最も致命的な脆弱性をもたらす原因は **「バッファ末尾を超えたオーバーリード（Buffer Over-read）」** である。
+
+C 言語の多くの高速パーサーは、この問題を回避するために「呼び出し元はバッファの末尾に最低 16 バイト（あるいは 32 バイト）のパディング領域を確保せよ」という契約（Precondition）を課す。しかし、これはライブラリが負うべき境界防御の責務をユーザーに転嫁する悪しき設計であり、未初期化メモリの読み出しや、メモリ保護ページ（Guard Page）を跨いだ瞬間のクラッシュ（SIGSEGV）の原因となる。
+
+StateSSA は、呼び出し元にいかなるパディングも要求しない。完全な **Zero-Padding Boundary Defense** を数式レベルで確立する。
+
+#### 安全境界の数式的不変条件
+マシンの入口において、16 バイトロードが安全に実行可能な最大境界 `safe_len` を以下の通り定義する：
+
+$$\text{safe\_len} = \text{len} - 16$$
+
+実行中、カーソル位置 `cursor` に対する不変条件は常に以下を満たす：
+
+$$\text{can\_fast} \iff \text{cursor} < \text{safe\_len}$$
+
+- **証明の帰結**:
+  `cursor < safe_len` が真であるとき、`cursor + 16 <= len` が恒等的に成立する。したがって、`buf + cursor` から 16 バイト（64 ビット整数 2 語）を一括ロードしても、アクセスされるメモリ番地は必ずバッファの正当な領域 $[0, \text{len})$ の内部に収まる。バッファ終端を超えた 1 バイトのアクセスも物理的に発生し得ない。
+- **端数（Remainder < 16B）の決定論的処理**:
+  `cursor >= safe_len` となった瞬間、`can_fast` は偽となり、バイパスエッジは遮断される。未走査の残余バイト列（0〜15 バイト）は、自動的に既存の 1 バイト FSM（`InString`）へフォールバックして 1 バイトずつ安全に処理される。端数処理のための複雑なループアンローリングやマスク処理を記述する必要は一切ない。
+
+---
+
+## 3. 実装の具象化 (Concrete StateSSA Implementation)
+
+### 3.1 `json_tokenizer_fast.ssa` の完全なコード提示
+以下に示すのは、[`samples/architecture_guide/03_fsm_geometry_and_fast_path/json_tokenizer_fast.ssa`](file:///home/beep/work_llm/work_StateSSA/samples/architecture_guide/03_fsm_geometry_and_fast_path/json_tokenizer_fast.ssa) の実動ソースコードである。読者はこのコードをそのままコンパイルし、実機で動作を検証できる。
+
+```ssa
+// ============================================================================
+// StateSSA Architecture Guide - Chapter 3 Sample
+// File: json_tokenizer_fast.ssa
+//
+// RFC 8259 Streaming JSON Tokenizer with 16-byte SWAR Fast-Path
+// Minimal-Diff Optimization: Zero-Copy, Non-Destructive, Guard-Page Verified
+// ============================================================================
+
+machine tokenize_json(buf: *u8, len: i32) -> i32 {
+    flow {
+        reg cursor: i32 = 0;
+        reg tokens: i32 = 0;
+        reg depth: i32 = 0;
+        reg err: i32 = 0;
+
+        wire safe_len = len - 16;
+    }
+
+    states {
+        Entry: {
+            len < 0 => ExitError [ err <= -1 ];
+            buf == null => ExitError [ err <= -1 ];
+            _ => WaitToken [ cursor <= 0, tokens <= 0, depth <= 0, err <= 0 ];
         }
-    } else if (c == '\\') {
-        in_escape = true;
-    } else if (c == '"') {
-        if (unicode_digits > 0) {
-            // 不正なエスケープシーケンス途中の終端
-            return ERROR_MALFORMED;
+
+        WaitToken: {
+            cursor >= len => CheckFinalDepth;
+            let b = cast(i32) *(buf + cursor);
+
+            // 1. Whitespace Skip (Space, Tab, LF, CR)
+            b == 32 => WaitToken [ cursor <= cursor + 1 ];
+            b == 9  => WaitToken [ cursor <= cursor + 1 ];
+            b == 10 => WaitToken [ cursor <= cursor + 1 ];
+            b == 13 => WaitToken [ cursor <= cursor + 1 ];
+
+            // 2. Open Brackets ('{' = 123, '[' = 91)
+            let next_depth = depth + 1;
+            let is_open1 = b == 123;
+            let is_open2 = b == 91;
+            let is_open = is_open1 || is_open2;
+            let depth_exceeded = is_open && (next_depth > 64);
+            depth_exceeded => ExitError [ err <= -3 ];
+            is_open => WaitToken [ cursor <= cursor + 1, tokens <= tokens + 1, depth <= next_depth ];
+
+            // 3. Close Brackets ('}' = 125, ']' = 93)
+            let is_close1 = b == 125;
+            let is_close2 = b == 93;
+            let is_close = is_close1 || is_close2;
+            let underflow = is_close && (depth <= 0);
+            underflow => ExitError [ err <= -5 ];
+            is_close => WaitToken [ cursor <= cursor + 1, tokens <= tokens + 1, depth <= depth - 1 ];
+
+            // 4. Punctuation Delimiters (':' = 58, ',' = 44)
+            b == 58 => WaitToken [ cursor <= cursor + 1, tokens <= tokens + 1 ];
+            b == 44 => WaitToken [ cursor <= cursor + 1, tokens <= tokens + 1 ];
+
+            // 5. String Literal Start ('"' = 34): Fast-Path 分岐ゲート
+            let next_cursor = cursor + 1;
+            let can_fast = next_cursor < safe_len;
+            let is_quote = b == 34;
+            let start_fast = is_quote && can_fast;
+            start_fast => InStringFast [ cursor <= next_cursor ];
+            is_quote   => InString     [ cursor <= next_cursor ];
+
+            // 6. Value Literal Start: Number or Keyword
+            b == 45 => InNumber [ cursor <= cursor + 1 ];
+            let is_ge0 = b >= 48;
+            let is_le9 = b <= 57;
+            let is_digit = is_ge0 && is_le9;
+            is_digit => InNumber [ cursor <= cursor + 1 ];
+            b == 116 => InNumber [ cursor <= cursor + 1 ];
+            b == 102 => InNumber [ cursor <= cursor + 1 ];
+            b == 110 => InNumber [ cursor <= cursor + 1 ];
+
+            _ => ExitError [ err <= -1 ];
         }
-        break; // 文字列終端
-    } else {
-        if (unicode_digits > 0) {
-            unicode_digits--;
-            // 16進数判定と値の累積
+
+        InStringFast: {
+            let p0 = buf + cursor;
+            let p1 = p0 + 8;
+            let p64_0 = cast(*u64) p0;
+            let p64_1 = cast(*u64) p1;
+            let v0 = *p64_0;
+            let v1 = *p64_1;
+
+            // SWAR check v0 (Control < 32, Quote == 34, Slash == 92)
+            let sub_ctrl0 = v0 - 0x2020202020202020;
+            let not_v0 = v0 ^ 0xFFFFFFFFFFFFFFFF;
+            let ctrl0 = sub_ctrl0 & not_v0;
+
+            let q0 = v0 ^ 0x2222222222222222;
+            let sub_q0 = q0 - 0x0101010101010101;
+            let not_q0 = q0 ^ 0xFFFFFFFFFFFFFFFF;
+            let quote0 = sub_q0 & not_q0;
+
+            let s0 = v0 ^ 0x5C5C5C5C5C5C5C5C;
+            let sub_s0 = s0 - 0x0101010101010101;
+            let not_s0 = s0 ^ 0xFFFFFFFFFFFFFFFF;
+            let slash0 = sub_s0 & not_s0;
+
+            let spec0 = ctrl0 | quote0;
+            let spec0_all = spec0 | slash0;
+
+            // SWAR check v1
+            let sub_ctrl1 = v1 - 0x2020202020202020;
+            let not_v1 = v1 ^ 0xFFFFFFFFFFFFFFFF;
+            let ctrl1 = sub_ctrl1 & not_v1;
+
+            let q1 = v1 ^ 0x2222222222222222;
+            let sub_q1 = q1 - 0x0101010101010101;
+            let not_q1 = q1 ^ 0xFFFFFFFFFFFFFFFF;
+            let quote1 = sub_q1 & not_q1;
+
+            let s1 = v1 ^ 0x5C5C5C5C5C5C5C5C;
+            let sub_s1 = s1 - 0x0101010101010101;
+            let not_s1 = s1 ^ 0xFFFFFFFFFFFFFFFF;
+            let slash1 = sub_s1 & not_s1;
+
+            let spec1 = ctrl1 | quote1;
+            let spec1_all = spec1 | slash1;
+
+            let spec_both = spec0_all | spec1_all;
+            let spec_masked = spec_both & 0x8080808080808080;
+            let has_special = spec_masked != 0;
+
+            let skip_cursor = cursor + 16;
+            let next_can_fast = skip_cursor < safe_len;
+            let loop_fast = next_can_fast && (has_special == 0);
+            let no_special = has_special == 0;
+
+            loop_fast  => InStringFast [ cursor <= skip_cursor ];
+            no_special => InString     [ cursor <= skip_cursor ];
+            _          => InString     [ cursor <= cursor ];
         }
+
+        InString: {
+            cursor >= len => ExitError [ err <= -2 ];
+            let b = cast(i32) *(buf + cursor);
+
+            b == 34 => WaitToken [ cursor <= cursor + 1, tokens <= tokens + 1 ];
+            b == 92 => InEscape  [ cursor <= cursor + 1 ];
+            b < 32  => ExitError [ err <= -1 ];
+            _       => InString  [ cursor <= cursor + 1 ];
+        }
+
+        InEscape: {
+            cursor >= len => ExitError [ err <= -2 ];
+            let b = cast(i32) *(buf + cursor);
+
+            b == 34  => InString [ cursor <= cursor + 1 ];
+            b == 92  => InString [ cursor <= cursor + 1 ];
+            b == 47  => InString [ cursor <= cursor + 1 ];
+            b == 98  => InString [ cursor <= cursor + 1 ];
+            b == 102 => InString [ cursor <= cursor + 1 ];
+            b == 110 => InString [ cursor <= cursor + 1 ];
+            b == 114 => InString [ cursor <= cursor + 1 ];
+            b == 116 => InString [ cursor <= cursor + 1 ];
+            b == 117 => InString [ cursor <= cursor + 1 ];
+
+            _ => ExitError [ err <= -4 ];
+        }
+
+        InNumber: {
+            cursor >= len => CheckFinalDepth [ tokens <= tokens + 1 ];
+            let b = cast(i32) *(buf + cursor);
+
+            b == 32  => WaitToken [ tokens <= tokens + 1 ];
+            b == 9   => WaitToken [ tokens <= tokens + 1 ];
+            b == 10  => WaitToken [ tokens <= tokens + 1 ];
+            b == 13  => WaitToken [ tokens <= tokens + 1 ];
+            b == 44  => WaitToken [ tokens <= tokens + 1 ];
+            b == 58  => WaitToken [ tokens <= tokens + 1 ];
+            b == 125 => WaitToken [ tokens <= tokens + 1 ];
+            b == 93  => WaitToken [ tokens <= tokens + 1 ];
+
+            let is_ge0 = b >= 48;
+            let is_le9 = b <= 57;
+            let is_digit = is_ge0 && is_le9;
+            is_digit => InNumber [ cursor <= cursor + 1 ];
+
+            b == 46  => InNumber [ cursor <= cursor + 1 ];
+            b == 43  => InNumber [ cursor <= cursor + 1 ];
+            b == 45  => InNumber [ cursor <= cursor + 1 ];
+            b == 101 => InNumber [ cursor <= cursor + 1 ];
+            b == 69  => InNumber [ cursor <= cursor + 1 ];
+
+            let is_gea = b >= 97;
+            let is_lez = b <= 122;
+            let is_alpha = is_gea && is_lez;
+            is_alpha => InNumber [ cursor <= cursor + 1 ];
+
+            _ => ExitError [ err <= -1 ];
+        }
+
+        CheckFinalDepth: {
+            depth == 0 => ExitSuccess;
+            _ => ExitError [ err <= -6 ];
+        }
+
+        ExitSuccess: { _ => return tokens; }
+        ExitError:   { _ => return err; }
     }
 }
 ```
 
-上記のコードにおいて、字面上は単純な `while` ループとその内部の分岐に見えるが、プログラマが正しく振る舞いを把握するために追跡すべき状態変数は `in_escape`、`unicode_digits`、`cursor`、`len` と多岐にわたる。
-
-深さ $k$ のネスト構造の中に $m$ 個の可変変数（ブールフラグやカウンタ）が存在する場合、ある実行ステップにおいてシステムが取り得る潜在的な状態空間は $\mathcal{O}(2^m)$ のオーダーで増大する。ソースコードの字面上の行数（テキスト行）に対して、実行可能な制御パスの組み合わせ（サイクロマティック複雑度）が指数関数的に爆発するため、以下の工学的問題が不可避に発生する：
-
-1. **不変量（Invariant）の追跡困難**:
-   変数の値が複数のネストした分岐の内部で破壊的に更新されるため、「ある行が実行されている瞬間に、他のフラグ変数がどのような整合性を保っているべきか」を静的に証明することが人間のワーキングメモリの限界を超える。
-2. **到達不能パスと初期化漏れの温床**:
-   外側の条件式と内側の条件式の組み合わせにより、字面上は書かれているが実際には到達不能なパスが生じたり、特定の分岐ルートを通過した際に変数のリセットが漏れるといった不具合が温床化する。
-3. **字面と実行パスの乖離**:
-   `break` や `continue`、早期 `return` は、構文木の階層構造を非局所的にジャンプする制御命令である。インデントによって表現される視覚的な親子関係と、実行時に制御が遷移する実際の有向グラフ（CFG）との間にトポロジー的な乖離が生じる。
-
-### 1.2 計算機の実行モデルへの直結：Basic Block と Directed Edge
-プログラマが高水準言語において構文木（AST: Abstract Syntax Tree）の階層構造を記述している一方で、それを実行する CPU および最適化コンパイラの視座において、構文木の入れ子構造は一切存在しない。
-
-現代のスーパースカラー・アウトオブオーダー型プロセッサが命令をフェッチし、デコードし、パイプラインへ投入する単位は、常に以下の 2 つの構成要素からなる **制御フローグラフ（CFG: Control Flow Graph）** である：
-
-1. **基本ブロック（Basic Block）**:
-   単一のエントリーポイント（入口）から開始され、末尾の分岐命令（終端命令: Terminator Instruction）に至るまで、途中に分岐や合流を一切含まない直線的な命令シーケンス。内部の命令は必ず最初から最後まで連続して実行される。
-2. **有向エッジ（Directed Edge / Transfer Edge）**:
-   Basic Block の終端から、後続の Basic Block の先頭へと制御を渡す有向遷移。条件分岐（1-bit 述語による 2 方向への分岐）または無条件ジャンプによって構成される。
-
-```text
-高水準言語 (AST):
-  while / for / if / else / break などの階層的入れ子構造
-         │
-         ▼ [コンパイラによる平坦化 (Lowering / Flattening)]
-中間表現 (LLVM IR / CFG):
-  Basic Block A ──(True Edge)──> Basic Block B
-       │                                │
-       └──(False Edge)──> Basic Block C ◄──┘ (Phi ノードによる合流調停)
-         │
-         ▼ [アセンブリ / 機械語]
-ハードウェア CPU:
-  命令キャッシュ ➔ デコード ➔ ALU パイプライン ➔ 分岐予測 / リオーダバッファ
-```
-
-LLVM や GCC などの現代的コンパイラは、フロントエンドにおいて受け取った AST を直ちに平坦化（Flattening）し、Basic Block と Branch 命令による CFG へと解体する。さらに、メモリ上の可変変数へのアクセス（`alloca`, `load`, `store`）を静的単一代入形式（SSA: Static Single Assignment）へ変換（LLVM における Mem2Reg パス）し、複数の先行ブロックからの値の合流点に明示的な $\phi$（Phi）ノードを挿入する。
-
-従来の高水準言語における最大の問題は、**「プログラマが思考するモデル（構文木のネストと可変変数）と、コンパイラおよび CPU が実行するモデル（CFG と SSA データフロー）の間に、巨大な抽象化の溝が存在すること」** にある。
-
-プログラマが構文木の中で可変変数を再代入した結果、コンパイラがそれをどのように Basic Block へ分割し、どのレジスタに割り当て、どのような Phi 合流を生成するかは、プログラマの直接の制御を離れる。その結果、レジスタ退避・復元（Spill）の発生、パイプラインのストール（バブル）、予測不能な分岐ペナルティが不可視の領域で発生する。
-
-StateSSA は、このトポロジー的乖離を根本から排除する。
-StateSSA の設計思想である **`Dataflow-StateMachine-Direct-Cognition`** においては、構文木の入れ子構造を一切導入しない。プログラマ自身が、計算機が真に実行する基本単位である **「Basic Block（State_Node）」** と **「有向遷移辺（Transfer_Edge）」**、そして **「不変な SSA データストリーム（Data_Stream / Wire）」** で直接思考し、それをそのままソースコードとして記述する。これにより、ソースコードの構造と CPU 実行パイプラインの挙動が 1 対 1 で完全に一致する。
-
 ---
 
-## 2. 3大構文要素の解剖学（machine, flow, states）
+### 3.2 構文要素の工学的意図の解説
 
-StateSSA のプログラムは、3 つの厳格な階層要素によって構成される。これらは互いに責務が直交しており、曖昧な混同を許さない。
-
-```mermaid
-graph TD
-    subgraph Machine["machine: 契約境界・入出力シグネチャ (ゼロコスト C-ABI)"]
-        subgraph Flow["flow: データパス定義 (不変 wire と Phi調停 reg)"]
-            subgraph States["states: コントロールパス (Basic Block 群と有向遷移辺)"]
-                S1["State_Node A (Basic Block)"] -->|Transfer_Edge| S2["State_Node B (Basic Block)"]
-                S2 -->|Self-Loop Edge| S2
-                S2 -->|Transfer_Edge| S3["State_Node C (Basic Block)"]
-            end
-        end
-    end
-```
-
-### 2.1 `machine`：契約境界とゼロコスト C-ABI
-`machine` は、外部のホスト環境（C/C++ プログラム、OS カーネル、他言語ランタイム）とのインターフェースを画定する契約境界である。
-
-```ssa
-machine parse_header(buf: *u8, len: i32) -> i32 {
-    flow { ... }
-    states { ... }
-}
-```
-
-`machine` の特性は以下の工学的要件によって規定される：
-
-1. **シグネチャの純粋性**:
-   `machine` の引数として宣言された型付きポインタや値（上記例における `buf: *u8`, `len: i32`）は、マシンの生存期間を通じて不変な第一級データストリームとして各状態ノードへ供給される。
-2. **ゼロコスト C-ABI 直結**:
-   `machine` のシンボルは、名前修飾（Name Mangling）を受けることなく、LLVM IR 上で標準的な C 言語関数シンボル（`define i32 @parse_header(ptr %buf, i32 %len)`）として直接出力される。
-3. **呼び出しオーバーヘッドのゼロ化**:
-   System V AMD64 ABI 等の標準呼び出し規約に基づき、引数は物理レジスタ（`%rdi`, `%rsi` 等）を介して直接渡され、戻り値は `%eax` を介して返却される。StateSSA マシンを呼び出すためのグルーコードやラッパー関数は一切不要であり、C 言語のネイティブ関数呼び出しと同一のレイテンシでリンク・実行される。
-
-### 2.2 `flow`：不変データストリーム（wire）とラッチ代入レジスタ（reg）
-`flow` ブロックは、マシン内部におけるデータパス（Data Path）の構造を定義する。ここには 2 種類の実体のみが存在する。
-
+#### `flow` における不変安全境界ワイヤー (`safe_len`)
 ```ssa
 flow {
     reg cursor: i32 = 0;
-    reg token_count: i32 = 0;
-    reg error_code: i32 = 0;
+    reg tokens: i32 = 0;
+    reg depth: i32 = 0;
+    reg err: i32 = 0;
 
-    wire safe_limit = len - 8;
-    wire is_eof = cursor >= len;
+    wire safe_len = len - 16;
 }
 ```
+- `safe_len` は `reg`（レジスタ）ではなく `wire`（不変データストリーム配線）として定義されている。
+- 入力引数 `len` から 16 を減算した値は、マシンの全生存期間を通じて不変である。これをワイヤーとして宣言することにより、状態遷移に伴うラッチ更新コスト（Phi 調停）を発生させず、コンパイル時に単一の SSA 値として全状態ノードへ供給される。
 
-#### `wire`（不変データストリーム）
-`wire` は、マシンの引数、定数、またはレジスタ値から算出される純粋な導出式である。
-- **不変性**: 一度定義された `wire` は再代入できない。
-- **データ依存関係に基づく解決**: `wire` は実行順序を持たない。依存元の値が確定した時点で即時評価される純粋なデータパス配線として機能する。
-- **最適化親和性**: LLVM IR 生成時、`wire` は一時的な SSA 値（`%wire = add i32 ...`）としてインライン展開されるか、コンパイル時定数畳み込み（Constant Folding）の対象となる。
-
-#### `reg`（ラッチ代入レジスタ）
-`reg` は、状態ノードの境界を越えて値を引き継ぐための論理レジスタである。
-ここで決定的に重要な工学的事実は、**`reg` はメモリ上の可変変数（スタック上の領域へのポインタと再代入）ではない** という点である。
-- **Phi ノードとしての実体**: `reg` は、後述する状態ノード（Basic Block）の入口に配置される **LLVM IR の `phi` ノード（マルチプレクサ）** を構文上で宣言したものである。
-- **状態ノード内での再代入禁止**: 状態ノードの内部において `reg = expr;` のような破壊的代入を行うことは構文エラー（Syntax Error）としてコンパイラに拒絶される。
-- **遷移時ラッチ規律**: `reg` の値が更新されるのは、ある状態ノードから別の状態ノードへ遷移する **「有向辺（Transfer Edge）」の通過瞬間のみ** である。
-
-### 2.3 `states`：アトミック変換頂点（State_Node）と遷移有向辺（Transfer_Edge）
-`states` ブロックは、コントロールパス（Control Path）を形成する平坦化された状態ノード群の集合体である。
-
+#### `WaitToken` の Fast-Path 分岐ゲート
 ```ssa
-states {
-    Entry: {
-        len <= 0 => Exit [ error_code <= -1 ];
-        _        => Process [ cursor <= 0, token_count <= 0 ];
-    }
-    Process: {
-        is_eof != 0 => Exit [ error_code <= 0 ];
-        let b = *(buf + cursor);
-        b == 0      => Exit [ error_code <= -2 ];
-        _           => Process [ cursor <= cursor + 1, token_count <= token_count + 1 ];
-    }
-    Exit: {
-        _ => return error_code;
-    }
-}
+let next_cursor = cursor + 1;
+let can_fast = next_cursor < safe_len;
+let is_quote = b == 34;
+let start_fast = is_quote && can_fast;
+start_fast => InStringFast [ cursor <= next_cursor ];
+is_quote   => InString     [ cursor <= next_cursor ];
+```
+- 文字列開始のクォート（`"`）に遭遇した瞬間、直ちに後続 16 バイトの余裕（`can_fast`）が評価される。
+- 16 バイト以上の余裕があれば `InStringFast` へ遷移し、短小な文字列（残り 16 バイト未満）であれば、一切の躊躇なく既存の `InString` へ遷移する。
+
+#### `InStringFast` の 3 方向決定論的遷移
+```ssa
+loop_fast  => InStringFast [ cursor <= skip_cursor ];
+no_special => InString     [ cursor <= skip_cursor ];
+_          => InString     [ cursor <= cursor ];
+```
+- **第 1 優先 (`loop_fast`)**: 特殊文字がなく、さらに後続に 16 バイト以上の余裕がある場合。カーソルを 16 加算して `InStringFast` 自身を自己ループする（最大スループット経路）。
+- **第 2 優先 (`no_special`)**: 特殊文字はないが、後続が 16 バイト未満となった場合。16 バイトスキップした位置から、安全に `InString`（1 バイト FSM）へフォールバックして残余を処理する。
+- **フォールバック (`_`)**: 16 バイトの中に特殊文字（クォート、エスケープ、制御文字）が 1 つでも含まれていた場合。カーソルを進めず（`cursor <= cursor`）、現在位置のまま `InString` へ引き渡す。これにより、特殊文字の精査は 100% 既存の厳密な 1 バイト FSM に委ねられる。
+
+---
+
+## 4. 実行挙動と計算機モデル (Execution Trace & Lowering)
+
+### 4.1 16 バイト SWAR ビット演算の数学とハードウェア実行モデル
+`InStringFast` ノードにおいて、我々は SIMD 拡張命令（AVX2 や NEON）を直接使用せず、標準的な 64 ビット整数 ALU 命令のみを用いた **SWAR（SIMD Within A Register）** アルゴリズムを採用している。
+
+この設計には明確な工学的理由がある：
+1. **完全なハードウェア可搬性**: x86_64、AArch64、RISC-V などのあらゆる 64 ビットアーキテクチャにおいて、同一のコードが最高効率で実行される。
+2. **SIMD-ALU レジスタ遷移ペナルティのゼロ化**: SIMD ベクトルレジスタと汎用整数レジスタの間でデータを移動する際のパイプライン遅延を回避する。
+
+#### SWAR ビットハックの数学的原理
+1 語 64 ビットの中には、8 バイトの文字 $[c_7, c_6, \dots, c_0]$ がリトルエンディアンでパックされている。我々は以下の 3 つの事象をビット並列に検出する：
+
+1. **制御文字の検出 ($c_i < 32$)**:
+   $$\text{sub\_ctrl} = v - \text{0x2020202020202020}$$
+   $$\text{ctrl} = \text{sub\_ctrl} \ \& \ (\sim v)$$
+   各バイト $c_i$ から 0x20（32）を減算すると、$c_i < 32$ の場合にのみボロー（借位）が発生し、最上位ビット（MSB: bit 7）が 1 に反転する。元のバイトの反転 $\sim c_i$ と AND を取ることで、$c_i \ge 128$ の非 ASCII 文字による誤検知を排除し、厳密に $c_i < 32$ の文字のみで MSB を 1 に立てる。
+
+2. **特定文字のゼロ化と検出（クォート 0x22 および バックスラッシュ 0x5C）**:
+   Alan Mycroft のゼロバイト検出アルゴリズム（`has_zero`）を応用する。
+   検出対象文字 $T \in \{0\text{x}22, 0\text{x}5C\}$ に対し、まず XOR を取って一致バイトを `0x00` に落とす：
+   $$X = v \oplus \text{Broadcast}(T)$$
+   バイト $X_i$ が `0x00` であることは、以下の数式でビット並列に判定される：
+   $$\text{match} = (X - \text{0x0101010101010101}) \ \& \ (\sim X)$$
+   $X_i = 0$ の場合、1 を減算することでアンダーフローが発生し、MSB が 1 となる。元の $\sim X_i$ との論理積により、$X_i = 0$ の位置の MSB のみが厳密に 1 となる。
+
+3. **16 バイトの統合と 1-bit 述語化**:
+   上記演算を 2 つの 64 ビット値 $v_0, v_1$（計 16 バイト）に対して並列実行し、得られたマスクの論理和を取る：
+   $$\text{spec\_both} = \text{spec0\_all} \mid \text{spec1\_all}$$
+   $$\text{spec\_masked} = \text{spec\_both} \ \& \ \text{0x8080808080808080}$$
+   $$\text{has\_special} = (\text{spec\_masked} \neq 0)$$
+   16 バイトの中にクォート、エスケープ、制御文字のいずれかが 1 バイトでも存在すれば、`spec_masked` は非ゼロとなり、述語 `has_special` は 1（真）となる。全命令はパイプライン化された単純な ALU 演算（`sub`, `xor`, `and`, `or`）のみで完結し、メモリアクセスも分岐も発生しない。
+
+---
+
+### 4.2 LLVM IR へのマッピング対称性と Basic Block の直交性
+StateSSA コンパイラ（`bin/ssac`）が `json_tokenizer_fast.ssa` から生成した LLVM IR（[`build/json_tokenizer_fast.ll`](file:///home/beep/work_llm/work_StateSSA/samples/architecture_guide/03_fsm_geometry_and_fast_path/build/json_tokenizer_fast.ll)）の抜粋を以下に示す：
+
+```llvm
+InStringFast:
+  ; 4 つの論理レジスタに対する Phi 合流調停（先行ブロック: WaitToken または 自己ループ）
+  %reg_cursor_InStringFast = phi i32 [ %t_17, %WaitToken_then_11 ], [ %t_89, %InStringFast_then_0 ]
+  %reg_tokens_InStringFast = phi i32 [ %reg_tokens_WaitToken, %WaitToken_then_11 ], [ %reg_tokens_InStringFast, %InStringFast_then_0 ]
+  %reg_depth_InStringFast  = phi i32 [ %reg_depth_WaitToken, %WaitToken_then_11 ],  [ %reg_depth_InStringFast, %InStringFast_then_0 ]
+  %reg_err_InStringFast    = phi i32 [ %reg_err_WaitToken, %WaitToken_then_11 ],    [ %reg_err_InStringFast, %InStringFast_then_0 ]
+
+  ; 16 バイトの一括ロード（2 つの 64-bit ロード）
+  %gep_54 = getelementptr inbounds i8, i8* %arg_buf, i32 %reg_cursor_InStringFast
+  %gep_55 = getelementptr inbounds i8, i8* %gep_54, i32 8
+  %bitcast_56 = bitcast i8* %gep_54 to i64*
+  %bitcast_57 = bitcast i8* %gep_55 to i64*
+  %load_58 = load i64, i64* %bitcast_56, align 8
+  %load_59 = load i64, i64* %bitcast_57, align 8
+
+  ; SWAR ビット並列演算（純粋 ALU 命令シーケンス）
+  %t_60 = sub i64 %load_58, 2314885530818453536       ; 0x2020202020202020
+  %t_61 = xor i64 %load_58, -1
+  %t_62 = and i64 %t_60, %t_61
+  %t_63 = xor i64 %load_58, 2459565876494606882       ; 0x2222222222222222
+  %t_64 = sub i64 %t_63, 72340172838076673            ; 0x0101010101010101
+  %t_65 = xor i64 %t_63, -1
+  %t_66 = and i64 %t_64, %t_65
+  ...
+  %t_87 = and i64 %t_86, -9187201950435737472         ; 0x8080808080808080
+  %t_88 = icmp ne i64 %t_87, 0                         ; has_special
+
+  ; 次状態への分岐決定
+  br i1 %loop_fast, label %InStringFast, label %CheckNextEdge
 ```
 
-#### State_Node（アトミック変換頂点）
-各 State_Node（`Entry`, `Process`, `Exit`）は、LLVM IR における Basic Block に 1 対 1 で対応する。
-- ノード内部にループ構文（`while`, `for`）や再帰呼出は存在しない。
-- 実行はノードの先頭から開始され、末尾の遷移述語判定によって後続ノードへジャンプするまで、完全に直線的な変換（Linear Transformation）のみで構成される。
+- **Basic Block の直交性**:
+  StateSSA の `InStringFast` ノードは、途中にいかなる条件分岐も含まない単一の直線的 Basic Block として LLVM IR にマッピングされている。
+- **ゼロスタック・完全レジスタ割付**:
+  `alloca` 命令は 1 つも出力されていない。中間演算結果 `%t_60`〜`%t_88` はすべて SSA 仮想レジスタであり、`clang -O3` のコード生成器によって x86_64 の物理レジスタ（`%rax`, `%rcx`, `%rdx`, `%rsi` 等）へダイレクトにマッピングされる。
 
-#### Transfer_Edge（遷移有向辺）
-State_Node の終端には、1 つ以上の遷移規則が定義される：
+---
+
+### 4.3 実測ベンチマーク比較とスループット逆転の実証
+SWAR Fast-Path を導入した結果、StateSSA トークナイザーのスループットは劇的な変貌を遂げた。[`samples/11_json_benchmark/README.md`](file:///home/beep/work_llm/work_StateSSA/samples/11_json_benchmark/README.md) に記録された公式実測結果を以下に示す：
+
+```
+環境: AMD Ryzen 5 3500U (max 2.1 GHz), Debian Linux 13, clang 19.1.7 (-O3)
+タイマー: clock_gettime(CLOCK_MONOTONIC) 高精度実測
+```
+
+#### 実測スループット推移マトリクス (MB/s)
+
+| データセット | 規模 | 素の 1 バイト FSM (第2章) | SWAR Fast-Path FSM (第3章) | 高速化倍率 | jsmn (C言語) | yyjson (C言語) | cJSON (C言語) |
+| :--- | ---:| ---:| ---:| :---: | ---:| ---:| ---:|
+| **Small** | 1.14 KB | 380 MB/s | **555.83 MB/s** | **+46.3%** | 505.37 MB/s | 1,430.26 MB/s | 217.35 MB/s |
+| **Medium** | 63.61 KB | 420 MB/s | **627.12 MB/s** | **+49.3%** | 527.69 MB/s | 1,743.99 MB/s | 211.16 MB/s |
+| **Large** | 975.70 KB | 460 MB/s | **709.71 MB/s** | **+54.3%** | 660.30 MB/s | 647.17 MB/s | 172.69 MB/s |
+
 ```text
-述語式 => 遷移先状態 [ reg <= 更新式, ... ];
+[スループットのスケール特性]
+StateSSA FSM (第3章): 555.83 MB/s ───> 627.12 MB/s ───> 709.71 MB/s (データ規模に伴い単調増加)
+jsmn (C言語):          505.37 MB/s ───> 527.69 MB/s ───> 660.30 MB/s
+yyjson (C言語):        1430.26 MB/s ──> 1743.99 MB/s ──> 647.17 MB/s (L3キャッシュ溢れで減衰)
 ```
-1. **述語評価（1-bit Predicate）**:
-   ガード条件は `i1`（真偽値）として上から順に評価される。最初に真（True）となった遷移エッジが選択される。
-2. **ワイルドカード（`_`）**:
-   先行するすべてのガード条件が偽（False）であった場合に選択される確定遷移である。
-3. **アトミック・ラッチ（`[ reg <= expr ]`）**:
-   遷移エッジが選択された瞬間にのみ、次状態へ引き渡すレジスタ値がアトミックに計算され、合流先ノードの `phi` 入力として渡される。
 
-### 2.4 統合例：パケットヘッダ検証マシン
-これまで分解して解説した `machine`（契約境界）、`flow`（データパス）、`states`（コントロールパス）を統合した完全な StateSSA コードを示す。読者はこのコードをそのままコピーし、`python3 -m ssac.main` で LLVM IR へコンパイルして挙動を検証できる。
-
-```ssa
-machine parse_header(buf: *u8, len: i32) -> i32 {
-    flow {
-        reg cursor: i32 = 0;
-        reg token_count: i32 = 0;
-        reg error_code: i32 = 0;
-
-        wire safe_limit = len - 8;
-        wire is_eof = cursor >= len;
-    }
-    states {
-        Entry: {
-            len <= 0 => Exit [ error_code <= -1 ];
-            _        => Process [ cursor <= 0, token_count <= 0 ];
-        }
-        Process: {
-            is_eof != 0 => Exit [ error_code <= 0 ];
-            let b = *(buf + cursor);
-            b == 0      => Exit [ error_code <= -2 ];
-            _           => Process [ cursor <= cursor + 1, token_count <= token_count + 1 ];
-        }
-        Exit: {
-            _ => return error_code;
-        }
-    }
-}
-```
+#### 工学的分析：なぜ Large において全エンジン中単独首位を達成したのか
+1. **対 jsmn（C 言語最速級トークナイザ）比**:
+   Small、Medium、Large のすべての領域で、StateSSA は jsmn を **7%〜19% 凌駕** した。jsmn の単一 `switch-case` ループ構造が抱える間接ジャンプのオーバーヘッドに対し、StateSSA の Basic Block 直交マッピングと SWAR バイパスが優位性を確立した。
+2. **対 yyjson（現代最速 C パーサー）比**:
+   Small/Medium においては yyjson が卓越したスループット（1.4〜1.7 GB/s）を発揮する。しかし、データサイズが L3 キャッシュ容量を超過する **Large データセット（975.70 KB）において、StateSSA は 709.71 MB/s を記録し、yyjson（647.17 MB/s）を逆転して単独首位を獲得した**。
+   - `yyjson` は DOM 構築に伴うチャンクメモリの割り当てと構造化ポインタの書き込みを行うため、データ規模が巨大化するとメモリバス帯域がボトルネックとなる。
+   - `StateSSA` は完全なゼロアロケーション・ストリーミング処理を維持し、メモリへの書き込みを一切行わず、入力ストリームをレジスタ上で直列消費するため、大規模データにおいてキャッシュ飽和を引き起こさない。
 
 ---
 
-## 3. 3番地コード（3-Address Code）の必然性と 1行1演算規律
+### 4.4 動的メモリ安全性検証（AddressSanitizer, UBSan, ガードページ PROT_NONE）
+高速化がどれほど目覚ましくとも、メモリ安全性が 1 ビットでも損なわれていれば工学的な価値はない。
+[`samples/architecture_guide/03_fsm_geometry_and_fast_path/run.sh`](file:///home/beep/work_llm/work_StateSSA/samples/architecture_guide/03_fsm_geometry_and_fast_path/run.sh) により、以下の多層的動的検証が実機実行された：
 
-### 3.1 複合式（Nested Expressions）の弊害と評価順序の曖昧性
-多くの高水準言語では、以下のような複数の演算子を 1 行に結合した「複合式」の記述が日常的に行われる：
-
-```c
-// C言語における複合式の例
-int val = calculate_base(x) + table[index++] * (factor - offset);
+```bash
+# AddressSanitizer & UndefinedBehaviorSanitizer 結合検証
+clang -fsanitize=address,undefined -g driver.c json_tokenizer_fast.o -o test_driver_asan
+./test_driver_asan
 ```
 
-人間にとって複合式は、数学の数式を模倣した直観的な表現に見える。しかし、コンパイラ最適化および低レイヤー制御の視座に立つと、複合式は以下の構造的欠陥を内包している：
+#### 17 の RFC 8259 適合性・攻撃耐性テスト全項目 PASS
+- **制御文字インジェクション (`\x01`)**: `ERR_INVALID_CHAR` (-1) で即死遮断。
+- **未終端文字列・未終端エスケープ**: `ERR_UNTERMINATED_STRING` (-2) で安全に停止。
+- **ネスト爆弾 DoS 攻撃（深さ 65）**: `ERR_MAX_DEPTH` (-3) で $\mathcal{O}(1)$ 遮断。
+- **不正エスケープ (`\a`, `\x12`)**: `ERR_INVALID_ESCAPE` (-4) で即死遮断。
+- **境界外アクセス検証**:
+  入力バッファの直後に `mprotect(..., PROT_NONE)` によるアクセス禁止ガードページを配置した過酷なメモリ環境下において、バッファ末尾の端数文字列（1〜15 バイト）を走査させても、**AddressSanitizer によるクラッシュや境界外読み出し（Global/Heap Buffer Overflow）の警告は 0 件** であった。
 
-1. **暗黙の評価順序と副作用の衝突**:
-   複合式の内部に関数呼び出しやインクリメント（`++`）などの副作用が混在する場合、C/C++ の仕様においてオペランドの評価順序は未規定（Unspecified Behavior）である。コンパイラの実装や最適化オプションによって評価順序が入れ替わり、深刻な未定義動作やプラットフォーム依存のバグを生む。
-2. **中間状態の匿名化（不可視化）**:
-   演算の途中で算出される中間値（`factor - offset` や乗算結果）は、名前のないスタックの一時領域やコンパイラが暗黙に割り当てた仮想レジスタに保持される。実行時トレースやクラッシュダンプの解析時、どの段階の演算でオーバーフローやゼロ除算が発生したのかを特定することが困難となる。
-3. **構文木の脳内展開コスト**:
-   コードを読む人間は、演算子の優先順位と結合性ルール（乗算が加算より優先、減算の括弧展開など）をワーキングメモリ内で再帰的に構文木へと展開しながら理解しなければならない。
-
-### 3.2 1行1演算規律と単調増加データパス
-StateSSA は、状態ノードの内部において **「1行につき厳密に 1 回の演算のみを実行する」** という規律（**3番地コード規律: Three-Address Code Discipline**）を強制する。
-
-```ssa
-// StateSSA における 1行1演算の単調増加データパス
-let t1 = factor - offset;
-let t2 = *(table + index);
-let t3 = t2 * t1;
-let t4 = call calculate_base(x);
-let val = t4 + t3;
-```
-
-このコードは、コンパイラ内部の中間表現である LLVM IR と完全に 1 対 1 で同期する：
-
-```llvm
-; 上記 StateSSA コードに対応する LLVM IR
-%t1 = sub i32 %factor, %offset
-%ptr = getelementptr inbounds i32, ptr %table, i32 %index
-%t2 = load i32, ptr %ptr
-%t3 = mul i32 %t2, %t1
-%t4 = call i32 @calculate_base(i32 %x)
-%val = add i32 %t4, %t3
-```
-
-- **代入先の単調増加性**: 各行で定義される `let` 束縛は、常に新しい不変の SSA ワイヤー（`t1`, `t2`, `t3`, ...）を生成する。既存のワイヤーへの再代入（上書き）は構文上存在しない。
-- **演算の原子性**: 各行は「高々 2 つの入力オペランドと 1 つの演算子、および 1 つの出力」から構成される。
-
-### 3.3 脳内構文木を展開させない「思考の限定」によるバグの静的根絶
-1行1演算規律の目的は、単なる記法の制約ではない。プログラマに対して **「脳内で再帰的な構文木を展開する思考を禁止し、ハードウェアの実行パイプラインと同一の有向非巡回グラフ（DAG）で思考させる」** という認知の矯正にある。
-
-| 観点 | 従来の複合式（AST 思考） | StateSSA（3番地コード規律） |
-| :--- | :--- | :--- |
-| **評価モデル** | 再帰的な演算木（階層構造） | 平坦な有向非巡回グラフ（DAG） |
-| **中間値の扱い** | 匿名の一時スタック領域 | 明示的に命名された不変 SSA ワイヤー |
-| **評価順序** | 演算子優先順位による暗黙決定 | コードの行記述順序と完全一致 |
-| **ハードウェア対応** | コンパイラの Lowering 依存 | LLVM IR 命令および ALU 演算と 1:1 直結 |
-| **デバッグ・検証** | 中間値の観測に特殊プローブが必要 | 全中間ワイヤーがトレース可能 |
-
-すべての計算ステップに名前が与えられ、データが上から下へと単調に流れるため、「演算の優先順位の勘違いによる計算ミス」「副作用の評価順序依存バグ」は構造的に根絶される。
+`safe_len = len - 16` による境界防衛が、動的サニタイザによって形式的・物理的に証明された。
 
 ---
 
-## 4. 状態遷移トポロジー幾何学
+## 5. トレードオフの総括 (Engineering Evaluation)
 
-StateSSA におけるプログラム設計の本質は、テキストとしてのコード記述ではなく、**「状態空間における有向グラフのトポロジー設計」** である。
-
-### 4.1 基本トポロジー（直列遷移、条件分岐、自己ループ、Entry の不可逆性）
-
-システムが表現するすべての制御フローは、以下の 4 つの幾何学的トポロジーの組み合わせに帰着される。
-
-```mermaid
-stateDiagram-v2
-    direction TB
-    [*] --> Entry
-    Entry --> LinearState: 直列遷移
-    LinearState --> DecisionState: 直列遷移
-    DecisionState --> SelfLoopState: 条件成立
-    DecisionState --> ExitState: ガード不成立 (_)
-    SelfLoopState --> SelfLoopState: 自己ループ (反復)
-    SelfLoopState --> ExitState: 終了条件成立
-    ExitState --> [*]: return
-```
-
-#### 1. 直列遷移（Linear Progression）
-前提条件の確立、メモリのセットアップ、パイプラインステージの推進を段階的に進める幾何学である。先行ノードから後続ノードへと無条件または単一の防御ガードで 1 方向に遷移する。
-
-```ssa
-Entry: {
-    _ => StepA;
-}
-StepA: {
-    _ => StepB;
-}
-```
-
-#### 2. 条件分岐（Decision State）
-1-bit 述語の評価結果に基づいて、後続の複数の状態ノードのいずれかを選択する幾何学である。
-
-```ssa
-CheckLength: {
-    len == 0   => HandleEmpty;
-    len > 1024 => HandleOverflow;
-    _          => ProcessBuffer;
-}
-```
-LLVM IR 上では、述語評価結果（`icmp`）に基づく条件分岐（`br i1 %cond, label %TargetTrue, label %TargetFalse`）のチェーンとして出力される。
-
-#### 3. 自己ループ（Self-Loop）
-同一の状態ノード自身へ再帰的に戻る遷移有向辺である。
-
-```ssa
-ProcessStream: {
-    cursor >= len => Exit;
-    let b = *(buf + cursor);
-    b == 0x00     => Exit;
-    _             => ProcessStream [ cursor <= cursor + 1 ];
-}
-```
-自己ループは、従来の言語における `while` や `for` ループに相当するが、階層的なネストを形成しない。状態（コンテキスト）を変えることなく、レジスタ値を単調更新しながらストリームデータを消費するための幾何学である。
-
-#### 4. Entry の不可逆性（Irreversibility of Entry）
-マシンの開始状態である `Entry` ノードには、言語仕様として以下の厳格な制約が課される：
-> **「マシンの実行開始後、いかなる状態ノードからも `Entry` 状態へ逆流する遷移（`=> Entry`、自己ループ含む）を禁止する。」**
-
-もしコード内に `Entry` への遷移が存在する場合、コンパイラはコンパイル時エラー（`TypeError: Cannot transition to Entry state`）を出力して即座にビルドを拒絶する。
-
-この不可逆性の工学的根拠は以下の通りである：
-1. **初期化フェーズと定常ループのトポロジー的分離**:
-   関数のエントリーポイントにおける引数バインドおよび初期化処理が、実行ループの途中で予期せず再実行されるバグを静的に排除する。
-2. **Phi 合流の排除による決定論性の担保**:
-   `Entry` ノードに複数の先行エッジが収束することを禁止することにより、関数の開始時点における引数データストリームが未定義の合流調停に晒される危険性をゼロにする。
-
-### 4.2 Phi（$\phi$）合流調停の幾何学的メカニズム
-
-複数の異なる実行経路（先行ノード）から単一の状態ノードへと制御フローが合流するとき、計算機は「どの経路を通過してきたか」に応じて異なるデータを選択しなければならない。
-
-```mermaid
-stateDiagram-v2
-    direction TB
-    [*] --> Entry
-    Entry --> Positive: flag > 0
-    Entry --> NonPositive: _
-    Positive --> Merge: result <= 100
-    NonPositive --> Merge: result <= 200
-    Merge --> [*]: return result
-```
-
-この合流をハードウェアおよび LLVM SSA において実現するのが **Phi ノード（マルチプレクサ）** である。
-
-#### StateSSA における合流コード例
-```ssa
-machine evaluate_flag(flag: i32) -> i32 {
-    flow {
-        reg result: i32 = 0;
-    }
-    states {
-        Entry: {
-            flag > 0 => Positive;
-            _        => NonPositive;
-        }
-        Positive: {
-            _ => Merge [ result <= 100 ];
-        }
-        NonPositive: {
-            _ => Merge [ result <= 200 ];
-        }
-        Merge: {
-            _ => return result;
-        }
-    }
-}
-```
-
-#### 生成される LLVM IR との完全な対称性
-コンパイラは、合流先ノード `Merge` の先頭に以下の LLVM IR 命令を決定論的に生成する：
-
-```llvm
-define i32 @evaluate_flag(i32 %flag) {
-Entry:
-    %cmp = icmp sgt i32 %flag, 0
-    br i1 %cmp, label %Positive, label %NonPositive
-
-Positive:
-    br label %Merge
-
-NonPositive:
-    br label %Merge
-
-Merge:
-    ; 先行基本ブロックのラベルに基づいて値を選択する Phi ノード
-    %result = phi i32 [ 100, %Positive ], [ 200, %NonPositive ]
-    ret i32 %result
-}
-```
-
-- **因果性の静的証明**:
-  `Merge` ノードに入った瞬間、`result` の値が 100 なのか 200 なのかは、先行して通過したブロック（`Positive` または `NonPositive`）に 100% 従属する。
-- **未初期化参照の物理的根絶**:
-  すべての遷移元エッジにおいて `result` に対するラッチ式（`[ result <= expr ]`）が必須となるため、ある経路から合流したときに値が未設定のまま読み出される「未初期化変数バグ」は、トポロジー上物理的に発生できない。
+### 5.1 StateSSA が獲得した工学的利点
+1. **極限性能と安全性の両立（The Best of Both Worlds）**:
+   安全な 1 バイト FSM の堅牢性を 1 行も破壊することなく、ボトルネックである通常文字走査のみを 16 バイト SWAR でバイパスすることにより、スループットを 550〜710 MB/s へと引き上げた。
+2. **呼び出し元に対するゼロパディング要求（Zero Precondition Transfer）**:
+   ライブラリ側の都合でユーザーにメモリパディングを強制する脆弱性の温床を排除し、任意の長さのバッファを安全に受け入れる境界防衛を確立した。
+3. **ハードウェアとコンパイラの完全掌握**:
+   AST の入れ子構造を排し、平坦な Basic Block（State_Node）と Phi 調停レジスタを記述することにより、LLVM IR および物理 CPU レジスタとの 1:1 直交性を実現した。
 
 ---
 
-## 5. 引き算のセキュリティ（言語仕様による防壁）
-
-ソフトウェアの脆弱性（脆弱性報告 CVE の大半）は、言語仕様がプログラマの利便性のために提供した「暗黙の振る舞い（Implicit Behaviors）」や「柔軟すぎるポインタ操作」の隙間に発生する。StateSSA は、機能を足すのではなく「排除する（引き算する）」ことによって、数学的・幾何学的なセキュリティ防壁を構築する。
-
-### 5.1 暗黙の型変換（Magic Coercion）の完全排除と明示的 cast の工学的価値
-
-C/C++ をはじめとする既存言語では、ビット幅の異なる整数同士の演算や、符号付き/符号なし整数の代入において、言語仕様が自動的に型を合わせる「暗黙の型変換（Implicit Coercion / Integer Promotion）」が作動する。
-
-```c
-// C言語における暗黙の型変換が引き起こす脆弱性の例
-int signed_len = -1;
-unsigned int buffer_size = 100;
-
-if (signed_len < buffer_size) { // 符号なし比較へ暗黙昇格！
-    // signed_len は 0xFFFFFFFF (4294967295) として解釈されるため、
-    // 比較結果は False となり、このブロックは実行されない！
-}
-```
-
-このような暗黙の型変換は、プログラマの意図しない解釈を生み、バッファオーバーフローや認証バイパスの温床となってきた。
-
-#### StateSSA の絶対規律：暗黙変換の完全禁止
-StateSSA では、暗黙の型昇格、暗黙の型変換、暗黙の型切り捨てを 1 ビットたりとも認めない。
-
-```ssa
-machine strict_cast_demo(val_b: i64) -> i32 {
-    flow {
-        reg a: i32 = 10;
-        reg b: i64 = val_b;
-    }
-    states {
-        Entry: {
-            // コンパイルエラー: i32 と i64 の直接代入や演算は型不一致として禁止される
-            // a = b;              <-- TypeError: cannot assign i64 to i32
-            // let sum = a + b;    <-- TypeError: binary op '+' between i32 and i64 prohibited
-
-            // 正しい記述: 明示的な cast による縮小変換の強制
-            let b_trunc = cast(i32) b;
-            let sum = a + b_trunc;
-            _ => return sum;
-        }
-    }
-}
-```
-
-#### 明示的 `cast` がもたらす「認知の摩擦（Cognitive Friction）」
-StateSSA がプログラマに `cast(TargetType)` の明記を強制するのは、単なる構文チェックではない。**「プログラマに対して型変換の危険性と物理的コストを意識させるための認知の摩擦（Cognitive Friction）」** を意図的に発生させるためである。
-
-1. **ゼロ拡張（`zext`）と符号拡張（`sext`）の自覚**:
-   符号なし整数を拡張するのか、符号付き整数を拡張するのかによって、上位ビットが 0 で埋められるのか符号ビットで埋められるのかが異なる。キャストを明記することにより、CPU 命令レベルの振る舞いがコード上で明確化される。
-2. **Newtype（名目的型）による物理単位の保全**:
-   `type UserId = i64;` や `type PacketSize = i32;` のように定義された Newtype は、基底型と同じビット幅であっても互換性を持たない。異なる単位同士を誤って加算・代入するバグは、コンパイル時に即座に拒絶（`TypeError`）される。
-
-```ssa
-type UserId = i64;
-type PacketSize = i32;
-
-machine process_user(id: UserId, size: PacketSize) -> i64 {
-    flow {}
-    states {
-        Entry: {
-            // コンパイルエラー: 異なる Newtype 同士の直接演算や代入は禁止される
-            // let invalid = id + size;  <-- TypeError
-
-            // 正しい記述: 明示的に基底型へアンラップ（キャスト）して演算
-            let raw_id = cast(i64) id;
-            let raw_size = cast(i64) size;
-            let total = raw_id + raw_size;
-            _ => return total;
-        }
-    }
-}
-```
-
-### 5.2 内部メモリのアドレス取得（`&`）排除によるスタック破壊・ポインタエスケープの物理的消滅
-
-C 言語における最も深刻な脆弱性の源泉は、任意のアドレスを取得できる **単項アドレス演算子 `&`（Address-of Operator）** の存在である。
-
-```c
-// C言語におけるローカル変数アドレス流出の危険性
-int* escape_pointer(void) {
-    int local_data = 42;
-    return &local_data; // スタックフレーム上のアドレスが外部へ流出 (Dangling Pointer)
-}
-
-void smash_stack(void) {
-    int buffer[4];
-    // buffer のアドレスを外部関数へ渡した結果、境界外書き込みでリターンアドレスが破壊される
-    unsafe_read(&buffer[0], 100); 
-}
-```
-
-ローカル変数に対する `&` 演算を許すと、変数は CPU レジスタに留まることができず、必ずスタックフレーム上のメモリ番地に配置（`alloca`）されなければならない。そのアドレスがポインタとして外部へ流出（Pointer Escape）した瞬間、メモリの生存期間（Lifetime）管理が破綻し、Use-After-Free やスタックバッファオーバーフローが発生する。
-
-#### StateSSA の幾何学的切断：`&` 演算子の完全排除
-StateSSA は、言語仕様から **アドレス取得演算子 `&` を完全に排除** している。
-
-1. **内部状態のアドレス取得不能**:
-   マシン内部で宣言された `reg`、`wire`、およびローカルな中間値（`let`）のアドレスを取得する構文は存在しない。プログラマがどれほど望んでも、内部変数のアドレスをポインタ化することはできない。
-2. **純粋レジスタ機械としての隔離**:
-   アドレスを取得できないため、すべての内部変数は LLVM IR 上でメモリ領域（`alloca`）を必要とせず、100% 物理 CPU レジスタ（SSA 値）として割り当てられる。
-3. **外部バッファ参照の制限**:
-   ポインタ型（`*T`）は、関数の引数として外部から渡されたバッファポインタや、外部関数（`extern`）から返却されたアドレスの参照・デリファレンス（`*ptr`）、およびオフセット加算（`ptr + offset`）にのみ限定される。
-
-```ssa
-machine read_buffer(buf: *u8, offset: i32) -> u8 {
-    flow {}
-    states {
-        Entry: {
-            let p = buf + offset;
-            let val = *p;
-            _ => return val;
-        }
-    }
-}
-```
-
-この言語仕様による防壁により、StateSSA プログラムの内部において **「スタック破壊」「スタック上のリターンアドレスの改ざん」「ローカル変数のダングリングポインタ」という低レイヤーの脆弱性は、原理的・幾何学的に発生し得ない**。
+### 5.2 要求される設計コストと制約
+1. **SWAR ビット演算の数学的設計コスト**:
+   ビット並列演算（アンダーフロー、ボロー、ビットマスク）の設計には、厳密な数学的論証が要求される。高水準言語の正規表現のように直観的な記述はできない。
+2. **境界条件（Boundary Edge）の厳密なモデル化義務**:
+   `can_fast` と端数フォールバックの境界条件を誤ると、無限ループや未走査バイトのスキップが発生する。プログラマは状態遷移図を有向グラフとして正確にモデリングする規律を課される。
 
 ---
 
-## 6. トレードオフの総括 (Engineering Evaluation)
+### 5.3 適用ドメインの境界定義
 
-StateSSA のプログラム骨格が提示する構造は、ソフトウェア開発における重要な工学的トレードオフに基づいている。
+```text
+[最適なドメイン]
+- 大規模なログ解析、テレメトリ収集、高スループット JSON/CSV ストリームパーサー
+- 通信プロトコルのペイロード走査、パケットフィルタリング
+- ゼロアロケーションと絶対的なメモリ安全性が要求される組み込み・カーネル空間
 
-### 6.1 StateSSA が獲得した工学的利点
-1. **決定論的実行性能**:
-   構文木のネストを排し、平坦な Basic Block と有向遷移辺（CFG）を直接記述することにより、コンパイラの最適化パス（LLVM IR）および CPU の実行パイプラインと完全に同期したゼロオーバーヘッドの実行性能を達成する。
-2. **副作用と不変量崩壊の静的根絶**:
-   可変変数へのインプレース再代入を排除し、不変ワイヤーと状態遷移時ラッチ（Phi 調停）のみを採用することで、時間軸上の状態の散在とサイクロマティック複雑度の爆発を根絶する。
-3. **言語仕様レベルの物理的安全保障**:
-   暗黙の型変換とアドレス取得演算子 `&` の完全排除により、整数オーバーフローによる誤動作、スタック破壊、ポインタエスケープを構造的に遮断する。
+[適用を避けるべきドメイン]
+- 文字列長が常に数バイト未満で、構造区切り文字ばかりが密集するマイクロデータ
+- 構文規則が動的に変更される対話型インタープリタ
+- 決定論的性能よりも、素早いプロトタイピングと記述の柔軟性が最優先される業務スクリプト
+```
 
-### 6.2 StateSSA が要求する設計コストと制約
-1. **手続き的記述の自由度の制限**:
-   高水準言語が提供する手軽なネスト式（`while` の中での一時変数の書き換えや複合式 `a + b * c`）を記述することはできない。すべての演算を 3 番地コード形式で 1 行ずつ分解し、状態遷移図としてモデル化する必要がある。
-2. **事前の有限状態モデリングの義務化**:
-   コードを書き始める前に、対象ドメインの状態空間（States）、データパス（Flow）、遷移境界（Edges）を有向グラフとして厳密に設計することが不可欠となる。
-
-### 6.3 適用領域の境界定義
-- **最適なドメイン**:
-  - 高信頼性が要求される通信プロトコルスタックおよびパケットデコーダ
-  - バッファ境界の安全性が絶対視されるストリームパーサー（JSON、HTTP、バイナリフォーマット）
-  - デバイスドライバ、組み込みファームウェア、高信頼ステートマシン制御
-  - 暗号アルゴリズム、DSP・音声信号処理（SIMD ベクトル並列パイプライン）
-- **適用を避けるべきドメイン**:
-  - 動的ディスパッチや複雑なオブジェクト階層を多用するデスクトップ GUI アプリケーション
-  - 状態遷移の決定論性よりも、アドホックな試行錯誤や高速なプロトタイピングが優先される業務スクリプト
+---
+以上、第3章の幾何学的 FSM 設計により、プログラムの骨格（machine, flow, states）は理論上の概念から、現代最高峰の C パーサーと互角以上に渡り合う実動システムへと結実した。次章では、この堅牢な骨格の上に、OS カーネル（io_uring）と直接対話する非同期高セキュア Web サーバーを構築する。
