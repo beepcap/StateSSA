@@ -143,11 +143,15 @@ StateSSA rejects all padding mandates. It enforces **Zero-Padding Boundary Defen
 #### Mathematical Invariants of the Safe Boundary
 At machine entry, the maximum boundary within which a 16-byte bulk load is unconditionally safe, `safe_len`, is calculated:
 
-$$\text{safe\_len} = \text{len} - 16$$
+$$
+\mathrm{safe\_len} = \mathrm{len} - 16
+$$
 
 During execution, the predicate governing access to the fast path holds the following invariant:
 
-$$\text{can\_fast} \iff \text{cursor} < \text{safe\_len}$$
+$$
+\mathrm{can\_fast} \iff \mathrm{cursor} < \mathrm{safe\_len}
+$$
 
 - **Proof of Safety**:
   When `cursor < safe_len` is true, it follows identically that `cursor + 16 <= len`. Therefore, loading 16 bytes (two 64-bit integer words) from `buf + cursor` is guaranteed to address memory strictly within the legal buffer range $[0, \text{len})$. An out-of-bounds read of even a single byte is physically impossible.
@@ -419,27 +423,52 @@ This choice is grounded in rigorous engineering rationale:
 2. **Zero Vector-to-Integer Transition Latency**: It completely avoids pipeline stalls incurred when shuffling data between vector and general-purpose register files.
 
 #### Mathematical Principles of SWAR Bit Hacks
-Packed into each 64-bit word are 8 little-endian bytes $[c_7, c_6, \dots, c_0]$. We detect three categories of characters in bitwise parallel:
+Packed into each 64-bit word are 8 little-endian bytes $[c_7, c_6, \dots, c_0]$. We detect three categories of characters in bitwise parallel.
 
-1. **Control Character Detection ($c_i < 32$)**:
-   $$\text{sub\_ctrl} = v - \text{0x2020202020202020}$$
-   $$\text{ctrl} = \text{sub\_ctrl} \ \& \ (\sim v)$$
-   Subtracting 0x20 (32) from byte $c_i$ triggers a borrow if and only if $c_i < 32$, setting the Most Significant Bit (MSB: bit 7). Bitwise ANDing with the inverted original byte $\sim c_i$ eliminates false positives from non-ASCII characters ($c_i \ge 128$), setting the MSB strictly for bytes satisfying $c_i < 32$.
+##### (1) Control Character Detection (`c_i < 32`)
 
-2. **Target Character Detection (Quotes 0x22 and Backslashes 0x5C)**:
-   We adapt Alan Mycroft's zero-byte detection algorithm (`has_zero`).
-   For any target character $T \in \{0\text{x}22, 0\text{x}5C\}$, an XOR operation maps matching bytes directly to `0x00`:
-   $$X = v \oplus \text{Broadcast}(T)$$
-   Whether any byte $X_i$ equals `0x00` is determined across all bytes simultaneously via:
-   $$\text{match} = (X - \text{0x0101010101010101}) \ \& \ (\sim X)$$
-   When $X_i = 0$, subtracting 1 triggers an underflow borrow into bit 7. Masking with $\sim X_i$ ensures that only matching zero bytes produce an active MSB.
+$$
+\mathrm{sub\_ctrl} = v - \mathrm{0x2020202020202020}
+$$
 
-3. **16-Byte Aggregation and 1-Bit Predicate Formulation**:
-   Evaluating these equations across both 64-bit words $v_0$ and $v_1$ (16 bytes total) produces a composite mask:
-   $$\text{spec\_both} = \text{spec0\_all} \mid \text{spec1\_all}$$
-   $$\text{spec\_masked} = \text{spec\_both} \ \& \ \text{0x8080808080808080}$$
-   $$\text{has\_special} = (\text{spec\_masked} \neq 0)$$
-   If any quote, escape, or control character is present within the 16-byte block, `spec_masked` evaluates to non-zero, setting `has_special` to 1 (true). All operations execute as pipelined integer ALU instructions (`sub`, `xor`, `and`, `or`), with zero memory traffic and zero speculative branches.
+$$
+\mathrm{ctrl} = \mathrm{sub\_ctrl} \land (\sim v)
+$$
+
+Subtracting 0x20 (32) from byte $c_i$ triggers a borrow if and only if $c_i < 32$, setting the Most Significant Bit (MSB: bit 7). Bitwise ANDing with the inverted original byte $\sim c_i$ eliminates false positives from non-ASCII characters ($c_i \ge 128$), setting the MSB strictly for bytes satisfying $c_i < 32$.
+
+##### (2) Target Character Detection (Quotes 0x22 and Backslashes 0x5C)
+We adapt Alan Mycroft's zero-byte detection algorithm (`has_zero`).
+For any target character $T \in \{0\mathrm{x}22, 0\mathrm{x}5C\}$, an XOR operation maps matching bytes directly to `0x00`:
+
+$$
+X = v \oplus \mathrm{Broadcast}(T)
+$$
+
+Whether any byte $X_i$ equals `0x00` is determined across all bytes simultaneously via:
+
+$$
+\mathrm{match} = (X - \mathrm{0x0101010101010101}) \land (\sim X)
+$$
+
+When $X_i = 0$, subtracting 1 triggers an underflow borrow into bit 7. Masking with $\sim X_i$ ensures that only matching zero bytes produce an active MSB.
+
+##### (3) 16-Byte Aggregation and 1-Bit Predicate Formulation
+Evaluating these equations across both 64-bit words $v_0$ and $v_1$ (16 bytes total) produces a composite mask:
+
+$$
+\mathrm{spec\_both} = \mathrm{spec0\_all} \lor \mathrm{spec1\_all}
+$$
+
+$$
+\mathrm{spec\_masked} = \mathrm{spec\_both} \land \mathrm{0x8080808080808080}
+$$
+
+$$
+\mathrm{has\_special} = (\mathrm{spec\_masked} \neq 0)
+$$
+
+If any quote, escape, or control character is present within the 16-byte block, `spec_masked` evaluates to non-zero, setting `has_special` to 1 (true). All operations execute as pipelined integer ALU instructions (`sub`, `xor`, `and`, `or`), with zero memory traffic and zero speculative branches.
 
 ---
 
