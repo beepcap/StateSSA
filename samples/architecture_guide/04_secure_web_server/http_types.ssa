@@ -1,0 +1,46 @@
+// ============================================================================
+// StateSSA HTTP/1.1 Server Core Types
+// ゼロコピー・ゼロアロケーション HTTP リクエストデータ構造体
+// ============================================================================
+
+type HttpRequest = {
+    method:         u32,      // メソッド種別 (1: GET, 2: POST, 3: HEAD, 4: PUT, 5: DELETE, 0: UNKNOWN)
+    uri_ptr:        *u8,      // URI 開始アドレス (ゼロコピー)
+    uri_len:        u32,      // URI バイト長
+    version_major:  u32,      // HTTP バージョン主番号 (1)
+    version_minor:  u32,      // HTTP バージョン副番号 (1 または 0)
+    
+    // 主要ヘッダ
+    content_length: u32,      // Content-Length の値 (0 ならボディなし)
+    keep_alive:     u32,      // Connection: keep-alive (1: keep-alive, 0: close)
+    
+    // ボディ
+    body_ptr:       *u8,      // ボディ開始アドレス
+    body_len:       u32,      // 読み取り完了ボディ長
+    
+    // パーサ内部状態
+    state:          u32,      // 現在の FSM ステート ID (再開用)
+    consumed:       u32       // 入力バッファから消費したバイト数
+};
+
+// リクエスト構造体初期化マシン
+machine http_req_init(req: *HttpRequest) -> void {
+    flow {}
+
+    states {
+        Entry: {
+            req.method         <- 0;
+            req.uri_ptr        <- null;
+            req.uri_len        <- 0;
+            req.version_major  <- 1;
+            req.version_minor  <- 1;
+            req.content_length <- 0;
+            req.keep_alive     <- 1; // HTTP/1.1 のデフォルトは keep-alive
+            req.body_ptr       <- null;
+            req.body_len       <- 0;
+            req.state          <- 0; // 0: 初期状態
+            req.consumed       <- 0;
+            _ => return;
+        }
+    }
+}

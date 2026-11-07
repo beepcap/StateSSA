@@ -1,0 +1,847 @@
+// ============================================================================
+// StateSSA Tamper-Resistant Static File Delivery Engine (http_static.ssa)
+// StateSSA 50-line Discipline & Anti-Coercion Security Invariants
+// ============================================================================
+
+include "uring_types.ssa";
+
+// 1. 16進数文字 -> 数値変換マシン (46 lines <= 50)
+machine hex_to_val(c: u8) -> u32 {
+    flow {}
+
+    states {
+        Entry: {
+            c >= 48 => CheckDigit;
+            _       => RetInvalid;
+        }
+
+        CheckDigit: {
+            c <= 57 => RetDigit;
+            c >= 65 => CheckUpper;
+            _       => RetInvalid;
+        }
+
+        CheckUpper: {
+            c <= 70 => RetUpper;
+            c >= 97 => CheckLower;
+            _       => RetInvalid;
+        }
+
+        CheckLower: {
+            c <= 102 => RetLower;
+            _        => RetInvalid;
+        }
+
+        RetDigit: {
+            let v = c - 48;
+            _ => return cast(u32) v;
+        }
+
+        RetUpper: {
+            let v = c - 55;
+            _ => return cast(u32) v;
+        }
+
+        RetLower: {
+            let v = c - 87;
+            _ => return cast(u32) v;
+        }
+
+        RetInvalid: {
+            _ => return 99;
+        }
+    }
+}
+
+// 2. URI 不正文字検証マシン (25 lines <= 50)
+machine is_illegal_uri_char(b: u8) -> u32 {
+    flow {}
+
+    states {
+        Entry: {
+            b == 0   => Bad; // NULL (AC-07, AC-08)
+            b < 32   => Bad; // 制御文字 (AC-13)
+            b == 127 => Bad; // DEL
+            b == 92  => Bad; // '\\' (AC-03)
+            b == 192 => Bad; // 0xC0 (AC-12)
+            b == 193 => Bad; // 0xC1 (AC-12)
+            b >= 245 => Bad; // >= 0xF5 (AC-12)
+            _        => Good;
+        }
+
+        Bad: {
+            _ => return 1;
+        }
+
+        Good: {
+            _ => return 0;
+        }
+    }
+}
+
+// 3. 1文字 URL デコードステップマシン (49 lines <= 50)
+machine uri_decode_step(src: *u8, pos: u32, src_len: u32, out_char: *u8, out_adv: *u32) -> u32 {
+    flow {
+        wire cur_p = src + pos;
+        wire b = *cur_p;
+        wire rem = src_len - pos;
+    }
+
+    states {
+        Entry: {
+            b == 63 => Term;    // '?'
+            b == 35 => Term;    // '#'
+            b == 37 => Percent; // '%'
+            _       => Normal;
+        }
+
+        Term: {
+            _ => return 2;
+        }
+
+        Normal: {
+            let bad = call is_illegal_uri_char(b);
+            bad != 0 => Err;
+            *out_char <- b;
+            *out_adv  <- 1;
+            _ => return 0;
+        }
+
+        Percent: {
+            rem < 3 => Err;
+            let c1 = *(cur_p + 1);
+            let c2 = *(cur_p + 2);
+            let v1 = call hex_to_val(c1);
+            let v2 = call hex_to_val(c2);
+            v1 > 15 => Err;
+            v2 > 15 => Err;
+            let val = (v1 * 16) + v2;
+            let byte_val = cast(u8) val;
+            let bad_dec = call is_illegal_uri_char(byte_val);
+            bad_dec != 0 => Err;
+            *out_char <- byte_val;
+            *out_adv  <- 3;
+            _ => return 0;
+        }
+
+        Err: {
+            _ => return 1;
+        }
+    }
+}
+
+// 4. URL 完全デコードマシン (48 lines <= 50)
+machine uri_decode_full(src: *u8, src_len: u32, dst: *u8, max_len: u32) -> u32 {
+    flow {
+        reg in_pos:  u32 = 0;
+        reg out_pos: u32 = 0;
+        wire is_eof = in_pos == src_len;
+        wire is_full = out_pos >= (max_len - 1);
+    }
+
+    states {
+        Entry: {
+            src_len > 1024 => Err; // AC-10
+            let first_b = *src;
+            first_b != 47  => Err; // 先頭スラッシュなし (AC-11)
+            _ => Loop;
+        }
+
+        Loop: {
+            is_eof  => Done;
+            is_full => Err;
+            _       => Step;
+        }
+
+        Step: {
+            let out_p = dst + out_pos;
+            let adv_p = cast(*u32) (dst + 300);
+            let res = call uri_decode_step(src, in_pos, src_len, out_p, adv_p);
+            res == 1 => Err;
+            res == 2 => Done; // クエリ終端
+            let adv = *adv_p;
+            _ => Loop [ in_pos <= in_pos + adv, out_pos <= out_pos + 1 ];
+        }
+
+        Done: {
+            let term_p = dst + out_pos;
+            *term_p <- 0;
+            _ => return out_pos;
+        }
+
+        Err: {
+            _ => return 4294967295;
+        }
+    }
+}
+
+// 5a. ドットセグメント検証マシン (32 lines <= 50)
+machine path_check_dot_segment(dot_count: u32, seg_len: u32) -> u32 {
+    flow {
+        wire all_dots = dot_count == seg_len;
+    }
+
+    states {
+        Entry: {
+            seg_len == 0 => Good;
+            all_dots     => CheckDots;
+            _            => Good;
+        }
+
+        CheckDots: {
+            dot_count == 1 => Good;         // "." はカレントディレクトリ
+            dot_count == 2 => BadTraversal; // ".." は Anti-Coercion で即座に 400 (AC-01, AC-02)
+            _              => BadSyntax;    // "..." 以上は即座に 400 (AC-09)
+        }
+
+        BadTraversal: {
+            _ => return 1;
+        }
+
+        BadSyntax: {
+            _ => return 1;
+        }
+
+        Good: {
+            _ => return 0;
+        }
+    }
+}
+
+// 5b. 隠しファイルおよびドットセグメント総合判定マシン (24 lines <= 50)
+machine path_check_hidden(seg_first: u8, dot_count: u32, seg_len: u32) -> u32 {
+    flow {}
+
+    states {
+        Entry: {
+            seg_first == 46 => CheckHidden;
+            _               => CheckDots;
+        }
+
+        CheckHidden: {
+            dot_count != seg_len => RetForbidden;
+            _                    => CheckDots;
+        }
+
+        CheckDots: {
+            let r = call path_check_dot_segment(dot_count, seg_len);
+            _ => return r;
+        }
+
+        RetForbidden: {
+            _ => return 2; // 403 Forbidden
+        }
+    }
+}
+
+// 6. パスセグメント走査・Anti-Coercion マシン (46 lines <= 50)
+machine path_validate_segments(buf: *u8, len: u32) -> u32 {
+    flow {
+        reg pos: u32 = 0;
+        reg seg_len: u32 = 0;
+        reg dot_count: u32 = 0;
+        reg seg_first: u8 = 0;
+        wire is_eof = pos == len;
+        wire cur_p = buf + pos;
+        wire b = *cur_p;
+        wire is_slash = b == 47;
+        wire is_dot = b == 46;
+    }
+    states {
+        Entry: {
+            len == 0 => Good;
+            _ => Loop;
+        }
+        Loop: {
+            is_eof   => EndOfPath;
+            is_slash => OnSlash;
+            is_dot   => OnDot;
+            _        => OnNorm;
+        }
+        OnDot: {
+            seg_len == 0 => DotFirst;
+            _ => Loop [ pos <= pos + 1, seg_len <= seg_len + 1, dot_count <= dot_count + 1 ];
+        }
+        DotFirst: {
+            _ => Loop [ pos <= pos + 1, seg_len <= 1, dot_count <= 1, seg_first <= 46 ];
+        }
+        OnNorm: {
+            seg_len == 0 => NormFirst;
+            _ => Loop [ pos <= pos + 1, seg_len <= seg_len + 1 ];
+        }
+        NormFirst: {
+            _ => Loop [ pos <= pos + 1, seg_len <= 1, dot_count <= 0, seg_first <= b ];
+        }
+        OnSlash: {
+            let r = call path_check_hidden(seg_first, dot_count, seg_len);
+            r != 0 => ReturnErr [ seg_len <= r ];
+            _ => Loop [ pos <= pos + 1, seg_len <= 0, dot_count <= 0, seg_first <= 0 ];
+        }
+        EndOfPath: {
+            let r = call path_check_hidden(seg_first, dot_count, seg_len);
+            _ => return r;
+        }
+        ReturnErr: { _ => return seg_len; }
+        Good:      { _ => return 0; }
+    }
+}
+
+// 7. 相対パス抽出マシン (42 lines <= 50)
+machine path_extract_clean(src: *u8, len: u32, dst: *u8) -> u32 {
+    flow {
+        reg in_pos:  u32 = 0;
+        reg out_pos: u32 = 0;
+        wire is_eof = in_pos == len;
+        wire cur_p = src + in_pos;
+        wire b = *cur_p;
+        wire is_slash = b == 47;
+    }
+
+    states {
+        Entry: {
+            len == 0 => FinishEmpty;
+            _ => SkipLeadingSlashes;
+        }
+
+        SkipLeadingSlashes: {
+            is_eof   => FinishEmpty;
+            is_slash => SkipLeadingSlashes [ in_pos <= in_pos + 1 ];
+            _        => CopyLoop;
+        }
+
+        CopyLoop: {
+            is_eof => Finish;
+            _      => CopyChar;
+        }
+
+        CopyChar: {
+            let out_p = dst + out_pos;
+            *out_p <- b;
+            _ => CopyLoop [ in_pos <= in_pos + 1, out_pos <= out_pos + 1 ];
+        }
+
+        Finish: {
+            let term_p = dst + out_pos;
+            *term_p <- 0;
+            _ => return out_pos;
+        }
+
+        FinishEmpty: {
+            let term_p = dst + 0;
+            *term_p <- 0;
+            _ => return 0;
+        }
+    }
+}
+
+// 8a. .txt / .png 拡張子判定サブマシン (28 lines <= 50)
+machine static_check_txt_png(b1: u8, b2: u8, b3: u8) -> u32 {
+    flow {}
+
+    states {
+        Entry: {
+            b1 == 116 => CheckTxt; // 't'
+            b1 == 112 => CheckPng; // 'p'
+            _         => RetDefault;
+        }
+
+        CheckTxt: {
+            b2 != 120 => RetDefault;
+            b3 != 116 => RetDefault;
+            _         => return 6; // .txt
+        }
+
+        CheckPng: {
+            b2 != 110 => RetDefault;
+            b3 != 103 => RetDefault;
+            _         => return 5; // .png
+        }
+
+        RetDefault: {
+            _ => return 0;
+        }
+    }
+}
+
+// 8b. 4文字拡張子判定サブマシン (38 lines <= 50)
+machine static_mime_lookup_4(path: *u8, len: u32) -> u32 {
+    flow {
+        wire p4 = path + (len - 4);
+    }
+
+    states {
+        Entry: {
+            let b0 = *p4;
+            b0 == 46 => CheckExt4; // '.'
+            let b1 = *(p4 + 1);
+            b1 == 46 => CheckJs;   // ".js"
+            _        => RetDefault;
+        }
+
+        CheckExt4: {
+            let b1 = *(p4 + 1);
+            let b2 = *(p4 + 2);
+            let b3 = *(p4 + 3);
+            b1 == 99 => CheckCss; // 'c'
+            let tp = call static_check_txt_png(b1, b2, b3);
+            _ => return tp;
+        }
+
+        CheckCss: {
+            let b2 = *(p4 + 2);
+            let b3 = *(p4 + 3);
+            b2 != 115 => RetDefault;
+            b3 != 115 => RetDefault;
+            _         => return 2; // .css
+        }
+
+        CheckJs: {
+            let b2 = *(p4 + 2);
+            let b3 = *(p4 + 3);
+            b2 != 106 => RetDefault;
+            b3 != 115 => RetDefault;
+            _         => return 3; // .js
+        }
+
+        RetDefault: {
+            _ => return 0;
+        }
+    }
+}
+
+// 8c. 5文字拡張子判定サブマシン (38 lines <= 50)
+machine static_mime_lookup_5(path: *u8, len: u32) -> u32 {
+    flow {
+        wire p5 = path + (len - 5);
+    }
+
+    states {
+        Entry: {
+            let b0 = *p5;
+            b0 == 46 => Check5_ext;
+            _        => RetDefault;
+        }
+
+        Check5_ext: {
+            let b1 = *(p5 + 1);
+            b1 == 104 => CheckHtml; // 'h'
+            b1 == 106 => CheckJson; // 'j'
+            _        => RetDefault;
+        }
+
+        CheckHtml: {
+            let b2 = *(p5 + 2);
+            let b3 = *(p5 + 3);
+            let b4 = *(p5 + 4);
+            b2 != 116 => RetDefault;
+            b3 != 109 => RetDefault;
+            b4 != 108 => RetDefault;
+            _         => return 1; // .html
+        }
+
+        CheckJson: {
+            let b2 = *(p5 + 2);
+            let b3 = *(p5 + 3);
+            let b4 = *(p5 + 4);
+            b2 != 115 => RetDefault;
+            b3 != 111 => RetDefault;
+            b4 != 110 => RetDefault;
+            _         => return 4; // .json
+        }
+
+        RetDefault: {
+            _ => return 0;
+        }
+    }
+}
+
+// 8d. MIME タイプ判定メインマシン (30 lines <= 50)
+machine static_mime_lookup(path: *u8, len: u32) -> u32 {
+    flow {
+        reg m_res: u32 = 0;
+    }
+
+    states {
+        Entry: {
+            len >= 5 => Check5;
+            len >= 4 => Check4;
+            _        => RetDefault;
+        }
+
+        Check5: {
+            let m5 = call static_mime_lookup_5(path, len);
+            m5 != 0 => RetM5 [ m_res <= m5 ];
+            _       => Check4;
+        }
+
+        Check4: {
+            let m4 = call static_mime_lookup_4(path, len);
+            _ => return m4;
+        }
+
+        RetM5: {
+            _ => return m_res;
+        }
+
+        RetDefault: {
+            _ => return 0;
+        }
+    }
+}
+
+// 9. ドキュメントルートオープンマシン (35 lines <= 50)
+machine static_open_docroot(scratch: *u8) -> i32 {
+    flow {
+        reg root_fd: i32 = 0;
+    }
+
+    states {
+        Entry: {
+            let p1 = cast(*u8) "/var/www/html";
+            let fd1 = call syscall(2, cast(i64) p1, 589824, 0, 0, 0, 0); // SYS_open (O_RDONLY|O_DIRECTORY|O_CLOEXEC)
+            fd1 >= 0 => RetFd [ root_fd <= cast(i32) fd1 ];
+            _        => TryPublic;
+        }
+
+        TryPublic: {
+            let p2 = cast(*u8) "./public";
+            let fd2 = call syscall(2, cast(i64) p2, 589824, 0, 0, 0, 0);
+            fd2 >= 0 => RetFd [ root_fd <= cast(i32) fd2 ];
+            _        => TryCurrent;
+        }
+
+        TryCurrent: {
+            let p3 = cast(*u8) ".";
+            let fd3 = call syscall(2, cast(i64) p3, 589824, 0, 0, 0, 0);
+            _ => RetFd [ root_fd <= cast(i32) fd3 ];
+        }
+
+        RetFd: {
+            _ => return root_fd;
+        }
+    }
+}
+
+// 10. ファイル openat マシン (14 lines <= 50)
+machine static_open_file(root_fd: i32, rel_path: *u8) -> i32 {
+    flow {}
+
+    states {
+        Entry: {
+            // SYS_openat (257), O_RDONLY|O_NOFOLLOW|O_CLOEXEC (655360)
+            let res = call syscall(257, cast(i64) root_fd, cast(i64) rel_path, 655360, 0, 0, 0);
+            _ => return cast(i32) res;
+        }
+    }
+}
+
+// 11. 記述子クローズマシン (16 lines <= 50)
+machine static_close_fd(fd: i32) -> void {
+    flow {}
+
+    states {
+        Entry: {
+            fd < 0 => Done;
+            let _ = call syscall(3, cast(i64) fd, 0, 0, 0, 0, 0); // SYS_close
+            _ => Done;
+        }
+
+        Done: {
+            _ => return;
+        }
+    }
+}
+
+// 12. ファイル読み込みマシン (25 lines <= 50)
+machine static_fetch_file(root_fd: i32, rel_path: *u8, file_buf: *u8, max_len: u32) -> i32 {
+    flow {
+        reg cur_fd: i32 = 0;
+    }
+
+    states {
+        Entry: {
+            let fd = call static_open_file(root_fd, rel_path);
+            fd < 0 => RetErr [ cur_fd <= fd ];
+            _      => ReadFile [ cur_fd <= fd ];
+        }
+
+        ReadFile: {
+            let n_read = call syscall(0, cast(i64) cur_fd, cast(i64) file_buf, cast(i64) max_len, 0, 0, 0);
+            let _ = call static_close_fd(cur_fd);
+            _ => return cast(i32) n_read;
+        }
+
+        RetErr: {
+            _ => return cur_fd;
+        }
+    }
+}
+
+// 13a. MIME ヘッダ書き出しサブマシン (30 lines <= 50)
+machine static_write_mime_header_part1(dst: *u8, mime_id: u32) -> u32 {
+    flow {}
+
+    states {
+        Entry: {
+            mime_id == 1 => MimeHtml;
+            mime_id == 2 => MimeCss;
+            mime_id == 3 => MimeJs;
+            _            => RetZero;
+        }
+
+        MimeHtml: {
+            let s = cast(*u8) "Content-Type: text/html; charset=utf-8\r\n";
+            let l = call resp_copy_bytes(dst, s, 40);
+            _ => return l;
+        }
+
+        MimeCss: {
+            let s = cast(*u8) "Content-Type: text/css; charset=utf-8\r\n";
+            let l = call resp_copy_bytes(dst, s, 39);
+            _ => return l;
+        }
+
+        MimeJs: {
+            let s = cast(*u8) "Content-Type: application/javascript; charset=utf-8\r\n";
+            let l = call resp_copy_bytes(dst, s, 53);
+            _ => return l;
+        }
+
+        RetZero: {
+            _ => return 0;
+        }
+    }
+}
+
+// 13b. MIME ヘッダ書き出しメインマシン (38 lines <= 50)
+machine static_write_mime_header(dst: *u8, mime_id: u32) -> u32 {
+    flow {}
+
+    states {
+        Entry: {
+            mime_id <= 3 => Part1;
+            mime_id == 4 => MimeJson;
+            mime_id == 5 => MimePng;
+            mime_id == 6 => MimeTxt;
+            _            => MimeOctet;
+        }
+
+        Part1: {
+            let l1 = call static_write_mime_header_part1(dst, mime_id);
+            _ => return l1;
+        }
+
+        MimeJson: {
+            let s = cast(*u8) "Content-Type: application/json\r\n";
+            let l = call resp_copy_bytes(dst, s, 32);
+            _ => return l;
+        }
+
+        MimePng: {
+            let s = cast(*u8) "Content-Type: image/png\r\n";
+            let l = call resp_copy_bytes(dst, s, 25);
+            _ => return l;
+        }
+
+        MimeTxt: {
+            let s = cast(*u8) "Content-Type: text/plain; charset=utf-8\r\n";
+            let l = call resp_copy_bytes(dst, s, 41);
+            _ => return l;
+        }
+
+        MimeOctet: {
+            let s = cast(*u8) "Content-Type: application/octet-stream\r\n";
+            let l = call resp_copy_bytes(dst, s, 40);
+            _ => return l;
+        }
+    }
+}
+
+// 14. エラーレスポンス書き出しマシン (48 lines <= 50)
+machine static_write_error(conn: *HttpConn, code: u32) -> void {
+    flow {
+        wire tx = conn.tx_buf;
+    }
+
+    states {
+        Entry: {
+            code == 400 => Write400;
+            code == 403 => Write403;
+            code == 404 => Write404;
+            code == 405 => Write405;
+            _           => Write500;
+        }
+
+        Write400: {
+            let s = cast(*u8) "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 16\r\n\r\n400 Bad Request\n";
+            let _ = call resp_copy_bytes(tx, s, 90);
+            conn.tx_len <- 90;
+            _ => return;
+        }
+
+        Write403: {
+            let s = cast(*u8) "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 14\r\n\r\n403 Forbidden\n";
+            let _ = call resp_copy_bytes(tx, s, 86);
+            conn.tx_len <- 86;
+            _ => return;
+        }
+
+        Write404: {
+            let s = cast(*u8) "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 14\r\n\r\n404 Not Found\n";
+            let _ = call resp_copy_bytes(tx, s, 86);
+            conn.tx_len <- 86;
+            _ => return;
+        }
+
+        Write405: {
+            let s = cast(*u8) "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 23\r\n\r\n405 Method Not Allowed\n";
+            let _ = call resp_copy_bytes(tx, s, 104);
+            conn.tx_len <- 104;
+            _ => return;
+        }
+
+        Write500: {
+            let s = cast(*u8) "HTTP/1.1 500 Internal Error\r\nContent-Type: text/plain\r\nContent-Length: 15\r\n\r\n500 Server Err\n";
+            let _ = call resp_copy_bytes(tx, s, 90);
+            conn.tx_len <- 90;
+            _ => return;
+        }
+    }
+}
+
+// 15. 200 OK ヘッダ構築マシン (45 lines <= 50)
+machine static_build_200_header(dst: *u8, file_len: u32, mime_id: u32) -> u32 {
+    flow {
+        reg cur_off: u32 = 0;
+    }
+
+    states {
+        Entry: {
+            let s_ok = cast(*u8) "HTTP/1.1 200 OK\r\n";
+            let l_ok = call resp_copy_bytes(dst, s_ok, 17);
+            _ => WriteMime [ cur_off <= 17 ];
+        }
+
+        WriteMime: {
+            let m_ptr = dst + cur_off;
+            let m_len = call static_write_mime_header(m_ptr, mime_id);
+            _ => WriteClPrefix [ cur_off <= cur_off + m_len ];
+        }
+
+        WriteClPrefix: {
+            let cl_p = dst + cur_off;
+            let s_cl = cast(*u8) "Content-Length: ";
+            let l_cl = call resp_copy_bytes(cl_p, s_cl, 16);
+            _ => WriteClDigits [ cur_off <= cur_off + 16 ];
+        }
+
+        WriteClDigits: {
+            let d_p = dst + cur_off;
+            let d_len = call resp_write_u32_ascii(d_p, file_len);
+            _ => WriteEndHdr [ cur_off <= cur_off + d_len ];
+        }
+
+        WriteEndHdr: {
+            let e_p = dst + cur_off;
+            let s_end = cast(*u8) "\r\n\r\n";
+            let l_end = call resp_copy_bytes(e_p, s_end, 4);
+            _ => Done [ cur_off <= cur_off + 4 ];
+        }
+
+        Done: {
+            _ => return cur_off;
+        }
+    }
+}
+
+// 16. 静的ファイル読み込み＆送信構築マシン (48 lines <= 50)
+machine static_read_and_serve(conn: *HttpConn, rel_buf: *u8, rel_len: u32) -> void {
+    flow {
+        reg r_res: i32 = 0;
+        reg r_len: u32 = 0;
+        wire tx = conn.tx_buf;
+        wire file_buf = tx + 512;
+    }
+
+    states {
+        Entry: {
+            let root_fd = call static_open_docroot(tx);
+            root_fd < 0 => Err500;
+            let read_res = call static_fetch_file(root_fd, rel_buf, file_buf, 3500);
+            let _ = call static_close_fd(root_fd);
+            read_res < 0 => CheckOpenErr [ r_res <= read_res ];
+            _ => EmitSuccess [ r_res <= read_res, r_len <= rel_len ];
+        }
+
+        CheckOpenErr: {
+            r_res == -40 => Err403; // ELOOP (AC-17)
+            r_res == -13 => Err403; // EACCES
+            _            => Err404; // ENOENT (-2) (AC-14)
+        }
+
+        EmitSuccess: {
+            let mime_id = call static_mime_lookup(rel_buf, r_len);
+            let u_read = cast(u32) r_res;
+            let hdr_len = call static_build_200_header(tx, u_read, mime_id);
+            let _ = call resp_copy_bytes(tx + hdr_len, file_buf, u_read);
+            conn.tx_len <- hdr_len + u_read;
+            _ => return;
+        }
+
+        Err403: { let _ = call static_write_error(conn, 403); _ => return; }
+        Err404: { let _ = call static_write_error(conn, 404); _ => return; }
+        Err500: { let _ = call static_write_error(conn, 500); _ => return; }
+    }
+}
+
+// 17. 静的ファイル配信フロントマシン (45 lines <= 50)
+machine http_serve_static(conn: *HttpConn) -> void {
+    flow {
+        reg d_len: u32 = 0;
+        reg r_len: u32 = 0;
+        wire tx = conn.tx_buf;
+        wire u_ptr = conn.req.uri_ptr;
+        wire u_len = conn.req.uri_len;
+        wire method = conn.req.method;
+
+        wire dec_buf = tx + 0;
+        wire rel_buf = tx + 256;
+    }
+
+    states {
+        Entry: {
+            method == 1 => Decode; // GET
+            method == 3 => Decode; // HEAD
+            _           => Err405; // その他は 405
+        }
+
+        Decode: {
+            let dec_len = call uri_decode_full(u_ptr, u_len, dec_buf, 256);
+            dec_len == 4294967295 => Err400; // 不正文字、過長等 (AC-03, 07, 08, 10, 11, 12, 13)
+            _ => Validate [ d_len <= dec_len ];
+        }
+
+        Validate: {
+            let val_res = call path_validate_segments(dec_buf, d_len);
+            val_res == 1 => Err400; // .. トラバーサル、ドット連続異常 (AC-01, 02, 04, 05, 09)
+            val_res == 2 => Err403; // 隠しファイル
+            _ => Extract;
+        }
+
+        Extract: {
+            let rel_len = call path_extract_clean(dec_buf, d_len, rel_buf);
+            rel_len == 0 => Err404;
+            _ => Serve [ r_len <= rel_len ];
+        }
+
+        Serve: {
+            let _ = call static_read_and_serve(conn, rel_buf, r_len);
+            _ => return;
+        }
+
+        Err400: { let _ = call static_write_error(conn, 400); _ => return; }
+        Err403: { let _ = call static_write_error(conn, 403); _ => return; }
+        Err404: { let _ = call static_write_error(conn, 404); _ => return; }
+        Err405: { let _ = call static_write_error(conn, 405); _ => return; }
+    }
+}

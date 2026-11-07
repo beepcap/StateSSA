@@ -1,0 +1,673 @@
+// ============================================================================
+// StateSSA HTTP/1.1 Streaming Parser Implementation
+// ゼロコピー・ゼロアロケーション・ストリーミング有限状態機械 (FSM)
+// ============================================================================
+
+include "http_types.ssa";
+
+// HTTP リクエストストリーミングパーサマシン
+// 戻り値:
+//   1: 完全な 1 リクエストの解析完了 (PARSE_OK)
+//   0: データ不足、パケット継続待ち (NEED_MORE_DATA)
+//   2: プロトコル構文違反 (PARSE_ERROR)
+machine http_parse_request(req: *HttpRequest, in_buf: *u8, in_len: u32) -> u32 {
+    flow {
+        reg pos:       u32 = 0;
+        reg cur_state: u32 = 0; // 次回再開用ステート ID
+
+        wire is_eof    = pos == in_len;
+        wire cur_ptr   = in_buf + pos;
+        wire b         = *cur_ptr;
+        wire next_pos  = pos + 1;
+    }
+
+    states {
+        Entry: {
+            let st = req.state;
+            st == 0  => ReqStart;
+            st == 11 => Method_G;
+            st == 12 => Method_GE;
+            st == 13 => Method_GET;
+            st == 21 => Method_P;
+            st == 22 => Method_PO;
+            st == 23 => Method_POS;
+            st == 24 => Method_POST;
+            st == 31 => Method_H;
+            st == 32 => Method_HE;
+            st == 33 => Method_HEA;
+            st == 34 => Method_HEAD;
+            st == 40 => SkipSpacesBeforeURI;
+            st == 41 => ReadURILoop;
+            st == 50 => SkipSpacesBeforeVer;
+            st == 51 => Ver_H;
+            st == 52 => Ver_HT;
+            st == 53 => Ver_HTT;
+            st == 54 => Ver_HTTP;
+            st == 55 => Ver_Slash;
+            st == 56 => Ver_Major;
+            st == 57 => Ver_Dot;
+            st == 58 => Ver_Done;
+            st == 59 => Ver_CR;
+            st == 60 => HeaderLineStart;
+            st == 61 => HeaderEmpty_CR;
+            st == 62 => Hdr_C;
+            st == 63 => Hdr_CO;
+            st == 64 => Hdr_CON;
+            st == 65 => Hdr_CONT;
+            st == 161 => Hdr_CL_E;
+            st == 162 => Hdr_CL_N;
+            st == 163 => Hdr_CL_T;
+            st == 164 => Hdr_CL_Dash;
+            st == 165 => Hdr_CL_L;
+            st == 166 => Hdr_CL_E2;
+            st == 167 => Hdr_CL_N2;
+            st == 168 => Hdr_CL_G;
+            st == 169 => Hdr_CL_T2;
+            st == 170 => Hdr_CL_H;
+            st == 66 => Hdr_CONN;
+            st == 181 => Hdr_CN_E;
+            st == 182 => Hdr_CN_C;
+            st == 183 => Hdr_CN_T;
+            st == 184 => Hdr_CN_I;
+            st == 185 => Hdr_CN_O;
+            st == 186 => Hdr_CN_N;
+            st == 69 => Hdr_SkipName;
+            st == 70 => HeaderColon;
+            st == 71 => ParseCLValue;
+            st == 72 => EndCL_CR;
+            st == 74 => SkipValue;
+            st == 76 => SkipVal_CR;
+            st == 80 => Conn_C;
+            st == 81 => Conn_L;
+            st == 82 => Conn_O;
+            st == 83 => Conn_S;
+            st == 84 => Conn_E;
+            st == 90 => ReadBodyLoop;
+            _        => ReqStart;
+        }
+
+        // --------------------------------------------------------------------
+        // 1. Request Line (Method)
+        // --------------------------------------------------------------------
+        ReqStart: {
+            is_eof  => NeedMore [ cur_state <= 0 ];
+            b == 13 => SkipCRLF [ pos <= next_pos ];
+            b == 10 => SkipCRLF [ pos <= next_pos ];
+            b == 71 => Method_G [ pos <= next_pos ]; // 'G'
+            b == 80 => Method_P [ pos <= next_pos ]; // 'P'
+            b == 72 => Method_H [ pos <= next_pos ]; // 'H'
+            _       => Error;
+        }
+
+        SkipCRLF: {
+            _ => ReqStart;
+        }
+
+        // GET パース
+        Method_G: {
+            is_eof  => NeedMore [ cur_state <= 11 ];
+            b == 69 => Method_GE [ pos <= next_pos ]; // 'E'
+            _       => Error;
+        }
+
+        Method_GE: {
+            is_eof  => NeedMore [ cur_state <= 12 ];
+            b == 84 => Method_GET [ pos <= next_pos ]; // 'T'
+            _       => Error;
+        }
+
+        Method_GET: {
+            is_eof  => NeedMore [ cur_state <= 13 ];
+            b == 32 => Method_Done_GET [ pos <= next_pos ]; // ' '
+            _       => Error;
+        }
+
+        Method_Done_GET: {
+            req.method <- 1;
+            _ => SkipSpacesBeforeURI;
+        }
+
+        // POST パース
+        Method_P: {
+            is_eof  => NeedMore [ cur_state <= 21 ];
+            b == 79 => Method_PO [ pos <= next_pos ]; // 'O'
+            _       => Error;
+        }
+
+        Method_PO: {
+            is_eof  => NeedMore [ cur_state <= 22 ];
+            b == 83 => Method_POS [ pos <= next_pos ]; // 'S'
+            _       => Error;
+        }
+
+        Method_POS: {
+            is_eof  => NeedMore [ cur_state <= 23 ];
+            b == 84 => Method_POST [ pos <= next_pos ]; // 'T'
+            _       => Error;
+        }
+
+        Method_POST: {
+            is_eof  => NeedMore [ cur_state <= 24 ];
+            b == 32 => Method_Done_POST [ pos <= next_pos ]; // ' '
+            _       => Error;
+        }
+
+        Method_Done_POST: {
+            req.method <- 2;
+            _ => SkipSpacesBeforeURI;
+        }
+
+        // HEAD パース
+        Method_H: {
+            is_eof  => NeedMore [ cur_state <= 31 ];
+            b == 69 => Method_HE [ pos <= next_pos ]; // 'E'
+            _       => Error;
+        }
+
+        Method_HE: {
+            is_eof  => NeedMore [ cur_state <= 32 ];
+            b == 65 => Method_HEA [ pos <= next_pos ]; // 'A'
+            _       => Error;
+        }
+
+        Method_HEA: {
+            is_eof  => NeedMore [ cur_state <= 33 ];
+            b == 68 => Method_HEAD [ pos <= next_pos ]; // 'D'
+            _       => Error;
+        }
+
+        Method_HEAD: {
+            is_eof  => NeedMore [ cur_state <= 34 ];
+            b == 32 => Method_Done_HEAD [ pos <= next_pos ]; // ' '
+            _       => Error;
+        }
+
+        Method_Done_HEAD: {
+            req.method <- 3;
+            _ => SkipSpacesBeforeURI;
+        }
+
+        // --------------------------------------------------------------------
+        // 2. Request Line (URI)
+        // --------------------------------------------------------------------
+        SkipSpacesBeforeURI: {
+            is_eof  => NeedMore [ cur_state <= 40 ];
+            b == 32 => SkipSpacesBeforeURI [ pos <= next_pos ];
+            _       => MarkURIStart;
+        }
+
+        MarkURIStart: {
+            req.uri_ptr <- cur_ptr;
+            req.uri_len <- 0;
+            _ => ReadURILoop;
+        }
+
+        ReadURILoop: {
+            is_eof  => NeedMore [ cur_state <= 41 ];
+            b == 32 => SkipSpacesBeforeVer [ pos <= next_pos ];
+            b == 13 => Error;
+            b == 10 => Error;
+            _       => IncURI;
+        }
+
+        IncURI: {
+            req.uri_len <- req.uri_len + 1;
+            _ => ReadURILoop [ pos <= next_pos ];
+        }
+
+        // --------------------------------------------------------------------
+        // 3. Request Line (Version: HTTP/1.1 or HTTP/1.0)
+        // --------------------------------------------------------------------
+        SkipSpacesBeforeVer: {
+            is_eof  => NeedMore [ cur_state <= 50 ];
+            b == 32 => SkipSpacesBeforeVer [ pos <= next_pos ];
+            b == 72 => Ver_H [ pos <= next_pos ]; // 'H'
+            _       => Error;
+        }
+
+        Ver_H: {
+            is_eof  => NeedMore [ cur_state <= 51 ];
+            b == 84 => Ver_HT [ pos <= next_pos ]; // 'T'
+            _       => Error;
+        }
+
+        Ver_HT: {
+            is_eof  => NeedMore [ cur_state <= 52 ];
+            b == 84 => Ver_HTT [ pos <= next_pos ]; // 'T'
+            _       => Error;
+        }
+
+        Ver_HTT: {
+            is_eof  => NeedMore [ cur_state <= 53 ];
+            b == 80 => Ver_HTTP [ pos <= next_pos ]; // 'P'
+            _       => Error;
+        }
+
+        Ver_HTTP: {
+            is_eof  => NeedMore [ cur_state <= 54 ];
+            b == 47 => Ver_Slash [ pos <= next_pos ]; // '/'
+            _       => Error;
+        }
+
+        Ver_Slash: {
+            is_eof  => NeedMore [ cur_state <= 55 ];
+            b == 49 => Ver_Major [ pos <= next_pos ]; // '1'
+            _       => Error;
+        }
+
+        Ver_Major: {
+            is_eof  => NeedMore [ cur_state <= 56 ];
+            b == 46 => Ver_Dot [ pos <= next_pos ]; // '.'
+            _       => Error;
+        }
+
+        Ver_Dot: {
+            is_eof  => NeedMore [ cur_state <= 57 ];
+            b == 49 => Ver_Set11 [ pos <= next_pos ]; // '1' -> HTTP/1.1
+            b == 48 => Ver_Set10 [ pos <= next_pos ]; // '0' -> HTTP/1.0
+            _       => Error;
+        }
+
+        Ver_Set11: {
+            req.version_minor <- 1;
+            _ => Ver_Done;
+        }
+
+        Ver_Set10: {
+            req.version_minor <- 0;
+            req.keep_alive    <- 0; // HTTP/1.0 はデフォルト close
+            _ => Ver_Done;
+        }
+
+        Ver_Done: {
+            is_eof  => NeedMore [ cur_state <= 58 ];
+            b == 13 => Ver_CR [ pos <= next_pos ];
+            b == 10 => HeaderLineStart [ pos <= next_pos ];
+            _       => Error;
+        }
+
+        Ver_CR: {
+            is_eof  => NeedMore [ cur_state <= 59 ];
+            b == 10 => HeaderLineStart [ pos <= next_pos ];
+            _       => Error;
+        }
+
+        // --------------------------------------------------------------------
+        // 4. Headers
+        // --------------------------------------------------------------------
+        HeaderLineStart: {
+            is_eof  => NeedMore [ cur_state <= 60 ];
+            b == 13 => HeaderEmpty_CR [ pos <= next_pos ];
+            b == 10 => CheckBodyEnd [ pos <= next_pos ];
+            // 先頭文字判定 ('c' または 'C')
+            b == 67 => Hdr_C [ pos <= next_pos ]; // 'C'
+            b == 99 => Hdr_C [ pos <= next_pos ]; // 'c'
+            _       => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        HeaderEmpty_CR: {
+            is_eof  => NeedMore [ cur_state <= 61 ];
+            b == 10 => CheckBodyEnd [ pos <= next_pos ];
+            _       => Error;
+        }
+
+        // 'C' / 'c' の後続
+        Hdr_C: {
+            is_eof  => NeedMore [ cur_state <= 62 ];
+            b == 111 => Hdr_CO [ pos <= next_pos ]; // 'o'
+            b == 79  => Hdr_CO [ pos <= next_pos ]; // 'O'
+            b == 58  => HeaderColon [ pos <= next_pos ]; // ':'
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CO: {
+            is_eof  => NeedMore [ cur_state <= 63 ];
+            b == 110 => Hdr_CON [ pos <= next_pos ]; // 'n'
+            b == 78  => Hdr_CON [ pos <= next_pos ]; // 'N'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CON: {
+            is_eof  => NeedMore [ cur_state <= 64 ];
+            b == 116 => Hdr_CONT [ pos <= next_pos ]; // 't' -> content-length
+            b == 84  => Hdr_CONT [ pos <= next_pos ]; // 'T'
+            b == 110 => Hdr_CONN [ pos <= next_pos ]; // 'n' -> connection
+            b == 78  => Hdr_CONN [ pos <= next_pos ]; // 'N'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        // --- Content-Length パス ---
+        Hdr_CONT: {
+            is_eof  => NeedMore [ cur_state <= 65 ];
+            b == 101 => Hdr_CL_E [ pos <= next_pos ]; // 'e'
+            b == 69  => Hdr_CL_E [ pos <= next_pos ]; // 'E'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CL_E: {
+            is_eof  => NeedMore [ cur_state <= 161 ];
+            b == 110 => Hdr_CL_N [ pos <= next_pos ]; // 'n'
+            b == 78  => Hdr_CL_N [ pos <= next_pos ]; // 'N'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CL_N: {
+            is_eof  => NeedMore [ cur_state <= 162 ];
+            b == 116 => Hdr_CL_T [ pos <= next_pos ]; // 't'
+            b == 84  => Hdr_CL_T [ pos <= next_pos ]; // 'T'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CL_T: {
+            is_eof  => NeedMore [ cur_state <= 163 ];
+            b == 45  => Hdr_CL_Dash [ pos <= next_pos ]; // '-'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CL_Dash: {
+            is_eof  => NeedMore [ cur_state <= 164 ];
+            b == 108 => Hdr_CL_L [ pos <= next_pos ]; // 'l'
+            b == 76  => Hdr_CL_L [ pos <= next_pos ]; // 'L'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CL_L: {
+            is_eof  => NeedMore [ cur_state <= 165 ];
+            b == 101 => Hdr_CL_E2 [ pos <= next_pos ]; // 'e'
+            b == 69  => Hdr_CL_E2 [ pos <= next_pos ]; // 'E'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CL_E2: {
+            is_eof  => NeedMore [ cur_state <= 166 ];
+            b == 110 => Hdr_CL_N2 [ pos <= next_pos ]; // 'n'
+            b == 78  => Hdr_CL_N2 [ pos <= next_pos ]; // 'N'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CL_N2: {
+            is_eof  => NeedMore [ cur_state <= 167 ];
+            b == 103 => Hdr_CL_G [ pos <= next_pos ]; // 'g'
+            b == 71  => Hdr_CL_G [ pos <= next_pos ]; // 'G'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CL_G: {
+            is_eof  => NeedMore [ cur_state <= 168 ];
+            b == 116 => Hdr_CL_T2 [ pos <= next_pos ]; // 't'
+            b == 84  => Hdr_CL_T2 [ pos <= next_pos ]; // 'T'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CL_T2: {
+            is_eof  => NeedMore [ cur_state <= 169 ];
+            b == 104 => Hdr_CL_H [ pos <= next_pos ]; // 'h'
+            b == 72  => Hdr_CL_H [ pos <= next_pos ]; // 'H'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CL_H: {
+            is_eof  => NeedMore [ cur_state <= 170 ];
+            b == 58  => ParseCL_OWS [ pos <= next_pos ]; // ':' -> Content-Length 確定!
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        // --- Connection パス ---
+        Hdr_CONN: {
+            is_eof  => NeedMore [ cur_state <= 66 ];
+            b == 101 => Hdr_CN_E [ pos <= next_pos ]; // 'e'
+            b == 69  => Hdr_CN_E [ pos <= next_pos ]; // 'E'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CN_E: {
+            is_eof  => NeedMore [ cur_state <= 181 ];
+            b == 99  => Hdr_CN_C [ pos <= next_pos ]; // 'c'
+            b == 67  => Hdr_CN_C [ pos <= next_pos ]; // 'C'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CN_C: {
+            is_eof  => NeedMore [ cur_state <= 182 ];
+            b == 116 => Hdr_CN_T [ pos <= next_pos ]; // 't'
+            b == 84  => Hdr_CN_T [ pos <= next_pos ]; // 'T'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CN_T: {
+            is_eof  => NeedMore [ cur_state <= 183 ];
+            b == 105 => Hdr_CN_I [ pos <= next_pos ]; // 'i'
+            b == 73  => Hdr_CN_I [ pos <= next_pos ]; // 'I'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CN_I: {
+            is_eof  => NeedMore [ cur_state <= 184 ];
+            b == 111 => Hdr_CN_O [ pos <= next_pos ]; // 'o'
+            b == 79  => Hdr_CN_O [ pos <= next_pos ]; // 'O'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CN_O: {
+            is_eof  => NeedMore [ cur_state <= 185 ];
+            b == 110 => Hdr_CN_N [ pos <= next_pos ]; // 'n'
+            b == 78  => Hdr_CN_N [ pos <= next_pos ]; // 'N'
+            b == 58  => HeaderColon [ pos <= next_pos ];
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        Hdr_CN_N: {
+            is_eof  => NeedMore [ cur_state <= 186 ];
+            b == 58  => Conn_OWS [ pos <= next_pos ]; // ':' -> Connection 確定!
+            _        => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        // その他のヘッダ名スキップ
+        Hdr_SkipName: {
+            is_eof  => NeedMore [ cur_state <= 69 ];
+            b == 58 => HeaderColon [ pos <= next_pos ]; // ':'
+            b == 13 => Error;
+            b == 10 => Error;
+            _       => Hdr_SkipName [ pos <= next_pos ];
+        }
+
+        // --------------------------------------------------------------------
+        // 5. Header Value
+        // --------------------------------------------------------------------
+        HeaderColon: {
+            is_eof  => NeedMore [ cur_state <= 70 ];
+            b == 32 => HeaderColon [ pos <= next_pos ]; // OWS スキップ
+            b == 9  => HeaderColon [ pos <= next_pos ];
+            _       => SkipValue;
+        }
+
+        // --- Content-Length 数値パース ---
+        ParseCL_OWS: {
+            is_eof  => NeedMore [ cur_state <= 71 ];
+            b == 32 => ParseCL_OWS [ pos <= next_pos ];
+            b == 9  => ParseCL_OWS [ pos <= next_pos ];
+            _       => ParseCLValue;
+        }
+
+        ParseCLValue: {
+            is_eof => NeedMore [ cur_state <= 71 ];
+            b < 48 => ParseCL_NotDigit;
+            b > 57 => ParseCL_NotDigit;
+            _      => AccCL;
+        }
+
+        ParseCL_NotDigit: {
+            b == 13 => EndCL_CR [ pos <= next_pos ];
+            b == 10 => HeaderLineStart [ pos <= next_pos ];
+            b == 32 => SkipCLSpace [ pos <= next_pos ];
+            b == 9  => SkipCLSpace [ pos <= next_pos ];
+            _       => Error;
+        }
+
+        AccCL: {
+            let digit = b - 48;
+            req.content_length <- (req.content_length * 10) + digit;
+            _ => ParseCLValue [ pos <= next_pos ];
+        }
+
+        SkipCLSpace: {
+            is_eof  => NeedMore [ cur_state <= 71 ];
+            b == 32 => SkipCLSpace [ pos <= next_pos ];
+            b == 9  => SkipCLSpace [ pos <= next_pos ];
+            b == 13 => EndCL_CR [ pos <= next_pos ];
+            b == 10 => HeaderLineStart [ pos <= next_pos ];
+            _       => Error;
+        }
+
+        EndCL_CR: {
+            is_eof  => NeedMore [ cur_state <= 72 ];
+            b == 10 => HeaderLineStart [ pos <= next_pos ];
+            _       => Error;
+        }
+
+        // --- Connection ヘッダ値パース ("close" 検出) ---
+        Conn_OWS: {
+            is_eof  => NeedMore [ cur_state <= 80 ];
+            b == 32 => Conn_OWS [ pos <= next_pos ];
+            b == 9  => Conn_OWS [ pos <= next_pos ];
+            _       => Conn_C;
+        }
+
+        Conn_C: {
+            is_eof  => NeedMore [ cur_state <= 80 ];
+            b == 99  => Conn_L [ pos <= next_pos ]; // 'c'
+            b == 67  => Conn_L [ pos <= next_pos ]; // 'C'
+            b == 13  => SkipVal_CR [ pos <= next_pos ];
+            b == 10  => HeaderLineStart [ pos <= next_pos ];
+            _        => Conn_C [ pos <= next_pos ];
+        }
+
+        Conn_L: {
+            is_eof  => NeedMore [ cur_state <= 81 ];
+            b == 108 => Conn_O [ pos <= next_pos ]; // 'l'
+            b == 76  => Conn_O [ pos <= next_pos ]; // 'L'
+            b == 13  => SkipVal_CR [ pos <= next_pos ];
+            b == 10  => HeaderLineStart [ pos <= next_pos ];
+            _        => Conn_C [ pos <= next_pos ];
+        }
+
+        Conn_O: {
+            is_eof  => NeedMore [ cur_state <= 82 ];
+            b == 111 => Conn_S [ pos <= next_pos ]; // 'o'
+            b == 79  => Conn_S [ pos <= next_pos ]; // 'O'
+            b == 13  => SkipVal_CR [ pos <= next_pos ];
+            b == 10  => HeaderLineStart [ pos <= next_pos ];
+            _        => Conn_C [ pos <= next_pos ];
+        }
+
+        Conn_S: {
+            is_eof  => NeedMore [ cur_state <= 83 ];
+            b == 115 => Conn_E [ pos <= next_pos ]; // 's'
+            b == 83  => Conn_E [ pos <= next_pos ]; // 'S'
+            b == 13  => SkipVal_CR [ pos <= next_pos ];
+            b == 10  => HeaderLineStart [ pos <= next_pos ];
+            _        => Conn_C [ pos <= next_pos ];
+        }
+
+        Conn_E: {
+            is_eof  => NeedMore [ cur_state <= 84 ];
+            b == 101 => Conn_SetClose [ pos <= next_pos ]; // 'e' -> "close" 確定!
+            b == 69  => Conn_SetClose [ pos <= next_pos ]; // 'E'
+            b == 13  => SkipVal_CR [ pos <= next_pos ];
+            b == 10  => HeaderLineStart [ pos <= next_pos ];
+            _        => Conn_C [ pos <= next_pos ];
+        }
+
+        Conn_SetClose: {
+            req.keep_alive <- 0;
+            _ => SkipValue;
+        }
+
+        // --- 一般的なヘッダ値スキップ ---
+        SkipValue: {
+            is_eof  => NeedMore [ cur_state <= 74 ];
+            b == 13 => SkipVal_CR [ pos <= next_pos ];
+            b == 10 => HeaderLineStart [ pos <= next_pos ];
+            _       => SkipValue [ pos <= next_pos ];
+        }
+
+        SkipVal_CR: {
+            is_eof  => NeedMore [ cur_state <= 76 ];
+            b == 10 => HeaderLineStart [ pos <= next_pos ];
+            _       => Error;
+        }
+
+        // --------------------------------------------------------------------
+        // 6. Check Body & Streaming Body Loop
+        // --------------------------------------------------------------------
+        CheckBodyEnd: {
+            let cl = req.content_length;
+            cl == 0 => FinishNoBody;
+            _       => InitBodyRead;
+        }
+
+        FinishNoBody: {
+            req.consumed <- pos;
+            req.state    <- 100; // 完了
+            _ => return 1;       // PARSE_OK
+        }
+
+        InitBodyRead: {
+            let cur_bptr = req.body_ptr;
+            cur_bptr == null => SetBodyPtr;
+            _                => ReadBodyLoop;
+        }
+
+        SetBodyPtr: {
+            req.body_ptr <- cur_ptr;
+            _ => ReadBodyLoop;
+        }
+
+        ReadBodyLoop: {
+            let cl = req.content_length;
+            let blen = req.body_len;
+            blen == cl => FinishBody;
+            is_eof     => NeedMore [ cur_state <= 90 ];
+            _          => ConsumeBodyByte;
+        }
+
+        ConsumeBodyByte: {
+            req.body_len <- req.body_len + 1;
+            _ => ReadBodyLoop [ pos <= next_pos ];
+        }
+
+        FinishBody: {
+            req.consumed <- pos;
+            req.state    <- 100; // 完了
+            _ => return 1;       // PARSE_OK
+        }
+
+        NeedMore: {
+            req.state    <- cur_state;
+            req.consumed <- pos;
+            _ => return 0; // NEED_MORE_DATA
+        }
+
+        Error: {
+            req.state <- 999;
+            _ => return 2; // PARSE_ERROR
+        }
+    }
+}

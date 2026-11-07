@@ -1,0 +1,209 @@
+// ============================================================================
+// StateSSA io_uring Asynchronous HTTP Web Server Core Engine
+// ゼロ C 言語・ゼロアロケーション・カーネル直接制御 FSM
+// ============================================================================
+
+include "uring_types.ssa";
+include "uring_sqe.ssa";
+include "uring_init.ssa";
+include "uring_conn.ssa";
+include "http_response.ssa";
+include "http_parser.ssa";
+
+machine uring_server_run(port: u32) -> i32 {
+    flow {
+        reg l_fd:       i32 = -1;
+        reg c_res:      i32 = 0;
+        reg c_tag:      u64 = 0;
+        reg cur_slot:   u32 = 0;
+        reg ring_ctx_p: *UringContext = null;
+        reg conns_p:    *HttpConn = null;
+    }
+
+    states {
+        Entry: {
+            // 1. ソケット作成 & Listen
+            let listen_fd = call uring_create_listen_socket(port);
+            listen_fd < 0 => Error;
+
+            // 2. UringContext & HttpConn プール (64スロット) の mmap 確保
+            // sizeof(UringContext) ~ 128 bytes, sizeof(HttpConn) ~ 64 bytes * 64 = 4096 bytes
+            let ctx_mem = call mmap(null, 128, 3, 34, -1, 0);
+            let conns_mem = call mmap(null, 8192, 3, 34, -1, 0);
+            let _ = call memset(ctx_mem, 0, 128);
+            let _ = call memset(conns_mem, 0, 8192);
+
+            // 3. uring リング初期化
+            let u_ret = call uring_setup_ring(ctx_mem, 128);
+            u_ret < 0 => Error;
+
+            // 4. 接続プール初期化
+            let p_ret = call init_connection_pool(conns_mem, 64);
+
+            // 5. 初回 Accept SQE 投入
+            let _ = call sqe_prep_accept(ctx_mem, listen_fd, 0);
+            let _ = call uring_enter(ctx_mem, 1, 0, 0);
+
+            _ => WaitEvent [ l_fd <= listen_fd, ring_ctx_p <= ctx_mem, conns_p <= conns_mem ];
+        }
+
+        WaitEvent: {
+            let cq_h_ptr = ring_ctx_p.cq_khead;
+            let cq_t_ptr = ring_ctx_p.cq_ktail;
+            let cq_h = *cq_h_ptr;
+            let cq_t = *cq_t_ptr;
+            cq_h == cq_t => EnterKernel;
+            _            => PopCQE;
+        }
+
+        EnterKernel: {
+            // IORING_ENTER_GETEVENTS = 1
+            let ret = call uring_enter(ring_ctx_p, 0, 1, 1);
+            _ => WaitEvent;
+        }
+
+        PopCQE: {
+            let cq_h_ptr = ring_ctx_p.cq_khead;
+            let cq_h = *cq_h_ptr;
+            let mask = ring_ctx_p.cq_mask;
+            let cq_idx = cq_h & mask;
+            let cqes_base = ring_ctx_p.cqes;
+            let cqe = cqes_base + cq_idx;
+            let tag = cqe.user_data;
+            let res = cqe.res;
+            let next_cq_h = cq_h + 1;
+            *cq_h_ptr <- next_cq_h;
+
+            tag == 0 => HandleAccept [ c_res <= res ];
+            _        => HandleClient [ c_tag <= tag, c_res <= res ];
+        }
+
+        // --------------------------------------------------------------------
+        // 1. 新規クライアント接続受付 (Accept)
+        // --------------------------------------------------------------------
+        HandleAccept: {
+            c_res < 0 => ReAccept;
+            let free_slot = call find_free_slot(conns_p, 64);
+            free_slot < 0 => CloseExcess;
+
+            let conn = conns_p + free_slot;
+            conn.fd     <- c_res;
+            conn.state  <- 1; // ACTIVE
+            conn.rx_len <- 0;
+            let _ = call http_req_init(&conn.req);
+
+            // RECV event tag: (free_slot + 1) | (1 << 16)
+            let recv_tag = (free_slot + 1) | 65536;
+            let _ = call sqe_prep_recv(ring_ctx_p, c_res, conn.rx_buf, 4096, recv_tag);
+            _ => ReAccept;
+        }
+
+        CloseExcess: {
+            let _ = call close(c_res);
+            _ => ReAccept;
+        }
+
+        ReAccept: {
+            let _ = call sqe_prep_accept(ring_ctx_p, l_fd, 0);
+            let sq_h_ptr = ring_ctx_p.sq_khead;
+            let sq_t_ptr = ring_ctx_p.sq_ktail;
+            let sq_h = *sq_h_ptr;
+            let sq_t = *sq_t_ptr;
+            let to_sub = sq_t - sq_h;
+            let ret = call uring_enter(ring_ctx_p, to_sub, 0, 0);
+            _ => WaitEvent;
+        }
+
+        // --------------------------------------------------------------------
+        // 2. クライアント通信イベント (Recv / Send)
+        // --------------------------------------------------------------------
+        HandleClient: {
+            let slot_raw = c_tag & 65535;
+            let slot_raw32 = cast(u32) slot_raw;
+            let client_slot = slot_raw32 - 1;
+            let ev_shift = c_tag >> 16;
+            let ev_type = ev_shift & 65535;
+            ev_type == 1 => DispatchRecv [ cur_slot <= client_slot ];
+            ev_type == 2 => DispatchSend [ cur_slot <= client_slot ];
+            _            => WaitEvent;
+        }
+
+        DispatchRecv: {
+            c_res <= 0 => DoClose;
+            let conn = conns_p + cur_slot;
+            conn.rx_len <- c_res;
+
+            // HTTP パース実行 (ゼロコピー・ストリーミング FSM)
+            let p_res = call http_parse_request(&conn.req, conn.rx_buf, c_res, 0);
+            p_res == 1 => SendResp; // PARSE_OK
+            p_res == 0 => WaitMore; // PARSE_SUSPEND (追加データ待機)
+            _          => DoClose;  // PARSE_ERROR
+        }
+
+        SendResp: {
+            let conn = conns_p + cur_slot;
+            let _ = call http_build_response(conn);
+
+            // SEND event tag: (cur_slot + 1) | (2 << 16)
+            let slot1 = cur_slot + 1;
+            let send_tag = slot1 | 131072;
+            let _ = call sqe_prep_send(ring_ctx_p, conn.fd, conn.tx_buf, conn.tx_len, send_tag);
+            let sq_h_ptr = ring_ctx_p.sq_khead;
+            let sq_t_ptr = ring_ctx_p.sq_ktail;
+            let sq_h = *sq_h_ptr;
+            let sq_t = *sq_t_ptr;
+            let to_sub = sq_t - sq_h;
+            let _ = call uring_enter(ring_ctx_p, to_sub, 0, 0);
+            _ => WaitEvent;
+        }
+
+        WaitMore: {
+            let conn = conns_p + cur_slot;
+            let slot1 = cur_slot + 1;
+            let recv_tag = slot1 | 65536;
+            let _ = call sqe_prep_recv(ring_ctx_p, conn.fd, conn.rx_buf, 4096, recv_tag);
+            let sq_h_ptr = ring_ctx_p.sq_khead;
+            let sq_t_ptr = ring_ctx_p.sq_ktail;
+            let sq_h = *sq_h_ptr;
+            let sq_t = *sq_t_ptr;
+            let to_sub = sq_t - sq_h;
+            let _ = call uring_enter(ring_ctx_p, to_sub, 0, 0);
+            _ => WaitEvent;
+        }
+
+        DispatchSend: {
+            let conn = conns_p + cur_slot;
+            let is_keep = conn.req.keep_alive;
+            is_keep != 0 => KeepAliveNext;
+            _            => DoClose;
+        }
+
+        KeepAliveNext: {
+            let conn = conns_p + cur_slot;
+            let _ = call http_req_init(&conn.req);
+            conn.rx_len <- 0;
+            let slot1 = cur_slot + 1;
+            let recv_tag = slot1 | 65536;
+            let _ = call sqe_prep_recv(ring_ctx_p, conn.fd, conn.rx_buf, 4096, recv_tag);
+            let sq_h_ptr = ring_ctx_p.sq_khead;
+            let sq_t_ptr = ring_ctx_p.sq_ktail;
+            let sq_h = *sq_h_ptr;
+            let sq_t = *sq_t_ptr;
+            let to_sub = sq_t - sq_h;
+            let _ = call uring_enter(ring_ctx_p, to_sub, 0, 0);
+            _ => WaitEvent;
+        }
+
+        DoClose: {
+            let conn = conns_p + cur_slot;
+            let _ = call close(conn.fd);
+            conn.fd    <- -1;
+            conn.state <- 0;
+            _ => WaitEvent;
+        }
+
+        Error: {
+            _ => return -1;
+        }
+    }
+}
